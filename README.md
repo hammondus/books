@@ -319,10 +319,11 @@ Throughout the book, we must consistently reinforce these three pillars:
 * Error Handling, Testing, and Deployment
 
 ### Appendices
-* **A. Go Tooling Deep Dive** (`go build`, `go vet`, `go work`)
-* **B. Go Release History** (Generics, Concurrency improvements)
-* **C. Go in 2026** (Comparison with C, Java, Javascript, Rust & Zig)
-* **D. Recommended Reading** (Official docs, high quality website/github repos, influential talks)
+* **A. Go Tooling** Deep Dive (`go build`, `go vet`, `go work`)
+* **B. Go Doc** Deep Dive (Using `go doc` and writing documentation for go doc)
+* **C. Go Release History** (Generics, Concurrency improvements)
+* **D. Go in 2026** (Comparison with C, Java, Javascript, Rust & Zig)
+* **E. Recommended Reading** (Official docs, high quality website/github repos, influential talks)
 
 ---
 ##Prompt for Zig
@@ -689,7 +690,8 @@ Throughout the book, consistently reinforce these three pillars:
 
 ### Appendices
 
-- **A. Zig Build System Deep Dive** (custom build runners, cross-compilation matrix)
-- **B. Zig Language Evolution** (async history, key proposals, the roadmap to 1.0)
-- **C. Zig in 2026** (ecosystem maturity, comparison with C, Rust, Go, and modern C++)
-- **D. Recommended Resources** (official docs, zig.guide, influential GitHub repos, talks by Andrew Kelley)
+- **A. Zig Build System** Deep Dive (custom build runners, cross-compilation matrix)
+- **B. Zig Documentation Generation** Deep Dive (Using `-femit-docs` and `zigdoc` )
+- **C. Zig Language Evolution** (async history, key proposals, the roadmap to 1.0)
+- **D. Zig in 2026** (ecosystem maturity, comparison with C, Rust, Go, and modern C++)
+- **E. Recommended Resources** (official docs, zig.guide, influential GitHub repos, talks by Andrew Kelley)
