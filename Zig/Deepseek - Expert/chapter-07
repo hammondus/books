@@ -1,0 +1,353 @@
+## Chapter 7: Comptime: The Heart of Zig
+
+If you remember only one thing from this book, let it be this: **comptime is Zig’s secret weapon.** It dissolves the boundary between compile time and runtime by letting you execute *normal Zig code* during compilation. The language doesn’t give you a separate macro language, a template metalanguage, or a preprocessor. Instead, you use the exact same syntax, types, and control flow you already know, but annotated with the `comptime` keyword. The result is a model of metaprogramming that is simultaneously more powerful and easier to reason about than any of its competitors.
+
+This chapter takes you from basic comptime expressions to the deep magic of `@typeInfo`-driven code generation. You will learn not just *how* to write comptime code, but *why* the Zig team made these choices, how the compiler executes that code, and where the sharp edges lie.
+
+---
+
+### 1. Basic Usage – The “How”
+
+The `comptime` keyword marks a scope, a variable, or a function parameter as “evaluate this at compile time.”
+
+#### 1.1 Comptime Expressions
+
+Any expression can be forced to compile time by wrapping it in `comptime { ... }` or prefixing it with `comptime`.
+
+```zig
+const std = @import("std");
+
+pub fn main() void {
+    const result = comptime blk: {
+        var sum: u32 = 0;
+        for (0..100) |i| {
+            sum += i;
+        }
+        break :blk sum;
+    };
+    // result is a runtime constant equal to 4950,
+    // but the computation happened at compile time.
+    std.debug.print("{d}\n", .{result});
+}
+```
+
+Here the loop and addition are executed entirely inside the compiler. `result` is embedded as a `u32` constant 4950 in the final binary; there is zero runtime cost for the calculation.
+
+#### 1.2 Comptime Parameters
+
+When a function parameter is declared `comptime`, the call site must supply a compile-time-known value. This is the gateway to generics.
+
+```zig
+fn Vec(comptime T: type, comptime size: u32) type {
+    return struct {
+        data: [size]T,
+
+        fn dot(self: @This(), other: @This()) T {
+            var sum: T = 0;
+            for (0..size) |i| {
+                sum += self.data[i] * other.data[i];
+            }
+            return sum;
+        }
+    };
+}
+
+const Vec3f = Vec(f32, 3);
+```
+
+`Vec` is a function that returns a **type**. It is called at compile time because its parameters are `comptime`. This is Zig’s replacement for C++ templates: a plain function that happens to run during compilation. Since `T` and `size` are known at comptime, the generated struct has a fixed `[size]T` and the loop in `dot` is unrolled or optimized accordingly.
+
+#### 1.3 Comptime Variables
+
+Inside a comptime scope, you can use `var` and `const` as usual. These variables exist only in the compiler’s memory, not in the final binary.
+
+```zig
+fn generateFieldTable(comptime T: type) [@typeInfo(T).Struct.fields.len][]const u8 {
+    const fields = @typeInfo(T).Struct.fields;
+    var names: [fields.len][]const u8 = undefined;
+    for (fields, 0..) |f, i| {
+        names[i] = f.name;
+    }
+    return names;
+}
+```
+
+Here `names` is a comptime array of strings that is constructed, then returned and embedded as a constant.
+
+#### 1.4 Inline Control Flow with Comptime
+
+Zig allows `inline for`, `inline while`, and `inline else` to unroll or branch at compile time. When combined with a comptime-known sequence, the loop body is instantiated once per element, treating the element as comptime.
+
+```zig
+fn printFields(comptime T: type, value: T) void {
+    inline for (@typeInfo(T).Struct.fields) |field| {
+        std.debug.print("{s} = {any}\n", .{ field.name, @field(value, field.name) });
+    }
+}
+```
+
+Even though `value` is a runtime argument, the field names and types are comptime. `inline for` generates a separate `std.debug.print` call for each field—zero reflection cost, zero dynamic dispatch.
+
+---
+
+### 2. Under the Hood – The Engine
+
+To wield comptime effectively, it helps to understand what the compiler actually does with it.
+
+Zig’s self-hosted compiler (stage2 and beyond) contains a **comptime interpreter**. When the compiler encounters a `comptime` expression, it does not emit runtime code; instead, it executes the relevant Zig IR inside an in-process VM. This interpreter understands all safe Zig operations: arithmetic, memory allocation (via a dedicated comptime allocator), function calls, and even a subset of the standard library. It does **not** handle unsafe operations like inline assembly or volatile access—those are forbidden at comptime.
+
+Key points about the comptime engine:
+
+- **Memory Model:** Comptime code can allocate using `std.heap.page_allocator` (or a special comptime allocator). All memory allocated during comptime is discarded when compilation completes. A `FixedBufferAllocator` backed by a comptime-known buffer is often the best choice for predictability.
+- **Execution Limits:** The interpreter has a configurable “backward branch” limit (the `--maxrss` equivalent for comptime) to prevent infinite loops from hanging the compiler. Zig also tracks comptime call depth and memory usage.
+- **No Separate Compilation:** Comptime functions are not compiled to native code and executed. They are interpreted as Zig bytecode. This means comptime code can be slower than equivalent runtime code, but the trade-off is simplicity—the same language, the same semantics.
+- **Code Generation:** When a comptime expression yields a value (like a type, constant, or string), that value is embedded directly into the compilation unit. For types returned from comptime functions (like `Vec(f32, 3)`), the compiler generates a specialized version of the struct and its methods exactly as if you had written it by hand.
+
+The Zig compiler also employs **memoization** for comptime calls: if you call the same comptime function with the same arguments twice, the result is reused. This prevents the explosion of duplicated types and values.
+
+---
+
+### 3. Why This Design? – The Philosophy
+
+The decision to make comptime “normal Zig code” is a direct consequence of the “No Hidden Control Flow” and “Explicit is Better Than Implicit” pillars.
+
+**No second language.** C++ templates are a Turing-complete functional language embedded within a statement-oriented language, with completely different syntax and semantics. Macros (C, Rust’s `macro_rules!`) force you to think in token trees. Zig says: you already know how to write Zig; use that same skill to write code that generates code.
+
+**Compile-time reflection without runtime baggage.** In many languages, reflection requires either runtime type information (RTTI) or a separate code generator. Zig’s `@typeInfo` returns a comptime data structure describing every field, function, and alignment of a type. Because this data structure only exists at compile time, the binary does not carry any of it unless you explicitly embed a subset.
+
+**Generics are functions.** A generic type in Zig is just a function that takes comptime parameters and returns a `type`. There are no “angle brackets” with special syntax, no template argument deduction guides, no SFINAE. You can use conditionals, loops, recursion—any control flow—to decide the returned type. This makes building complex generics (like a library that adapts its API based on the presence of a `write` method) straightforward and explicit.
+
+**Eliminates code generation as a separate step.** Before Zig, high-performance parsers, serializers, or protocol handlers often required external scripts (Python, awk) to generate C/C++ source files. With comptime, that generation is integrated into the build. A `comptime` function can read a file (if the compiler permits it; currently limited but evolving) or use a fixed schema to produce types and dispatch tables. The entire build pipeline becomes reproducible and cross-compilable by default.
+
+**Safety and determinism.** Comptime execution is sandboxed. It cannot spawn processes, access the network, or write to arbitrary files (by default; there are escape hatches but they are explicit). This ensures that compiling a Zig project cannot lead to supply-chain attacks where a simple `zig build` runs arbitrary code.
+
+---
+
+### 4. Competing Approaches – The Context
+
+**C.** C has macros (`#define`), `_Generic`, and external code generation. Macros perform token substitution; they know nothing about types, scopes, or control flow. `_Generic` provides only a rudimentary type-based dispatch. Any sophisticated metaprogramming (e.g., generating serialization code) requires writing a separate program that outputs C, integrated via Makefiles—error-prone, hard to debug, and often platform-dependent. Zig’s comptime offers type-safe, in-language code generation that works identically across all targets.
+
+**C++.** Template metaprogramming is legendary for its power and its opacity. Templates are Turing-complete but operate at the type level with recursion, specialization, and SFINAE. Compile-time computation is possible via `constexpr`, but the language has two distinct worlds: the template/macro universe and the `constexpr` universe, each with its own constraints. Error messages remain a notorious pain point. Zig collapses everything into one execution model; an `if` at comptime is just an `if`. The result is far more readable and maintainable.
+
+**Rust.** Rust provides generics (similar to C++ templates but with trait bounds), declarative macros (`macro_rules!`), and procedural macros (proc macros). Proc macros are Rust code that runs at compile time, manipulates token streams, and can perform arbitrary computation. This is powerful but introduces complexity: macros live in separate crates, require special annotation, and are harder to debug. Zig’s comptime is integrated directly into the compilation unit; a function is comptime simply by marking its parameter `comptime`. No separate crate, no token-stream manipulation—you operate on types and values, not syntax.
+
+**Go.** Go historically had no generics; the `interface{}` and code generation (`go generate`) were the primary workarounds. Modern Go (1.18+) introduced type parameters, but they are restricted and do not support arbitrary compile-time execution. Go’s philosophy prioritizes simplicity, and code generation is still common for serialization or ORM-like features. Zig’s comptime provides the same “normal code” feel, but with the full power of a systems language.
+
+**Python/Java.** Both treat metaprogramming as a runtime activity (decorators, reflection, dynamic proxies). Zig’s comptime moves all that cost to the compiler, enabling zero-overhead abstractions that are impossible in a runtime-driven environment.
+
+---
+
+### 5. Common Mistakes – The Gotchas
+
+Even seasoned engineers trip over comptime’s unique rules. Here are the top pitfalls.
+
+**5.1 Assuming a comptime value can be used as a runtime value.** A `comptime` variable is a compile-time entity; it disappears after compilation. You cannot take its address, pass it to a function expecting a runtime pointer, or store it in a global unless you explicitly emit a runtime constant.
+
+```zig
+const name = comptime blk: {
+    break :blk "hello"; // this is a comptime string
+};
+// name is a *const [5:0]u8 embedded in the binary.
+// You can use it at runtime because it’s a constant.
+```
+
+But:
+
+```zig
+fn allocName(allocator: std.mem.Allocator) ![]u8 {
+    const str = comptime blk: {
+        break :blk "world"; // comptime string
+    };
+    // str is a comptime *const [5:0]u8, but allocPrint expects a runtime []const u8.
+    return std.fmt.allocPrint(allocator, "{s}", .{str});
+}
+```
+This works because comptime string literals coerce to runtime slices. However, if you had an array built at comptime with `std.ArrayList(u8)` and tried to return its `items`, that memory is freed after compilation—a bug.
+
+**5.2 Comptime infinite loops and resource exhaustion.** A comptime `while (true)` without a limit will make the compiler hang or crash. Zig's backward branch limit will terminate it, but the error message may be confusing. Always ensure loops at comptime have a clear termination condition or use `inline for` over a known range.
+
+**5.3 Overusing `comptime` for function parameters when a type would suffice.** A function like `fn process(comptime n: u32, data: [n]u8)` forces `n` to be comptime, which creates a separate instantiation for each size. If `n` varies widely at runtime, consider using a slice instead. Remember: comptime parameters generate monomorphized code, which can bloat binary size. Use them only when the value must be known at compile time (e.g., for array lengths, type selection, or unrolling).
+
+**5.4 `@typeInfo` on types with comptime-only fields.** Some types have fields that are only accessible at comptime (e.g., functions, `comptime` fields). Attempting to iterate over them with `inline for` and emit runtime code for those fields will cause a compile error. Check `@typeInfo` for `comptime` fields and handle them separately.
+
+**5.5 Trying to pass a runtime value to a `comptime` parameter.** The compiler will give an error like “value must be known at compile time.” This often surprises those coming from languages where generics are automatically inferred from runtime arguments. In Zig, if a parameter is `comptime`, the argument **must** be a comptime expression or a `comptime` variable.
+
+**5.6 Expecting side effects at runtime from comptime functions.** Comptime functions execute only inside the compiler. If you write a log message inside a comptime function, it will appear only during compilation (via `@compileLog`). If you want runtime behavior, you must generate code that performs the side effect when called.
+
+---
+
+### 6. Performance Considerations – The Cost
+
+Comptime shifts computational cost from runtime to compile time. This is often a win, but it demands awareness.
+
+**Compile-time overhead.** Each comptime call adds to the compiler’s work. Large-scale metaprogramming (e.g., generating thousands of types from a schema) can noticeably increase build times. Use memoization where possible: the compiler already caches calls with identical arguments, so structuring your comptime code to avoid redundant computation helps.
+
+**Binary size.** Comptime generics behave like C++ templates: each combination of comptime arguments produces a separate instantiation. If you write a `Sort(comptime T: type, comptime algo: SortAlgorithm)` and call it for ten types and three algorithms, you get thirty copies of the sort function. This can inflate binary size. Mitigation strategies include:
+- Exposing a runtime dispatch path for less performance-critical cases (e.g., passing a vtable or function pointer).
+- Using `inline for` only when the number of instantiations is small and known.
+- Combining similar instantiations manually if they share identical code.
+
+**Runtime performance gains.** The benefit is exactly the opposite of the cost: no runtime reflection, no dynamic dispatch, no vtables, no allocations. A comptime-generated switch on a tag can become a perfect jump table. A serializer built from `@typeInfo` can be as efficient as hand-written code because the compiler sees the full unrolled structure. The performance ceiling of comptime-generated code matches hand-tuned Zig.
+
+**Cache locality.** Comptime constants are embedded in the read-only data section of the binary. A large comptime lookup table can consume significant memory at runtime. Use `FixedBufferAllocator` or comptime arrays for tables that would otherwise be computed at startup, but profile the memory impact.
+
+---
+
+### 7. Best Practices – The Idiomatic Way
+
+**7.1 Treat comptime functions as pure.** Comptime functions should have no mutable global state (except for caching). They take comptime inputs, return a comptime result, and that’s it. This makes memoization effective and reasoning easy.
+
+**7.2 Use `@typeInfo` and `std.meta` liberally.** Zig’s standard library provides many helper functions (`std.meta.trait.isTuple`, `std.meta.FieldEnum`, `std.meta.DeclEnum`, etc.). Familiarize yourself with them; they prevent reinventing reflection primitives.
+
+**7.3 Prefer `inline for` for type-level iteration.** When you need to act on each field of a struct, `inline for` over `@typeInfo(T).Struct.fields` is the canonical pattern. It generates a separate code path per field, yielding optimal performance without manual unrolling.
+
+**7.4 Document comptime parameters clearly.** A function like `fn makeVec(comptime T: type, comptime size: u32) type` should have a doc comment explaining what `T` and `size` must satisfy. Because comptime parameters are not validated by a typeclass, the function will fail with a compile error if, say, `T` does not support multiplication. That error can be cryptic; add checks with `@compileError` to emit helpful messages.
+
+**7.5 Use `@compileLog` and `@compileError` for debugging and validation.** When building complex comptime logic, insert `@compileLog` to inspect types and values. To enforce invariants, call `@compileError` with a descriptive message:
+
+```zig
+if (@typeInfo(T) != .Struct) {
+    @compileError("Expected a struct type, got " ++ @typeName(T));
+}
+```
+
+**7.6 Keep comptime boundaries minimal.** A function should be `comptime` only in the parameters that need to be. Avoid marking entire functions as `comptime` unless they are helper functions for other comptime code. This allows the compiler to decide whether to run them at compile time or runtime based on the call context (if you use `comptime` on a call, it will force comptime evaluation).
+
+**7.7 Cache reusable comptime results.** If a comptime function is called repeatedly with the same arguments, store the result in a comptime `const` and reuse it. The compiler’s memoization usually handles it, but explicit caching makes your intent clearer and avoids edge cases.
+
+---
+
+### 8. Examples – Complete and Buildable
+
+#### 8.1 Compile-Time Function Evaluation
+
+```zig
+const std = @import("std");
+
+fn factorial(comptime n: u32) u32 {
+    var result: u32 = 1;
+    var i: u32 = 1;
+    while (i <= n) : (i += 1) {
+        result *= i;
+    }
+    return result;
+}
+
+const fact10 = factorial(10); // computed at compile time
+
+pub fn main() void {
+    std.debug.print("10! = {d}\n", .{fact10});
+}
+```
+
+#### 8.2 Generic Stack Type
+
+```zig
+fn Stack(comptime T: type, comptime capacity: usize) type {
+    return struct {
+        const Self = @This();
+        buffer: [capacity]T = undefined,
+        len: usize = 0,
+
+        pub fn push(self: *Self, value: T) !void {
+            if (self.len >= capacity) return error.Overflow;
+            self.buffer[self.len] = value;
+            self.len += 1;
+        }
+
+        pub fn pop(self: *Self) ?T {
+            if (self.len == 0) return null;
+            self.len -= 1;
+            return self.buffer[self.len];
+        }
+    };
+}
+
+const IntStack = Stack(i32, 64);
+```
+
+#### 8.3 `@typeInfo`-Powered Serialization
+
+```zig
+fn printStruct(comptime T: type, value: T) void {
+    const fields = @typeInfo(T).Struct.fields;
+    inline for (fields) |field| {
+        std.debug.print("{s}: {any}\n", .{ field.name, @field(value, field.name) });
+    }
+}
+
+const Person = struct {
+    name: []const u8,
+    age: u32,
+    active: bool,
+};
+
+pub fn main() void {
+    const p = Person{ .name = "Alice", .age = 30, .active = true };
+    printStruct(Person, p);
+}
+```
+
+#### 8.4 Comptime Invariant Checking
+
+```zig
+fn requirePowerOfTwo(comptime n: u32) void {
+    if (n == 0 or (n & (n - 1)) != 0) {
+        @compileError(std.fmt.comptimePrint("{d} is not a power of two", .{n}));
+    }
+}
+
+fn RingBuffer(comptime T: type, comptime size: u32) type {
+    requirePowerOfTwo(size);
+    return struct {
+        buffer: [size]T = undefined,
+        read_idx: u32 = 0,
+        write_idx: u32 = 0,
+    };
+}
+
+// RingBuffer(u8, 10); // compile error: 10 is not a power of two
+const MyBuf = RingBuffer(u8, 16); // ok
+```
+
+#### 8.5 Comptime Table Generation for a Sine LUT
+
+```zig
+const sin_lut = blk: {
+    const N = 256;
+    var table: [N]f32 = undefined;
+    var i: usize = 0;
+    while (i < N) : (i += 1) {
+        table[i] = @sin(2.0 * std.math.pi * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(N)));
+    }
+    break :blk table;
+};
+
+pub fn main() void {
+    std.debug.print("sin(0) ~ {d}\n", .{sin_lut[0]});
+}
+```
+
+All examples compile with `zig build-exe` and require no external files.
+
+---
+
+### 9. Summary & Exercises
+
+**Summary:**
+- `comptime` marks code that runs inside the compiler, using the same Zig semantics.
+- It replaces templates, macros, and code generation with a single, coherent model.
+- `@typeInfo` provides full compile-time reflection, enabling zero-cost serialization, validation, and API generation.
+- The compiler interprets comptime code; there is no separate metaprogramming environment.
+- Comptime parameters cause monomorphization—balance code bloat against runtime performance.
+- Idiomatic comptime relies on `inline for`, `@compileError`, and pure functions.
+
+**Exercises:**
+
+1. **Struct Field Dumper:** Write a comptime function `fn fieldTypes(comptime T: type) []const u8` that returns a comma-separated string of field names and types for any struct. For `Person` above, the result should be `"name: []const u8, age: u32, active: bool"`. Use `@typeInfo` and `std.fmt.comptimePrint`. Test it with a `test` block that calls `@compileLog` to verify the output.
+
+2. **Generic `max` Function:** Implement `fn max(comptime T: type, a: T, b: T) T` that works for any numeric type, using `@typeInfo` to check if `T` is an integer or float and calling `@compileError` otherwise. Ensure the function works at both comptime and runtime. Verify with a test.
+
+3. **Comptime Hash Map:** Using only comptime features, build a static key-value store that maps a set of known string keys to integers. The store must be initialized at compile time with a function `fn initMap(comptime entries: anytype) type` where `entries` is a tuple of `struct { key: []const u8, value: u32 }`. The returned type should have a `fn get(key: []const u8) ?u32` method that uses an if-else chain (unrolled with `inline for`) to look up the key. This exercise prepares you for the more advanced metaprogramming in the next chapter.
+
+These exercises deepen your ability to think in compile-time terms—where code produces code, and runtime overhead vanishes. The next chapter will push this machinery to its limits: building entire DSLs, generating API layers, and managing compile-time complexity.

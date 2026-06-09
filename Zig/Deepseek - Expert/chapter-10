@@ -1,0 +1,431 @@
+# Chapter 10: Arrays, Slices, and Pointers
+
+Arrays, slices, and pointers form the backbone of every data access pattern in Zig. They are deliberately thin abstractions over memory—no hidden allocations, no automatic resizing, no implicit decay—giving you full control while enabling the compiler to enforce safety where possible. This chapter dissects the three kinds of sequence types, their memory representations, and the idiomatic usage that makes Zig systems code read like a precise map of memory.
+
+---
+
+## 1. Basic Usage
+
+### Fixed-Size Arrays
+
+An array type is written `[N]T`. The length `N` is a compile-time integer and becomes part of the type. Arrays are **values**: assigning one array to another copies every element, just like an integer.
+
+```zig
+const std = @import("std");
+
+pub fn main() void {
+    // Explicit length, explicit initializer.
+    var a: [4]u8 = .{ 10, 20, 30, 40 };
+
+    // Inferred length with _.
+    const b = [_]u8{ 1, 2, 3 };          // type: [3]u8
+
+    // Indexing returns a *T (pointer to element) in a mutable context,
+    // or a const reference from a const array.
+    a[0] = 99;
+    const first = b[0];                  // copy of the value
+
+    // The .len field is a compile-time constant.
+    const len: usize = a.len;            // 4
+}
+```
+
+Arrays can be initialized with `undefined` to avoid a double‑write when you intend to fill them immediately.
+
+### Slices
+
+A slice is a fat pointer: a pointer to the first element plus a runtime length. Its type is `[]T` (mutable) or `[]const T` (read‑only). You obtain a slice by **slicing** an array, another slice, or a pointer with a known length.
+
+```zig
+const arr = [_]u8{ 5, 6, 7, 8 };
+
+// Slicing syntax: arr[start..end]. end is exclusive.
+const s1: []const u8 = arr[0..arr.len];  // whole array
+const s2 = arr[1..3];                    // [2]u8{6,7}
+
+// &arr coerces to []const u8 for a const array.
+const s3: []const u8 = &arr;
+```
+
+Slicing never allocates; it simply constructs a new fat pointer. A slice carries no capacity—only a length. To append or grow, you must use an explicit allocator (see `std.ArrayList`).
+
+Sentinel slices add a known sentinel value at the end of the runtime data. The type `[:0]const u8` denotes a slice of bytes that is guaranteed to be null-terminated. This is used for C string interop and for operations that require a null terminator without extra copying.
+
+```zig
+const hello: [:0]const u8 = "hello"; // string literal is sentinel-terminated
+std.debug.print("{s}\n", .{hello});  // {s} expects [:0]const u8
+```
+
+You can also slice an array to a sentinel slice if the source already has the sentinel:
+
+```zig
+const buf = [_:0]u8{ 'Z', 'i', 'g' }; // sentinel array
+const zstr: [:0]const u8 = &buf;
+```
+
+### Pointers
+
+Zig’s pointer types are explicit and varied, each encoding a distinct intent.
+
+| Type          | Meaning |
+|---------------|---------|
+| `*T`          | Pointer to exactly one `T`. |
+| `*const T`    | Pointer to one immutable `T`. |
+| `[*]T`        | Many-item pointer: points to an unknown number of `T`. No length stored. |
+| `[*:S]T`      | Many-item pointer with sentinel `S` at the end. |
+| `?*T`         | Optional pointer: either a valid `*T` or `null`. |
+| `*[N]T`       | Pointer to an entire array of `N` elements. |
+
+You obtain a pointer with `&`:
+
+```zig
+var x: u32 = 42;
+const p: *u32 = &x;
+p.* += 1;               // dereference with .*
+std.debug.print("{}\n", .{x}); // 43
+```
+
+A `[*]T` supports indexing and pointer arithmetic, but the compiler cannot perform bounds checks because the length is unknown. You rarely use it directly except in C interop; convert it to a slice as soon as possible with `ptr[0..len]`.
+
+The optional pointer `?*T` makes nullability explicit. To use the pointer, you must unwrap it:
+
+```zig
+fn maybeIncrement(p: ?*u32) void {
+    if (p) |non_null| {
+        non_null.* += 1;
+    }
+}
+```
+
+---
+
+## 2. Under the Hood
+
+### Memory Representation
+
+**Array**
+An array `[N]T` is laid out as `N` contiguous elements with no extra metadata. `@sizeOf([N]T)` equals `N * @sizeOf(T)`. When an array is a local variable, it resides on the stack; when embedded in a struct, it contributes directly to the struct’s size. Arrays are values, so a function taking an array by value receives a copy of all elements. The compiler may optimize this copy with memcpy or pass a pointer internally if the array is large, but that is invisible to the programmer.
+
+**Slice**
+A slice `[]T` is a struct `{ ptr: [*]T, len: usize }`. On a 64‑bit system it occupies 16 bytes. The pointer points to the first element in memory; `len` is the number of elements accessible. Slicing an array `arr[a..b]` computes `ptr = &arr[a]` and `len = b - a`. No data moves.
+
+A sentinel slice `[:X]T` adds no extra runtime field. Instead, the compiler relies on the invariant that `(ptr + len)* == X` (the sentinel is present at the end). When constructing a sentinel slice from a known-good source, the compiler trusts you; it does not insert a runtime check unless safety checks are enabled.
+
+**Pointers**
+A `*T` is a single memory address (8 bytes on 64‑bit). The dereference `p.*` yields an lvalue of type `T`. For `*[N]T`, dereferencing yields the entire array value (a copy if used as an rvalue).
+`[*]T` is a C‑compatible pointer: an address with no length metadata. Indexing `ptr[i]` is equivalent to `@intToPtr(*T, @ptrToInt(ptr) + i * @sizeOf(T)).*`. It is unchecked even in debug mode because the bounds are unknown.
+`?*T` is a nullable pointer: its in‑memory representation is a pointer that may be `0x0` (null). Zig uses the same null optimisation that C uses, so `@sizeOf(?*T) == @sizeOf(*T)`.
+
+### Compile-Time vs. Runtime Knowledge
+
+The array length is a compile‑time constant, enabling several important behaviours:
+- Compile‑time bounds checking for constant indices.
+- Automatic inference of slice length in `var s = arr[1..];` (the `.len` of the resulting slice is comptime‑known).
+- `@TypeOf(arr)` knows `N`, so generic functions using `anytype` can extract `N` with `@typeInfo`.
+
+Slice lengths are usually runtime values (except when slicing a comptime‑known array with comptime bounds, in which case the length may fold into a comptime value). The compiler can still insert runtime bounds checks for slice indexing in safe build modes (`Debug` and `ReleaseSafe`). In `ReleaseFast` and `ReleaseSmall`, bounds checks are omitted for slices, just as they are for `[*]T`, unless you enforce them manually with `@setRuntimeSafety`.
+
+---
+
+## 3. Why This Design?
+
+Zig’s array/slice/pointer design solves several long‑standing C pain points while avoiding the complexity of C++ or Rust, all under the “no hidden control flow” umbrella.
+
+### Arrays Don’t Decay
+
+In C, an array name in an expression decays to a pointer to its first element, losing size information. Zig arrays are first‑class values. You can pass an array by value (copy), pass a pointer to it (`*[N]T`), or slice it (`[]T`). The programmer decides. There is no silent transition from array to pointer—if you want a slice, you write the slice operation.
+
+### Slices Are the Universal Sequence View
+
+A slice is a pointer‑plus‑length pair, exactly like Rust’s `&[T]`. It does not own memory, it has no capacity, and it cannot grow. This makes slices trivially safe to pass around without worrying about hidden allocations. If you need a growable sequence, use `std.ArrayList`, which is built around an allocator and exposes a slice view via `.items`. The separation of “view” (slice) and “owner” (ArrayList) is intentional: it forces explicit allocation points and prevents the “who frees this?” confusion.
+
+### No Implicit Allocation for Concatenation
+
+In many languages, `+` on slices/strings performs an allocation under the hood. Zig’s `++` operator works only on arrays and slices with comptime‑known lengths, producing a new array or a slice pointing to static memory. For runtime concatenation you call `std.mem.concat` or use an `ArrayList`; both require you to pass an allocator. This ensures that every allocation is visible in the source.
+
+### Many-Item Pointers as an Escape Hatch
+
+`[*]T` exists for two reasons: C ABI compatibility and low‑level pointer arithmetic. It is the only pointer type that allows arithmetic without bounds. Zig nudges you toward slices, which carry length and enable runtime safety. The existence of `[*]T` acknowledges that some code must interface with C or perform unsafe operations; the type name’s `[*]` syntax is a visible marker of “danger ahead.”
+
+### Optional Pointers Instead of Implicit Null
+
+C’s `NULL` is a valid pointer value that the type system does not distinguish. Zig’s `?*T` is a distinct type: you cannot dereference it without first checking for null. This eliminates null‑pointer dereference bugs from all but the most deliberate `@as` casts.
+
+### Sentinels for Interop and Safety
+
+The sentinel annotation (`[:0]T`, `[*:0]T`) allows Zig to interface with C’s null‑terminated strings without runtime overhead. The compiler can statically verify that array literals and string literals have the promised sentinel, and it can insert bounds‑check assertions in debug mode when constructing sentinel slices.
+
+---
+
+## 4. Competing Approaches
+
+### C
+
+- **Arrays decay to pointers** in most contexts; the size must be passed separately. Zig arrays retain their length as part of the type and do not decay.
+- **Pointer + length pairs** are ad‑hoc; every API must document whether a pointer points to one element or many, and where the length is. Zig’s `[]T` formalizes this pair and the compiler enforces it.
+- **Nullability** is implicit; a `T*` may or may not be null. Zig’s `?*T` forces a check.
+- **Sentinel strings** rely on convention. Zig encodes sentinel information in the type system.
+
+### C++
+
+- `std::array<T, N>` is the closest analogue to Zig’s `[N]T`: a value type with size known at compile time.
+- `std::span<T>` (C++20) provides a non‑owning view much like `[]T`, but it still coexists with raw pointers and arrays that decay. Zig’s slice is the one idiomatic sequence view.
+- Operator overloading can hide allocations (e.g., `std::string` concatenation). Zig’s `++` is limited to comptime‑length sequences, so any runtime allocation must be explicit.
+- C++ references (`T&`) can be null in practice (via null pointer dereference). Zig’s references are simply pointers; if you want to guarantee non‑null, pass the pointee by value or use `*T` with a documented invariant.
+
+### Rust
+
+- Rust’s `[T; N]` (array) and `&[T]` (slice) are structurally identical to Zig’s array and slice. Both use fat pointers for slices. The key difference is **lifetimes**: Rust’s borrow checker enforces that a slice never outlives its backing memory. Zig relies on the programmer to uphold that invariant, offering `defer` and explicit allocators as tools.
+- Rust’s `Vec<T>` is analogous to `std.ArrayList`, but `Vec` is part of the language’s standard prelude. Zig’s ArrayList is a library type; the language itself has no growable collection type. This reinforces the “explicit allocation” pillar.
+- Rust’s `Option<&T>` is Zig’s `?*T`. Both eliminate null‑related UB.
+
+### Go
+
+- Go’s slices are reference types that carry a pointer, a length, *and a capacity*. They can grow via `append`, which may allocate a new backing array and copy. Zig’s slices never allocate; growth is handled by a separate `ArrayList`.
+- Go’s arrays are values but are rarely used directly because slices are the idiomatic sequence. Zig makes arrays a first‑class building block for fixed‑size buffers and stack‑based data, with slices as the natural view.
+- Go’s pointer types (`*T`) are analogous to Zig’s `*T`, but Go pointers are always initialized to `nil` for uninitialised variables, introducing implicit nullability. Zig forces you to use `undefined` (which is unsafe to dereference) or an optional.
+
+---
+
+## 5. Common Mistakes
+
+### Returning a Slice to a Local Array
+
+A slice is only as valid as the memory it points to. Returning a slice of a stack‑allocated array creates a dangling pointer.
+
+```zig
+fn badSlice() []const u8 {
+    var buf: [64]u8 = undefined;
+    // fill buf...
+    return buf[0..];   // ❌ buf goes out of scope → dangling slice
+}
+```
+
+**Fix:** Either allocate the buffer on the heap (pass an allocator) or let the caller provide the buffer.
+
+### Taking a Pointer to a Temporary Array
+
+Array literals like `&[_]u8{1,2,3}` produce a pointer to a comptime‑allocated constant (if the literal is comptime‑evaluated) or to a stack temporary. The following is safe because the array literal lives in static memory when used in a constant context:
+
+```zig
+const p: *const [3]u8 = &[_]u8{1,2,3}; // OK: static
+```
+
+But if you force a runtime context, the pointer may dangle. Always check that the lifetime of the target exceeds the pointer’s use.
+
+### Confusing `*[N]T` with `[]T`
+
+A `*[N]T` points to an entire array. Dereferencing it gives the array value, which you can then slice. A `[]T` is a fat pointer. You cannot directly assign a `*[N]T` to a function expecting `[]T`; you must first dereference and slice, or rely on coercion from `*[N]T` to `[]T` (Zig allows implicit coercion in some contexts, e.g., function arguments). The coercion is a convenience but it hides the conversion—be aware that it happens.
+
+```zig
+fn sum(slice: []const u8) u8 { ... }
+
+const arr: [4]u8 = .{1,2,3,4};
+sum(&arr);          // coercion *[4]u8 -> []const u8
+sum(arr[0..]);      // explicit slice, clearer intent
+```
+
+### Assuming a Slice Has Capacity
+
+Coming from Go, you might try to `append` to a slice. Zig’s `[]T` has no `append` method. Concatenation with `++` on runtime‑length slices is a compile error.
+
+```zig
+var s: []u8 = ...;
+s = s ++ [_]u8{5};  // error: ++ on slices requires comptime lengths
+```
+
+Use `std.ArrayList` or `std.mem.concat`.
+
+### Forgetting Sentinel Invariants
+
+If you coerce a regular slice to a sentinel slice, the compiler trusts that the sentinel exists. A missing sentinel leads to undefined behaviour when a function reads past the slice length expecting the sentinel.
+
+```zig
+const non_null_terminated: []const u8 = &[_]u8{'a','b'};
+const z: [:0]const u8 = @ptrCast(non_null_terminated); // UB!
+```
+
+Always ensure that the memory beyond the slice length contains the sentinel value. When in doubt, use `std.mem.sliceTo` to create a sentinel slice from a known‑terminated buffer.
+
+### Misusing `[*]T` for General‑Purpose Code
+
+`[*]T` lacks length, so indexing is always unsafe. Use slices unless you are forced by a C API. If you must accept a `[*]T`, immediately convert it to a slice with a provided length.
+
+---
+
+## 6. Performance Considerations
+
+### Array Copying Overhead
+
+Passing a large array by value copies every element, incurring O(N) cost and potentially blowing the stack. Prefer passing a `*const [N]T` or a slice. The slice (16 bytes) is cheap to copy and still provides indexed access.
+
+### Bounds Checking
+
+In `Debug` and `ReleaseSafe` modes, slice indexing inserts a runtime bounds check. The cost is negligible for most code, but in the hottest loops you may see a few extra instructions. If you have profiled and verified that the check is a bottleneck, you can switch to `ReleaseFast` (which omits checks) or use `@setRuntimeSafety(false)` on a specific block. However, never do this prematurely—bounds checks have caught countless latent bugs.
+
+An alternative for truly safety‑critical hot paths is to use a `[*]T` with manual length tracking and `@setRuntimeSafety` disabled, but this requires rigorous verification.
+
+### Cache Locality
+
+Slices provide a dense, contiguous memory view. Iterating over a slice with `for (slice) |item|` results in linear memory access, which the hardware prefetcher loves. This is the most cache‑friendly way to process sequences of data. The same holds for arrays, though a `for` over an array by value will copy each element unless you iterate by pointer: `for (&arr) |*item|`.
+
+### Pointer vs. Slice as Function Parameters
+
+Passing a slice costs 16 bytes (two registers). Passing a `*[N]T` costs 8 bytes (one register) but the length is fixed at compile time. If your function genuinely works with any length, the slice is the right choice; the extra register is free. If the length is a true constant (e.g., a cryptographic hash output size), `*const [32]u8` conveys that constraint to the type system and avoids runtime length loads.
+
+### No Allocation Overhead for Slicing
+
+Slicing is a pure register/stack operation; it never touches the heap. This makes it suitable for real‑time and embedded contexts where dynamic allocation is forbidden. You can slice stack arrays, static buffers, and memory‑mapped regions with equal ease.
+
+---
+
+## 7. Best Practices
+
+1. **Use slices for sequence parameters**
+   If a function reads a contiguous sequence of `T`, accept `[]const T`. If it modifies elements, accept `[]T`. This makes the function flexible (callers can pass arrays, other slices, ArrayList items, etc.).
+
+2. **Use `*const [N]T` when length is a compile‑time invariant**
+   Example: a SHA-256 compression function that always operates on a 64‑byte block. The type `*const [64]u8` documents the exact size, and the compiler can optimize based on the constant length.
+
+3. **Prefer slicing over raw `[*]T`**
+   Convert C‑style `[*]u8` + length pairs to a slice immediately at the API boundary. This enables bounds checking and makes the intent clear.
+
+4. **Explicitly check optional pointers**
+   Use `if (opt_ptr) |p| { ... }` or `opt_ptr orelse return error.NullPointer`. Do not `@intToPtr` a null unless you are absolutely certain.
+
+5. **Leverage sentinel slices for C interop**
+   When a C function expects `const char *`, pass `[:0]const u8`. Zig will coerce it to `[*:0]const u8` automatically. This documents the null‑termination requirement in your Zig code.
+
+6. **Initialize arrays with `undefined` only when you will overwrite every element**
+   This avoids paying the cost of zero‑initialisation when you intend to fill the array immediately. Be careful: reading an `undefined` element is undefined behaviour.
+
+7. **Use `std.mem.span` to construct a slice from a pointer and length**
+   This function is a safe wrapper that returns a slice, helping you avoid off‑by‑one errors when converting `[*]T` to `[]T`. For sentinel pointers, `std.mem.spanZ` works for `[*:0]T`.
+
+8. **Iterate by pointer when modifying array elements**
+   ```zig
+   for (&arr) |*elem| {
+       elem.* = process(elem.*);
+   }
+   ```
+   This avoids copying each element.
+
+---
+
+## 8. Examples
+
+All examples below are self‑contained; compile with `zig build-exe <file>.zig`.
+
+### Example 1: Summing a Slice
+
+```zig
+const std = @import("std");
+
+fn sumSlice(data: []const u32) u64 {
+    var total: u64 = 0;
+    for (data) |val| {
+        total += val;
+    }
+    return total;
+}
+
+pub fn main() !void {
+    const array = [_]u32{ 1, 2, 3, 4, 5 };
+    const result = sumSlice(&array);
+    std.debug.print("Sum: {}\n", .{result});
+}
+```
+
+### Example 2: Safe Null Pointer Handling
+
+```zig
+const std = @import("std");
+
+fn incrementOrZero(opt: ?*u32) u32 {
+    if (opt) |ptr| {
+        ptr.* += 1;
+        return ptr.*;
+    } else {
+        return 0;
+    }
+}
+
+pub fn main() !void {
+    var x: u32 = 10;
+    const a = incrementOrZero(&x);   // 11
+    const b = incrementOrZero(null); // 0
+    std.debug.print("a={}, b={}\n", .{ a, b });
+}
+```
+
+### Example 3: Sentinel Slice with C’s `printf`
+
+```zig
+const std = @import("std");
+const c = @cImport(@cInclude("stdio.h"));
+
+pub fn main() void {
+    const greeting: [:0]const u8 = "Hello, Zig!";
+    _ = c.printf("%s\n", greeting.ptr); // coercion to [*:0]const u8
+}
+```
+
+Build with `zig build-exe example.zig -lc`.
+
+### Example 4: Pointer to Array for Fixed‑Size Buffers
+
+```zig
+const std = @import("std");
+
+fn fillBuffer(buf: *[64]u8) void {
+    for (buf, 0..) |*byte, i| {
+        byte.* = @intCast(i % 256);
+    }
+}
+
+pub fn main() !void {
+    var buffer: [64]u8 = undefined;
+    fillBuffer(&buffer);
+    // buffer now contains 0..63
+    std.debug.print("Last byte: {}\n", .{buffer[63]});
+}
+```
+
+### Example 5: Converting C Pointer+Length to Slice
+
+```zig
+const std = @import("std");
+
+fn processData(ptr: [*]const u8, len: usize) void {
+    const slice: []const u8 = ptr[0..len];
+    // Now you can use slice with bounds checking (in safe modes)
+    for (slice) |byte| {
+        // ...
+    }
+}
+```
+
+---
+
+## 9. Summary & Exercises
+
+Arrays are fixed‑size value types, slices are runtime‑length fat pointers, and Zig’s pointer zoo encodes ownership and nullability with surgical precision. Together they give you direct, predictable control over memory layout while the compiler enforces safety wherever enough information exists.
+
+### Key Takeaways
+
+- Arrays do not decay; they must be explicitly sliced or pointed to.
+- Slices are pointer + length, carry no capacity, and never allocate.
+- `[*]T` is the unsafe many‑item pointer; use slices instead unless C interop demands otherwise.
+- Optional pointers (`?*T`) make null checks mandatory.
+- Sentinel types (`[:0]T`, `[*:S]T`) bridge to C string conventions without overhead.
+
+### Exercises
+
+1. **Sentinel Slice Printer**
+   Write a function `printChars(s: [:0]const u8) void` that prints each character on a new line using `std.debug.print("{c}\n", .{ch})`. The function must not rely on the null terminator for iteration; it should use the slice’s `.len` field. Verify that your function works with a string literal and with a manually constructed sentinel array.
+
+2. **Fixed‑Size Ring Buffer**
+   Implement a generic `RingBuffer(T, capacity: usize)` that stores elements in a `[capacity]T` array. Provide methods `push` and `pop` that operate in O(1). Do not allocate memory; the backing array is inside the struct. Expose read and write slices via methods `writableSlice()` and `readableSlice()` that return sub‑slices of the internal array. The ring buffer should never copy data unnecessarily.
+
+3. **Design Critique**
+   Consider a function signature from a C library: `void process(const uint8_t *data, size_t len)`. Translate it to the most idiomatic Zig counterpart, explaining why your choice is safer than the original. Then write a wrapper that accepts a `[:0]const u8` and forwards to the C function, ensuring the sentinel is not included in the length. Discuss the trade‑offs between using a sentinel slice and a regular slice when calling C APIs that do not require a terminator.

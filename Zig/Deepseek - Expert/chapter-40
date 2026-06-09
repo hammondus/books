@@ -1,0 +1,439 @@
+# Chapter 40: Freestanding & Embedded Systems Programming
+
+Zig treats bare‑metal and freestanding targets not as an afterthought but as a natural extension of its philosophy: **explicit control, no hidden runtime, and a standard library that adapts to the environment you define.** A Zig binary built for `thumb-freestanding-eabi` runs on raw silicon without an operating system, without dynamic memory management unless you wire one up, and without any assumption about a “main” function that returns to a host. This chapter shows you how to harness that control—from linker scripts and interrupt vector tables to toggling an LED with a single `zig build` invocation.
+
+---
+
+## 1. Basic Usage
+
+The first step into Zig’s embedded world is selecting a target that tells the compiler “there is no operating system.” A typical microcontroller target looks like this:
+
+```bash
+zig build-exe src/main.zig -target thumb-freestanding-eabi -mcpu cortex-m3 -O ReleaseSmall
+```
+
+- **`thumb-freestanding-eabi`**: the triple that selects the Thumb instruction set, no OS, and the embedded application binary interface.
+- **`-mcpu cortex-m3`**: tells LLVM which CPU features are available (e.g., hardware divide, specific pipeline).
+- **`-O ReleaseSmall`**: prioritises code size, critical for devices with 64 KiB of flash.
+
+This command generates an ELF file. Zig’s standard library is fully available—no `#![no_std]` attribute as in Rust, no separate `libcore`. It is the same `std` you use on Linux or macOS, but with parts that depend on an OS (like `std.fs` or `std.os`) gated behind compile‑time checks or configurable backends.
+
+However, an ELF file alone does not know where RAM and flash live. You need to provide a **linker script** that defines the memory map and output sections. With `build.zig` this becomes a repeatable, self‑documenting process:
+
+```zig
+// build.zig
+const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const target = b.resolveTargetQuery(.{
+        .cpu_arch = .thumb,
+        .cpu_model = .{ .explicit = &std.Target.arm.cpu.cortex_m3 },
+        .os_tag = .freestanding,
+        .abi = .eabi,
+    });
+    const optimize = .ReleaseSmall;
+
+    const exe = b.addExecutable(.{
+        .name = "blinky",
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    exe.setLinkerScriptPath(b.path("link.ld"));
+    // Override the default entry point symbol (optional, default is _start)
+    exe.root_module.entry = .{ .symbol_name = "_start" };
+
+    // Create a flashing step (OpenOCD)
+    const flash_cmd = b.addSystemCommand(&[_][]const u8{
+        "openocd",
+        "-f", "board/stm32f4discovery.cfg",
+        "-c", "program build/blinky.elf verify reset exit",
+    });
+    flash_cmd.step.dependOn(&exe.step);
+    b.getInstallStep().dependOn(&flash_cmd.step);
+}
+```
+
+**Key points:**
+- `setLinkerScriptPath` feeds your custom memory layout to LLD (Zig’s default linker).
+- `exe.root_module.entry` specifies the symbol the hardware will jump to on reset. If you omit it, Zig defaults to `_start` for freestanding targets, which aligns with embedded conventions.
+- A `SystemCommand` step can invoke OpenOCD, J‑Link, or any other tool, making flashing part of the build graph.
+
+A minimal `src/main.zig` that just halts the CPU looks like this:
+
+```zig
+const cpu = @import("cpu.zig"); // hypothetical register definitions
+
+export fn _start() callconv(.Naked) noreturn {
+    // On Cortex-M, the initial stack pointer and reset vector are in the vector table.
+    // This function becomes the reset handler.
+    asm volatile (
+        \\   bl main
+    );
+    unreachable;
+}
+
+fn main() noreturn {
+    // enable GPIO clock, configure pin, toggle LED
+    while (true) {}
+}
+```
+
+Even this snippet reveals several embedded‑specific patterns: `callconv(.Naked)` prevents the compiler from generating a prologue or epilogue, leaving the programmer in full control of the entry sequence (essential because the stack pointer may need manual setup); `noreturn` signals that `_start` never returns.
+
+In practice, most embedded projects will use a **vector table** defined in the linker script and populated with exported functions. The Zig standard library provides helpers like `std.start` that can invoke a custom `main` after zeroing `.bss` and copying `.data`, but building the startup code yourself is often more instructive and gives you complete control.
+
+---
+
+## 2. Under the Hood
+
+When you target `thumb-freestanding-eabi`, the compiler and linker operate with a few assumptions:
+
+- **No libc.** Zig’s `std` does not link against `libc` unless you explicitly request it. All platform abstractions that rely on an OS (`std.os`, `std.fs`) are conditionally available. For freestanding, you provide implementations for panic, logging, and allocators if you use them.
+- **LLVM backend.** The LLVM code generator emits Thumb/Thumb‑2 instructions, and LLVM’s integrated assembler handles directives. The self‑hosted backend (x86‑64, aarch64) is not yet available for ARM embedded targets; the LLVM backend is used automatically.
+- **Linker script control.** LLD reads your script to place code in flash and variables in RAM. Zig exposes the script through `setLinkerScriptPath`, and you can reference symbols defined in the script using `@extern`:
+
+```zig
+const _stack_start = @extern(*u32, .{ .name = "__stack_start" });
+```
+
+This gives you typed access to memory boundaries, enabling safe stack pointer initialization.
+
+- **Calling conventions for interrupts.** Zig provides `callconv(.Interrupt)` for ARM Cortex‑M processors (and other architectures that support hardware interrupt stacking). This convention automatically saves and restores the caller‑saved registers that the hardware does not preserve, and it uses the correct return instruction (e.g., `bx lr` with a special return value). For extreme low‑level control, `callconv(.Naked)` disables all prologue/epilogue generation.
+
+- **`comptime` evaluated device registers.** The standard library’s `std.zig` target information exposes detailed CPU features. You can use `@import("builtin").cpu` to conditionally compile peripheral definitions, but more powerful is the ability to generate entire register maps at compile time from SVD files using `@embedFile` and `comptime` parsing. This eliminates runtime overhead and ensures that register accesses are inlined constants.
+
+- **No hidden static constructors.** Zig has no C++‑style static initialization. All mutable global state must be explicitly initialized at runtime. The `_start` function (or a custom `callMain` from `std.start`) zeroes `.bss` and copies `.data` from flash to RAM. This determinism is critical for real‑time systems.
+
+Under the hood, the vector table is simply an array of function pointers placed in a special section. The linker script defines where the hardware expects it. For example:
+
+```zig
+export const vector_table linksection(".vector_table") = [_]?*const fn () callconv(.C) void{
+    @ptrCast(&_stack_start), // initial stack pointer
+    _start,                  // reset handler
+    default_handler,         // NMI
+    default_handler,         // HardFault
+    // ... other exceptions, then interrupts
+};
+```
+
+The `linksection` keyword places the array exactly where the script specifies. The MCU reads the first word as the stack pointer and the second as the address of the reset handler. Zig’s typed pointers ensure the table is correctly aligned and sized at compile time.
+
+---
+
+## 3. Why This Design?
+
+Zig’s embedded approach flows directly from its three thematic pillars.
+
+**No hidden control flow.** An interrupt handler does not magically allocate stack frames or unwind—the calling convention you specify is exactly what the hardware will use. No hidden runtime trampoline adjusts the stack; if you choose `callconv(.Naked)`, you are responsible for saving and restoring every register. This prevents surprises when a tick handler runs with a partial stack frame.
+
+**Explicit is better than implicit.** There is no built‑in concept of a “heap” or “scheduler.” You bring your own allocator (often `FixedBufferAllocator`) and explicitly pass it to any function that needs memory. The entry point, panic handler, and log backend are all explicitly wired via `std_options` or direct `@export`. This makes the boot sequence auditable line by line.
+
+**Comptime over runtime magic.** Register maps, peripheral base addresses, clock configurations, and even entire interrupt vector tables can be generated at compile time from SVD or CMSIS headers. This eliminates runtime parsing, reduces binary size, and catches misconfigured clocks before the code ever reaches silicon. The same `comptime` machinery that builds generic data structures in hosted Zig builds register accessors in freestanding Zig—no need for a separate code generator.
+
+The deliberate choice to avoid a separate `#![no_std]` ecosystem means that libraries written for desktop Zig can often be reused on a microcontroller with minimal changes—provided they accept an allocator and do not depend on OS features. The `std` library itself respects this: `std.log` can be redirected to a UART by setting a few `std_options` fields, and `std.testing` can run on embedded hardware with a custom panic handler that blinks an LED.
+
+---
+
+## 4. Competing Approaches
+
+### C (`avr-gcc`, `arm-none-eabi-gcc`)
+Embedded C relies on a combination of compiler intrinsics, linker scripts, and vendor‑provided CMSIS headers. Register access is either done through macros that expand to raw pointer dereferences or through `struct` overlays packed to exact layouts. Zig’s `packed struct` and `@intToPtr` provide the same low‑level capability, but with type safety: a misaligned pointer or a field that overflows a reserved bit can be caught at compile time. Zig also eliminates C’s macro‑driven vector table definition, replacing it with a compile‑time array of typed function pointers. The build system integration in Zig far surpasses the typical Makefile or CMake script for embedded C; cross‑compilation is a first‑class feature, not a separate toolchain download.
+
+### Rust (`embedded-hal`, `cortex-m-rt`)
+Rust’s embedded ecosystem centres on the `#![no_std]` attribute and the `embedded-hal` trait hierarchy. This provides excellent abstraction for peripherals (e.g., `OutputPin`) but forces a split between `std` and `core`. In Zig there is no such split; the same `std` library works everywhere. The `std_options` mechanism is simpler than Rust’s `#[panic_handler]` and `#[global_allocator]` because it is a single global configuration struct, not a collection of separate attributes. Zig’s `callconv(.Interrupt)` covers the same ground as Rust’s `#[interrupt]` proc macro, but without needing a proc macro system—it’s a built‑in language feature.
+
+### Go (TinyGo)
+TinyGo provides a Go compiler for embedded targets, but it carries the Go runtime (garbage collector, goroutine scheduler) into a constrained environment. The garbage collector can pause execution unpredictably, making it unsuitable for hard real‑time control without careful tuning. Zig has no runtime pause; memory management is entirely manual and deterministic. Additionally, TinyGo has its own standard library subset; Zig’s `std` is the same codebase, just compiled in a different mode.
+
+### C++ (freestanding subset)
+C++ offers a freestanding mode, but exceptions and RTTI are usually disabled, and the language still carries the complexity of constructors/destructors. Global constructors must be manually invoked before `main`, a hidden control flow that Zig avoids entirely. Zig’s `comptime` replaces templates for device register manipulation with shorter compile times and more readable error messages.
+
+The overarching advantage Zig brings is that the **same toolchain, the same language, and the same build system** work from a beefy x86‑64 server down to a Cortex‑M0. That consistency reduces cognitive load and maintenance burden for teams that span the hardware‑software boundary.
+
+---
+
+## 5. Common Mistakes
+
+**1. Forgetting to define a panic handler**
+On freestanding targets, `std.debug.panic` depends on a back‑end that may not exist. If you use `@panic` or an assertion fails, the compiler will look for a `panic` function. The default one calls `std.os.abort`, which is missing. Define your own:
+
+```zig
+pub const std_options = struct {
+    pub fn panic(msg: []const u8, stack_trace: ?*std.builtin.StackTrace, _: ?usize) noreturn {
+        // Halt, blink LED, or log to UART
+        while (true) {}
+    }
+};
+```
+
+**2. Using the wrong calling convention for interrupt handlers**
+A SysTick handler written with the default `callconv(.C)` will corrupt the stack because the compiler does not emit the exception return sequence (`bx lr` with `EXC_RETURN`). Always use `callconv(.Interrupt)` (or `callconv(.Naked)` for very special cases). The hardware will fault almost immediately.
+
+**3. Assuming `.bss` and `.data` are set up automatically**
+If you bypass `std.start` and write your own `_start`, you must zero `.bss` and initialize `.data` by copying from the load address (`__etext` or similar) to the virtual address. Failing to do so leaves global variables with garbage values. Use `@extern` to reference the boundaries defined in the linker script and a `for` loop to copy/zero.
+
+**4. Using the default allocators without backing memory**
+`std.heap.GeneralPurposeAllocator` requires a backing allocator (e.g., `page_allocator`) that calls the OS. On bare metal, use `std.heap.FixedBufferAllocator` with a static buffer, or an arena backed by a linker‑defined region.
+
+**5. Expecting `std.debug.print` to work**
+`std.debug.print` writes to stderr, which doesn’t exist. Redirect it by providing a custom `std_options.logFn` that sends bytes to a UART, or use a semihosting write. The same goes for `std.log`.
+
+**6. Not marking memory‑mapped register pointers as `volatile`**
+A write to a GPIO output register that the compiler might optimise away because it appears unused leads to a dark LED. Always declare peripheral register pointers as `*volatile T`. Zig’s `@intToPtr` returns a regular pointer; wrap it with `@as(*volatile u32, @ptrFromInt(address))`.
+
+**7. Overlooking the stack size**
+The linker script usually defines a stack area, but Zig’s type‑aware stack usage analysis (via `@sizeOf` and manual inspection) helps avoid overflows. Consider enabling `-fstack-protector` or using a stack canary if your MCU supports it.
+
+---
+
+## 6. Performance Considerations
+
+Embedded performance is measured in cycles, bytes, and microamps. Zig’s design offers several levers to pull.
+
+**Interrupt latency**
+`callconv(.Interrupt)` adds minimal overhead—it only saves the registers the ABI designates as caller‑saved that the hardware does not automatically stack. On Cortex‑M, this can be as low as 12 cycles for a handler that does nothing. By contrast, a handler written in C might rely on the compiler to generate the correct prologue, which could push extra registers if the function body uses them.
+
+**Code size**
+`ReleaseSmall` optimises for size, but you can also help the compiler by using `comptime` to prune dead code. For example, a register definition file that includes thousands of registers can inflate the binary if the linker cannot garbage‑collect unused functions. Using `comptime` to generate only the registers your application references keeps flash usage low.
+
+**Memory layout**
+Zig’s `packed struct` gives you bit‑level control over register maps without runtime shifting and masking. Compare:
+
+```zig
+const GpioMode = packed struct(u32) {
+    mode: u2,
+    _reserved: u6,
+    type: u1,
+    speed: u2,
+    pupd: u2,
+    _pad: u19 = 0,
+};
+```
+
+Accessing `reg.*.mode = 2` compiles to a single `str` instruction with an immediate mask—identical to hand‑tuned assembly.
+
+**Zero‑cost abstractions**
+The standard library’s `std.atomic` intrinsics map directly to the target’s exclusive‑load/store instructions. A lock‑free ring buffer written with `std.atomic.Queue` on a single‑core microcontroller compiles away to ordinary loads and stores if interrupts are disabled, and to correct memory barriers when shared with DMA.
+
+**Allocator overhead**
+A `FixedBufferAllocator` has zero runtime cost beyond a few pointer bumps. Using an arena for per‑request allocations in a command parser lets you recycle memory with a single reset, avoiding fragmentation and keeping worst‑case execution time constant.
+
+**Profiling in situ**
+On supported debug probes, you can use Zig’s integration with Tracy (`-Dtracy`) to profile interrupt handlers and task durations. The instrumentation overhead is a few cycles per zone, making it feasible even on 100 MHz cores.
+
+---
+
+## 7. Best Practices
+
+1. **Build the startup code from first principles, then reuse `std.start`.**
+   Writing a custom `_start` that zeroes `.bss` and copies `.data` once teaches you the memory layout. After that, consider using `std.start.callMain` (which does this for you) and focus on application logic.
+
+2. **Use `std_options` to redirect all system dependencies.**
+   Centralise your panic handler, log function, and allocator backend in one `config.zig` file. This keeps the target‑specific plumbing isolated and makes it trivial to switch from a UART to semihosting or RTT.
+
+3. **Define peripherals as `packed struct` overlays with `volatile` pointers.**
+   Avoid raw integer addresses scattered across the code. Group registers by peripheral:
+
+   ```zig
+   pub const Uart = extern struct {
+       dr: u32,
+       rsr_ecr: u32,
+       _reserved0: [4]u32,
+       fr: u32,
+       // ...
+   };
+   pub const UART0 = @as(*volatile Uart, @ptrFromInt(0x4000_C000));
+   ```
+
+   This makes register access self‑documenting and catches bit‑width mismatches at compile time.
+
+4. **Use comptime to validate hardware configuration.**
+   Compute clock divisors, check that a baud rate is achievable, and assert that pin assignments are valid—all at compile time. If a configuration is impossible, fail the build rather than silently producing a broken binary.
+
+5. **Allocate from static memory.**
+   Use `std.heap.FixedBufferAllocator` for tasks that need dynamic memory, and arena allocators for pools of uniform objects. Never call `std.heap.page_allocator` on bare metal unless you have an MMU and a page allocator implementation.
+
+6. **Protect critical sections with `std.atomic` and proper interrupt masking.**
+   Use `std.atomic.spinLoopHint` for short waits, and disable only the interrupts that contend for the same data. Zig’s atomics are type‑safe and compile to the target’s exclusive monitors or plain loads/stores as appropriate.
+
+7. **Write tests that run on the host for peripheral‑independent logic.**
+   Use `test` blocks with `std.testing.allocator` to exercise algorithms, protocol parsers, and command handlers. Only the hardware‑touching code needs on‑target testing.
+
+8. **Version your linker script and startup code along with the application.**
+   Changes to the memory map (e.g., reserving space for a bootloader) must be reflected in both. Keep them in the same repository, and use `@extern` references that will fail to link if a symbol is missing.
+
+---
+
+## 8. Examples
+
+### Complete Blinky for STM32F4 (Cortex‑M4)
+
+**link.ld** (excerpt):
+```ld
+MEMORY
+{
+    FLASH (rx) : ORIGIN = 0x08000000, LENGTH = 512K
+    RAM   (rwx): ORIGIN = 0x20000000, LENGTH = 128K
+}
+
+_estack = ORIGIN(RAM) + LENGTH(RAM);
+
+SECTIONS
+{
+    .vector_table : { KEEP(*(.vector_table)) } > FLASH
+    .text : { *(.text*) } > FLASH
+    .rodata : { *(.rodata*) } > FLASH
+    .data : {
+        __data_load = LOADADDR(.data);
+        __data_start = .;
+        *(.data*)
+        __data_end = .;
+    } > RAM AT > FLASH
+    .bss : {
+        __bss_start = .;
+        *(.bss*)
+        __bss_end = .;
+    } > RAM
+}
+```
+
+**src/main.zig**:
+```zig
+const std = @import("std");
+const builtin = @import("builtin");
+
+// ---------- std_options (panic handler) ----------
+pub const std_options = struct {
+    pub fn panic(msg: []const u8, _: ?*std.builtin.StackTrace, _: ?usize) noreturn {
+        // In a real system, log msg to UART or blink an LED.
+        while (true) {}
+    }
+};
+
+// ---------- Vector table ----------
+const vector_table linksection(".vector_table") = [_]?*const fn () callconv(.C) void{
+    @ptrCast(&_estack),
+    _start,
+    default_handler, // NMI
+    default_handler, // HardFault
+    default_handler, // MemManage
+    default_handler, // BusFault
+    default_handler, // UsageFault
+    null, null, null, null, // reserved
+    default_handler, // SVCall
+    default_handler, // DebugMon
+    null,             // reserved
+    default_handler, // PendSV
+    SysTick_Handler, // SysTick
+};
+
+// ---------- Symbols from linker script ----------
+extern const _estack: u32;
+extern var __data_load: u8;
+extern var __data_start: u8;
+extern var __data_end: u8;
+extern var __bss_start: u8;
+extern var __bss_end: u8;
+
+fn default_handler() callconv(.C) void {
+    while (true) {}
+}
+
+// ---------- Reset handler ----------
+export fn _start() callconv(.Naked) noreturn {
+    // Set stack pointer
+    asm volatile (
+        \\   ldr sp, =_estack
+        \\   bl  zig_main
+    );
+    unreachable;
+}
+
+fn zig_main() noreturn {
+    // Initialize .data and .bss
+    const data_load_addr: [*]const u8 = @ptrCast(&__data_load);
+    const data_start_addr: [*]u8 = @ptrCast(&__data_start);
+    const data_size = @intFromPtr(&__data_end) - @intFromPtr(&__data_start);
+    @memcpy(data_start_addr[0..data_size], data_load_addr[0..data_size]);
+
+    const bss_start: [*]u8 = @ptrCast(&__bss_start);
+    const bss_size = @intFromPtr(&__bss_end) - @intFromPtr(&__bss_start);
+    @memset(bss_start[0..bss_size], 0);
+
+    // Enable clocks for GPIOA (RCC_AHB1ENR, bit 0)
+    const RCC_AHB1ENR = @as(*volatile u32, @ptrFromInt(0x40023830));
+    RCC_AHB1ENR.* |= 1;
+
+    // Configure PA5 as output (GPIOA_MODER, bits 10‑11 = 01)
+    const GPIOA_MODER = @as(*volatile u32, @ptrFromInt(0x40020000));
+    GPIOA_MODER.* &= ~(@as(u32, 3) << 10); // clear
+    GPIOA_MODER.* |= (1 << 10);             // set as output
+
+    // Configure SysTick for 1 ms interrupts (optional blink timer)
+    const SYST_RVR = @as(*volatile u32, @ptrFromInt(0xE000E014));
+    const SYST_CSR = @as(*volatile u32, @ptrFromInt(0xE000E010));
+    const SYST_CVR = @as(*volatile u32, @ptrFromInt(0xE000E018));
+    SYST_RVR.* = 16000 - 1; // assuming 16 MHz clock
+    SYST_CVR.* = 0;
+    SYST_CSR.* = 0b111; // enable, tickint, clksource
+
+    // Simple LED toggle in a loop (also toggled in SysTick)
+    var led_state: u32 = 0;
+    while (true) {
+        // Wait for SysTick flag
+        while (systick_tick == 0) {}
+        systick_tick = 0;
+        led_state ^= 1;
+        if (led_state != 0) {
+            GPIOA_BSRR.* = (1 << 5); // set PA5
+        } else {
+            GPIOA_BSRR.* = (1 << (5 + 16)); // reset PA5
+        }
+    }
+}
+
+var systick_tick: volatile u32 = 0;
+
+const GPIOA_BSRR = @as(*volatile u32, @ptrFromInt(0x40020018));
+
+export fn SysTick_Handler() callconv(.Interrupt) void {
+    systick_tick = 1;
+}
+```
+
+**Build and flash**:
+```bash
+zig build
+```
+
+This example covers all fundamentals: linker script, vector table, manual startup, clock enable, GPIO output, SysTick interrupt with correct calling convention, and volatile access. It compiles to a few hundred bytes of flash.
+
+---
+
+## 9. Summary & Exercises
+
+This chapter demonstrated that Zig’s freestanding support is not an isolated “embedded mode” but a logical consequence of its design. By making no assumptions about the environment, Zig lets you build from the bare metal up using the same tools and idioms you use for server software.
+
+**Recap:**
+- Cross‑compilation to any freestanding target is a single flag.
+- Linker scripts and vector tables are first‑class citizens, integrated into `build.zig`.
+- `callconv(.Interrupt)` and `callconv(.Naked)` give exact hardware control.
+- `std_options` redirects OS‑dependent hooks, enabling the full standard library on bare metal.
+- Memory‑mapped I/O is handled with `*volatile` and `packed struct` for zero‑overhead abstraction.
+- Comptime can validate entire hardware configurations at compile time.
+
+---
+
+### Exercises
+
+**1. UART Driver with Ring Buffer**
+Implement a minimal UART driver for a Cortex‑M4 that uses a ring buffer (from `std.atomic.Queue` or built yourself). The TX path should be interrupt‑driven: when the transmit data register is empty, the interrupt handler pulls the next byte from the buffer and writes it. The RX handler pushes received bytes into a separate buffer. Provide a `write` function that enqueues data and enables the TX empty interrupt if not already running. Ensure all data races are eliminated by using atomic operations or by masking interrupts in critical sections.
+
+**2. Custom Linker Script for a Bootloader**
+Write a linker script that places an application at offset `0x08008000` (32 KiB into flash) to coexist with a bootloader at `0x08000000`. Modify the startup code to copy `.data` from the correct load address and set the vector table offset register (`SCB_VTOR`) to the application’s vector table. Write a minimal bootloader in Zig that reads a new application image from an external SPI flash and writes it to the application region, then jumps to the new reset handler. Pay attention to stack setup and interrupt vector relocation.
+
+**3. Preemptive Scheduler Using PendSV**
+Implement a simple round‑robin scheduler for Cortex‑M that context‑switches on every SysTick. Each task has its own stack and a saved context (R4‑R11, LR, PC). Use PendSV to perform the actual switch, triggered from the SysTick handler. Ensure the scheduler uses no heap; task stacks are static arrays. Write a demo with three tasks that blink LEDs at different rates and pass a token via a lock‑free queue. Prove that no task starves and that interrupts remain responsive.
+
+These exercises will stretch your understanding of the hardware/software interface and show how Zig’s explicit control lets you build reliable, debuggable systems from the ground up.

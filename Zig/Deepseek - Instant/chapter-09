@@ -1,0 +1,590 @@
+# Chapter 9: Organizing Code with Modules
+
+In systems programming, the way you partition code into files and manage dependencies directly affects build times, cognitive load, and long-term maintainability. Zig’s module system is deliberately minimal—no header files, no preprocessor, no implicit visibility—yet it scales from single-file prototypes to multi-package projects with hundreds of modules. This chapter dissects how Zig’s file-as-module model works, how the compiler resolves imports, and how to structure real-world projects using `build.zig.zon` for package management.
+
+---
+
+## 1. Basic Usage
+
+The “How.” Runnable code snippets showing syntax and minimal API.
+
+### Files Are Modules, Imports Are Paths
+
+Every `.zig` file defines a module. The root module is the file passed to `zig build-exe` (e.g., `main.zig`). Use `@import` to bring another module’s public declarations into scope:
+
+```zig
+// math.zig
+pub const PI = 3.14159265358979323;
+pub fn add(a: i32, b: i32) i32 {
+    return a + b;
+}
+pub const Calculator = struct {
+    sum: i32,
+    fn new() Calculator {
+        return .{ .sum = 0 };
+    }
+};
+
+// main.zig
+const math = @import("math.zig");
+const std = @import("std");
+
+pub fn main() !void {
+    const result = math.add(40, 2);
+    std.debug.print("40 + 2 = {d}\n", .{result});
+    std.debug.print("PI = {d}\n", .{math.PI});
+}
+```
+
+Compile with `zig build-exe main.zig` – Zig automatically finds `math.zig` in the same directory.
+
+### Visibility: `pub` is the Only Import Gate
+
+Declarations are **private by default**. Only items marked `pub` are visible to importers:
+
+```zig
+// library.zig
+const secret = 42;          // not accessible from other modules
+pub const exposed = 43;     // accessible
+fn hidden() void {}         // private
+pub fn api() void {}        // public
+```
+
+### Subdirectories and Nested Modules
+
+A module can import other modules relative to its own path. Zig does **not** automatically treat directories as namespaces; you must explicitly create an entry point:
+
+```zig
+// utils/print.zig
+const std = @import("std");
+pub fn info(comptime fmt: []const u8, args: anytype) void {
+    std.debug.print(fmt, args);
+}
+
+// utils/hash.zig
+pub fn crc32(data: []const u8) u32 {
+    // ...
+}
+
+// utils/mod.zig – convention: re-export submodules
+pub const print = @import("print.zig");
+pub const hash = @import("hash.zig");
+
+// main.zig
+const utils = @import("utils/mod.zig");
+pub fn main() void {
+    utils.print.info("Hello\n", .{});
+}
+```
+
+Relative imports use `@import("./sub/file.zig")` or `@import("../parent.zig")`. The path must start with `./` or `../`; bare names like `@import("foo")` search the same directory as the current file, then fall back to package roots.
+
+### Package Management with `build.zig.zon`
+
+For external dependencies, Zig 0.13+ uses the **Zig Object Notation (ZON)** file `build.zig.zon` to declare packages. A typical `build.zon.zon` (the canonical name is `build.zig.zon` at project root):
+
+```zon
+.{
+    .name = "my_server",
+    .version = "0.1.0",
+    .dependencies = .{
+        .httpz = .{
+            .url = "https://github.com/karlseguin/httpz/archive/refs/tags/0.5.0.tar.gz",
+            .hash = "1220a8b3c2d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+    },
+}
+```
+
+In `build.zig`, you add the dependency to your executable:
+
+```zig
+// build.zig (partial)
+const exe = b.addExecutable(.{
+    .name = "my_server",
+    .root_source_file = .{ .path = "src/main.zig" },
+    .target = target,
+    .optimize = optimize,
+});
+const httpz = b.dependency("httpz", .{});
+exe.root_module.addImport("httpz", httpz.module("httpz"));
+```
+
+Then in your code:
+
+```zig
+const httpz = @import("httpz");
+```
+
+The hash in `build.zig.zon` ensures reproducible builds – Zig verifies the downloaded tarball matches the hash.
+
+---
+
+## 2. Under the Hood
+
+The “Engine.” Discussion of the compiler, memory representation, and runtime behavior.
+
+### No Header Files – Separate Compilation Without Duplication
+
+Traditional C/C++ separation relies on **header files** that duplicate declarations (function prototypes, struct layouts). Zig entirely eliminates this. The compiler, when it sees `@import("math.zig")`:
+
+1. **Locates the file** using a resolution algorithm (relative path → package root → system).
+2. **Parses the source file** into an AST, but does **not** re-parse transitive dependencies multiple times – the AST is cached per file.
+3. **Performs semantic analysis** (type checking, comptime evaluation) **only once** per module, regardless of how many times it’s imported.
+4. **Emits a “module hash”** based on the file’s content and all its dependencies’ hashes. This enables incremental recompilation.
+
+Crucially, **no separate “module map”** or header search path list exists (like `-I` in C). Zig’s import resolution is deterministic: it starts from the importing file’s directory, then consults the package root (set by the build system). There is no global include path – a conscious choice to prevent hidden, environment-dependent builds.
+
+### Memory Representation of a Module at Compile Time
+
+During compilation, the compiler holds a `Module` struct (in the compiler’s internal data structures) that contains:
+
+- An **AST** (Abstract Syntax Tree) of the file.
+- A **symbol table** mapping public names to their declarations (functions, types, variables).
+- A **dependency graph** edge to each imported module.
+
+When you import a module, the compiler does **not** copy its declarations into the importing module’s namespace. Instead, `@import` returns a **struct type** (at comptime) whose fields are the public declarations. This is why you write `math.add()` – `math` behaves exactly like a `struct` instance at compile time.
+
+### Separate Compilation (When It Happens)
+
+Zig **does not** currently (0.13) have a traditional separate compilation model where each `.o` file is built independently. The compiler operates on **whole programs** after parsing all modules. However, the build system allows caching of **intermediate results** per module, enabling incremental rebuilds. The self-hosted compiler (actively developed) aims to introduce true incremental compilation while preserving the no-header-file model.
+
+For large projects, the practical effect is that **modularity does not reduce final binary size** (dead code elimination still works) but **does affect compile time**: well-modularized code allows the build system to skip re-parsing unchanged files.
+
+### Build System Integration: `std.Build` and `LazyPath`
+
+The build system (`build.zig`) constructs a module graph explicitly. You can add multiple modules to an executable:
+
+```zig
+const exe = b.addExecutable(.{...});
+const mod1 = b.createModule(.{
+    .root_source_file = .{ .path = "src/mod1.zig" },
+    .imports = &.{
+        .{ .name = "helper", .module = helper_mod },
+    },
+});
+exe.root_module.addImport("mod1", mod1);
+```
+
+Each module can have its own set of imports, allowing fine‑grained dependency control without global namespaces.
+
+---
+
+## 3. Why This Design?
+
+The “Philosophy.” Why Zig chooses *this* instead of the obvious alternative.
+
+### No Header Files → No Duplication, No Preprocessor
+
+The C preprocessor’s textual inclusion (`#include`) is a frequent source of bugs: missing guards cause double definition; macros leak across headers; declarations must be manually kept in sync. Zig’s `@import` is **semantic** – the compiler reads the Zig source directly. There is no separate declaration file to maintain, and no macro hijacking.
+
+### Explicit Imports, No Implicit Transitive Visibility
+
+In many languages (C++, Python), importing a module also imports everything that module imports. Zig **requires** you to import directly any module you use:
+
+```zig
+// a.zig
+pub const X = 1;
+
+// b.zig – imports a.zig
+const a = @import("a.zig");
+pub const Y = a.X;
+
+// c.zig – wants to use X
+const a = @import("a.zig");  // must import explicitly
+// const b = @import("b.zig"); // b.Y does NOT give access to a.X unless b re‑exports it
+```
+
+This prevents **dependency leakage** and makes code reviews easier – you can see exactly which modules a file depends on.
+
+### File as Module → No Module Registry
+
+Languages like Rust require `mod` declarations to build a module tree, and Go uses `package` names with directory-based namespaces. Zig’s rule is **simpler**: one Zig file = one module. The mapping from import string to file path is mostly deterministic (relative + package roots). This avoids needing to maintain a separate module manifest file (like `Cargo.toml`’s `[lib]` or Go’s `go.mod` for internal modules).
+
+### Why `build.zig.zon` For External Packages?
+
+Zig’s standard library does **not** include a built-in package registry. Instead, the build system reads a declarative ZON file. The design choices:
+
+- **URL + hash** eliminates a central registry (you can host packages anywhere – GitHub, GitLab, your own server).
+- **Hash verification** guarantees reproducible builds (unlike Cargo’s `Cargo.lock` which still trusts the registry).
+- **No version solving** – you are expected to manually pick compatible versions, reducing complexity.
+
+This reflects Zig’s philosophy: **explicit over implicit, even at the cost of convenience**.
+
+---
+
+## 4. Competing Approaches
+
+Direct comparison with C, Rust, Go, C++, and Python.
+
+| **Language** | **Module System** | **Key Trade‑off** |
+|--------------|------------------|--------------------|
+| **C** | Header files + `#include` (textual) | Extremely flexible but error‑prone: macro leaks, duplicate declarations, no encapsulation. |
+| **C++ (pre‑20)** | Same as C, plus `#include` of header files | Adds namespaces, but still textual inclusion. Slow compile times due to repeated parsing. |
+| **C++20 Modules** | `import` + `.ixx` files | Solves textual inclusion but complex syntax, compiler support still uneven. Retains header/implementation split. |
+| **Rust** | `mod` declarations + `crate` / `pub use` | Fine‑grained control, explicit module tree. Can be verbose; `crate::` paths require mental mapping. |
+| **Go** | Directory = package, `import "path"` | Simple, fast. Implicitly exports uppercase names. No control over visibility within a package. |
+| **Python** | `import` searches `sys.path` | Dynamic, runtime module resolution. Implicit re‑export of imported names. |
+| **Zig** | File = module, `@import` with no header | Zero duplication, no preprocessor, but you must manually re‑export transitive dependencies. |
+
+### Zig vs. Rust: Explicit Imports Win for Clarity
+
+Rust’s module system allows `use crate::foo::bar;` which can rename and re‑export in complex ways. Zig’s `@import("foo.zig")` always returns a struct – no special syntax for renaming (you can assign to a local constant: `const f = @import("foo.zig");`). Zig lacks Rust’s `pub use` chaining, which forces you to be explicit but avoids indirection.
+
+### Zig vs. Go: No Magic Exports
+
+Go capitalizes public identifiers (`func Add()`). Zig requires `pub`. Go’s package system treats every `.go` file in a directory as part of the same package (visibility across files without `pub`). Zig treats each file as an independent module – if you want a multi-file “package”, you create a `mod.zig` that re‑exports the submodules. This is more explicit but adds a little boilerplate.
+
+### Zig vs. C Headers: The Elimination of ODR Violations
+
+C’s One Definition Rule (ODR) is routinely violated when headers define variables or non‑inline functions across multiple translation units. Zig’s `@import` never duplicates definitions; the compiler sees each module exactly once. If a module defines a global variable, there is only one instance across the entire program – no more `static` hacks in headers.
+
+---
+
+## 5. Common Mistakes
+
+The “Gotchas.” Specific pitfalls for developers coming from other ecosystems.
+
+### Mistake 1: Forgetting `pub` on Everything You Import
+
+```zig
+// utils.zig
+fn helper() void {}  // forgot pub
+const VALUE = 42;    // forgot pub
+
+// main.zig
+const utils = @import("utils.zig");
+utils.helper(); // error: no field 'helper'
+```
+
+**Fix**: Mark exported functions and constants with `pub`. Use `pub const` for types.
+
+### Mistake 2: Assuming Transitive Imports
+
+```zig
+// a.zig
+pub const X = 1;
+
+// b.zig
+const a = @import("a.zig");
+pub const Y = a.X;
+
+// c.zig
+const b = @import("b.zig");
+const x = b.X; // ERROR! b has no field 'X'
+```
+
+**Fix**: Either import `a.zig` directly in `c.zig`, or have `b.zig` re‑export it: `pub const X = a.X;`.
+
+### Mistake 3: Circular Imports
+
+Zig detects circular imports at compile time:
+
+```zig
+// a.zig
+const b = @import("b.zig");
+pub const A = 1;
+
+// b.zig
+const a = @import("a.zig");
+pub const B = a.A; // cycles
+```
+
+The compiler error is clear: `unable to import 'a.zig': cyclical import dependency`. Break the cycle by moving shared declarations to a third module.
+
+### Mistake 4: Incorrect `build.zig.zon` Hash
+
+If you modify a dependency’s URL or version without updating the hash, Zig will refuse to build:
+
+```
+error: hash mismatch: expected 1220a8b... got 3f4e5d6...
+```
+
+**Fix**: After changing the URL, run `zig build` – Zig prints the correct hash. Copy it into `build.zig.zon`.
+
+### Mistake 5: Overusing `@import` with Relative Paths That Break on Refactoring
+
+`@import("./sub/foo.zig")` is brittle if you move the importing file. Prefer **package‑relative imports**: define a module in `build.zig` and import by name (`@import("my_package/sub/foo")`). The build system then resolves the path from the package root.
+
+---
+
+## 6. Performance Considerations
+
+The “Cost.” Instruction count, allocation overhead, cache locality.
+
+### Compile‑Time Overhead
+
+- **Parsing each `.zig` file** costs O(N) in file size. Zig’s parser is hand‑written and fast (single pass), but deeply nested imports multiply the number of files parsed.
+- **Caching**: Zig caches the parsed AST for each file. If you import `math.zig` from 10 different places, it is parsed once.
+- **Incremental builds**: The build system re‑compiles a module only if its source or any of its imports changed (content‑hashed). Well‑modularized code can dramatically speed up rebuilds during development.
+
+### Runtime Overhead: Zero
+
+Modules have **no runtime cost**. All `@import` statements are resolved at compile time. The generated machine code is identical to a monolithic source file – there is no “module boundary” overhead such as dynamic dispatch or hidden indirection.
+
+### Separate Compilation vs. Whole‑Program Optimization
+
+Because Zig currently compiles whole programs, the optimizer (LLVM) can inline across module boundaries aggressively. This yields better runtime performance than C’s traditional separate compilation with LTO (Link Time Optimization) often disabled. The downside: linking a large project may use more memory. For embedded targets, this is rarely an issue.
+
+### Binary Size and Dead Code Elimination
+
+Unused public declarations in a module **do not** increase binary size – the linker (LLD or GNU ld) strips unreachable code. However, if a module exports a large table that is only partially used, you may need to refactor to avoid pulling in irrelevant data.
+
+### Recommendation for Fast Builds
+
+Group tightly coupled functionality into **one module** (e.g., a hash table implementation and its tests). Splitting each tiny function into its own file increases `@import` overhead and file I/O, slowing down both parsing and the build system’s dependency checking.
+
+---
+
+## 7. Best Practices
+
+The “Idiomatic Way.” How to write Zig that looks like the standard library.
+
+### Practice 1: One Logical Component Per File
+
+The Zig standard library typically places one major type or set of related functions in a file (e.g., `std/array_hash_map.zig`). Follow this pattern:
+
+```zig
+// user.zig – defines User type and operations
+pub const User = struct { id: u64, name: []const u8 };
+pub fn validate(u: User) bool { ... }
+pub fn serialize(u: User, out: anytype) !void { ... }
+```
+
+### Practice 2: Use `mod.zig` as a Package Entry Point
+
+For subdirectories that represent a cohesive package, create a `mod.zig` that re‑exports the public API:
+
+```zig
+// src/net/mod.zig
+pub const client = @import("client.zig");
+pub const server = @import("server.zig");
+pub const protocol = @import("protocol.zig");
+```
+
+Then importers write `const net = @import("net/mod.zig");` and access `net.client.connect()`.
+
+### Practice 3: Declare All Imports at Top of File, Sorted
+
+Place all `@import` statements before any other code, grouped logically (standard library first, then internal modules, then external packages). This mirrors Zig’s own style:
+
+```zig
+const std = @import("std");
+const assert = std.debug.assert;
+
+const internal = @import("internal.zig");
+const utils = @import("utils/mod.zig");
+const httpz = @import("httpz");
+```
+
+### Practice 4: Use `test` Blocks Inside Modules
+
+Each module can contain its own tests. Run them with `zig test math.zig` or via `zig build test`:
+
+```zig
+// math.zig
+pub fn add(a: i32, b: i32) i32 { return a + b; }
+
+test "add works" {
+    try std.testing.expectEqual(@as(i32, 5), add(2, 3));
+}
+```
+
+### Practice 5: Explicit Re‑export of Transitive Dependencies
+
+If your module depends on another module’s types, and you expect callers to need those types, re‑export them explicitly:
+
+```zig
+// db.zig
+const pool = @import("connection_pool.zig");
+pub const ConnectionPool = pool.ConnectionPool; // re‑export
+pub const QueryResult = @import("result.zig").QueryResult;
+```
+
+This reduces the number of imports caller needs.
+
+### Practice 6: Structure `build.zig.zon` Paths Minimally
+
+Only list directories that contain source files in `.paths`. This prevents Zig from watching irrelevant files (like `.git`, `docs`) for changes, speeding up incremental builds.
+
+---
+
+## 8. Examples
+
+Minimal but complete examples that crystallize the concept; every example is buildable with `zig build-exe`.
+
+### Example 1: Multi‑File Project Without Build System
+
+Directory layout:
+```
+project/
+├── main.zig
+├── math.zig
+└── utils/
+    └── print.zig
+```
+
+**math.zig**:
+```zig
+pub fn square(x: i32) i32 {
+    return x * x;
+}
+```
+
+**utils/print.zig**:
+```zig
+const std = @import("std");
+pub fn result(value: i32) void {
+    std.debug.print("Result: {d}\n", .{value});
+}
+```
+
+**main.zig**:
+```zig
+const math = @import("math.zig");
+const print = @import("utils/print.zig");
+
+pub fn main() void {
+    const x = math.square(7);
+    print.result(x);
+}
+```
+
+Build and run:
+```bash
+$ zig build-exe main.zig
+$ ./main
+Result: 49
+```
+
+### Example 2: Using an External Package (HTTPz)
+
+Assume `build.zig.zon` as shown earlier. **build.zig** (simplified):
+
+```zig
+const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    const exe = b.addExecutable(.{
+        .name = "webserver",
+        .root_source_file = .{ .path = "src/main.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const httpz = b.dependency("httpz", .{});
+    exe.root_module.addImport("httpz", httpz.module("httpz"));
+
+    b.installArtifact(exe);
+}
+```
+
+**src/main.zig**:
+```zig
+const std = @import("std");
+const httpz = @import("httpz");
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var server = try httpz.Server(.{}).init(allocator, .{ .port = 8080 });
+    defer server.deinit();
+
+    server.get("/", hello, .{});
+    try server.listen();
+}
+
+fn hello(_: *httpz.Request, res: *httpz.Response) !void {
+    try res.send("Hello from Zig!");
+}
+```
+
+Build with `zig build`. The import `httpz` resolves to the dependency declared in `build.zig`.
+
+### Example 3: Package with Re‑export Module
+
+Directory:
+```
+data_structures/
+├── mod.zig
+├── array_list.zig
+└── hash_map.zig
+```
+
+**data_structures/array_list.zig**:
+```zig
+pub fn ArrayList(comptime T: type) type {
+    return struct { ... };
+}
+```
+
+**data_structures/hash_map.zig**:
+```zig
+pub fn HashMap(comptime K: type, comptime V: type) type {
+    return struct { ... };
+}
+```
+
+**data_structures/mod.zig**:
+```zig
+pub const array_list = @import("array_list.zig");
+pub const hash_map = @import("hash_map.zig");
+```
+
+Consumer:
+```zig
+const ds = @import("data_structures/mod.zig");
+const ArrayList = ds.array_list.ArrayList(i32);
+const HashMap = ds.hash_map.HashMap(u64, []const u8);
+```
+
+---
+
+## 9. Summary & Exercises
+
+### Summary
+
+- **Files are modules**: Use `@import` with a file path; only `pub` declarations are visible.
+- **No headers**: Zig parses Zig source directly – no duplication, no macros.
+- **Explicit imports**: Transitive dependencies are not automatically available; re‑export if needed.
+- **Package management**: `build.zig.zon` declares external dependencies via URL + hash; `build.zig` adds them as imports.
+- **Performance**: Zero runtime cost; compile‑time overhead is mitigated by caching and incremental compilation.
+- **Modularity discipline**: Split by logical component, use `mod.zig` entry points, and keep tests close to the code.
+
+### Exercises
+
+**Exercise 1: Convert a Monolithic Program to Modules**
+Take a single‑file Zig program of at least 150 lines (e.g., a CSV parser or a small HTTP client). Refactor it into three modules: `io.zig` (file reading/writing), `parse.zig` (parsing logic), and `main.zig`. Ensure each module exposes only the necessary `pub` functions. Write a `build.zig` that compiles them together. Measure the difference in compilation time (`zig build --summary all`) before and after.
+
+**Exercise 2: Create a Reusable Package with `build.zig.zon`**
+Implement a simple ring buffer (`RingBuffer(T, capacity: comptime_int)`) in its own directory with a `build.zig.zon` file and a `build.zig` that exposes the module. Publish it to a local HTTP server or a GitHub tarball. Then create a separate project that depends on it by URL and hash. Verify that Zig downloads and caches the dependency correctly, and that changing the tarball without updating the hash causes a build error.
+
+**Exercise 3: Diagnose and Fix a Cyclic Import**
+Given the following two files, explain why they cause a compile error and restructure them to eliminate the cycle without merging into one file.
+
+```zig
+// events.zig
+const handlers = @import("handlers.zig");
+pub const Event = struct { ... };
+pub fn dispatch(e: Event) void { handlers.onEvent(e); }
+
+// handlers.zig
+const events = @import("events.zig");
+pub fn onEvent(e: events.Event) void { ... }
+```
+
+Your solution should introduce a third module (e.g., `core.zig`) that defines `Event` and removes the direct mutual imports.
+
+**Exercise 4 (Advanced): Build a Module Graph Visualizer**
+Write a comptime function that recursively traverses `@import` calls in a given root module (using `@typeInfo` and `@import`’s compile‑time reflectivity) and prints a DOT (graph description language) representation of the module dependency graph. Run it on a non‑trivial Zig codebase (e.g., a parser generator). This exercise forces you to understand how Zig represents imports at comptime and how to avoid infinite recursion.

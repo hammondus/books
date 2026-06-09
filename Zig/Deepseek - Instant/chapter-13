@@ -1,0 +1,374 @@
+## Chapter 13: Strings and Unicode
+
+Zig does not have a built-in `string` type. Instead, it treats strings as sequences of bytes—specifically, UTF-8 encoded text stored in mutable or immutable slices. This design reflects Zig’s philosophy: avoid hidden costs, keep memory representation transparent, and give the programmer complete control over encoding and validation. In this chapter, you will learn how to work with Zig strings in idiomatic, performant, and safe ways, including UTF-8 iteration, concatenation, C interoperation, and compile-time string processing.
+
+### 13.1 Basic Usage
+
+In Zig, a string literal is of type `*const [N:0]u8`, where `N` is the length (excluding the implicit null terminator). This coerces to `[:0]const u8` (a known-length, null-terminated slice) and also to `[]const u8` (a simple slice without the null terminator guarantee). Most string operations work with `[]const u8`; the null terminator is only required when passing strings to C APIs.
+
+```zig
+const std = @import("std");
+
+pub fn main() !void {
+    // String literal: type *const [5:0]u8 -> coerces to []const u8
+    const greeting = "Hello";
+    std.debug.print("Length: {d}\n", .{greeting.len}); // 5
+
+    // Concatenation: use std.mem.concat or (preferably) std.fmt.allocPrint
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const name = "Zig";
+    const message = try std.fmt.allocPrint(allocator, "{s}, {s}!", .{ greeting, name });
+    defer allocator.free(message);
+    std.debug.print("{s}\n", .{message}); // "Hello, Zig!"
+
+    // UTF-8 iteration: do NOT index by byte to get characters
+    const chinese = "你好"; // 6 bytes, 2 code points
+    var it = std.unicode.Utf8Iterator.init(chinese);
+    while (it.nextCodepoint()) |cp| {
+        std.debug.print("U+{X:0>4}\n", .{cp}); // U+4F60, U+597D
+    }
+
+    // Validate UTF-8 from external source
+    const maybe_invalid = "\x80\x81"; // invalid continuation bytes
+    if (std.unicode.utf8ValidateSlice(maybe_invalid)) {
+        std.debug.print("valid\n", .{});
+    } else {
+        std.debug.print("invalid UTF-8\n", .{}); // this prints
+    }
+}
+```
+
+#### Common String Operations
+
+| Operation | Idiomatic Zig | Notes |
+|-----------|---------------|-------|
+| Length (bytes) | `str.len` | O(1) |
+| Length (code points) | `std.unicode.utf8CountCodepoints(str)` | O(n), validates |
+| Concatenation | `std.fmt.allocPrint(alloc, "{s}{s}", .{a, b})` | Prefer over `mem.concat` |
+| Substring | `str[start..end]` | Byte indexes, must be on char boundary |
+| Find byte | `std.mem.indexOfScalar(u8, str, '@')` | Works on bytes |
+| Find substring | `std.mem.indexOfPos(u8, str, start, "needle")` | Byte search |
+| Compare | `std.mem.eql(u8, a, b)` or `==` (for slices) | |
+| Trim whitespace | `std.mem.trim(u8, str, " \t\r\n")` | |
+| Split | `std.mem.split(u8, str, delim)` | Returns iterator |
+| Join | `std.mem.join(alloc, sep, items)` | Allocates result |
+
+### 13.2 Under the Hood
+
+Zig’s string representation is a direct view into memory. No hidden encoding tag, no capacity field, no small‑string optimisation (SSO) – just a pointer and a length. This mirrors how systems programmers already think about buffers.
+
+#### Memory Layout
+
+- **String literal**: Stored in the `.rodata` section of the binary. The compiler appends a null byte after the last character, giving the `[N:0]` sentinel-terminated array type. The null byte is not counted in `len`.
+
+- **`[]const u8`** (runtime slice): Two machine words (pointer + length). The pointer may point to any memory (global, heap, stack).
+
+- **`[:0]const u8`** (null‑terminated slice): Same layout as `[]const u8` but with a compile‑time guarantee that `ptr[len] == 0`. No extra storage – the null byte already exists at the end of the referenced memory.
+
+- **`*const [N:0]u8`** (known length at comptime): Used only for literals and comptime‑known arrays. The length `N` is part of the type.
+
+#### Null Terminator: Required Only at Boundaries
+
+Zig does not rely on null terminators internally. The built‑in `@typeInfo` and `std.mem` functions use the slice length. The `[:0]` pointer exists solely to satisfy C APIs that expect null‑terminated strings. Converting `[]const u8` to `[:0]const u8` requires either a compile‑time known zero termination or a runtime check / allocation:
+
+```zig
+const std = @import("std");
+
+fn takesNullTerminated(s: [:0]const u8) void {
+    _ = s;
+}
+
+pub fn main() !void {
+    const runtime_str = "hello" ** 2; // known at runtime? Actually const, but not comptime-known length.
+    // This would NOT compile because runtime_str may not have a null terminator:
+    // takesNullTerminated(runtime_str);
+
+    // Option 1: guarantee at comptime (for literals or comptime-known arrays)
+    comptime takesNullTerminated("comptime lit");
+
+    // Option 2: allocate a null-terminated copy
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+    const copy = try alloc.dupeZ(u8, runtime_str);
+    defer alloc.free(copy);
+    takesNullTerminated(copy); // copy has type [:0]const u8
+}
+```
+
+#### UTF-8 Encoding Awareness
+
+Zig’s standard library provides UTF-8 validation and iteration functions, but the language itself treats strings as bytes. This means that slicing a string with byte indexes may split a multi-byte code point, producing invalid UTF-8. It is the programmer’s responsibility to avoid this, or to use validation functions to stay on character boundaries.
+
+### 13.3 Why This Design?
+
+Zig deliberately omits a dedicated string type. The reasons are rooted in the three pillars: **no hidden control flow, explicit allocations, and comptime over magic**.
+
+#### No Hidden Costs
+
+In languages like C++ (`std::string`) or Go (immutable `string`), operations such as concatenation, slicing, or passing to a function may involve hidden allocations, reference count updates, or locking. Zig’s `[]const u8` is a plain slice; any allocation must be explicit (e.g., `allocPrint`). This transparency is critical for embedded, real‑time, and kernel code where every allocation must be justified.
+
+#### Explicit Encoding
+
+By not baking UTF-8 into the type system, Zig forces you to decide when and where to validate. For high‑performance loops over ASCII data, you can skip UTF-8 checks. For user input, you validate explicitly at the module boundary. This matches how C strings work but without the undefined behavior traps – Zig’s safety checks (e.g., bounds checking) still apply, and the standard library gives you opt‑in validation.
+
+#### Interoperation with C and Systems
+
+Many OS and library APIs expect null‑terminated strings (e.g., `open`, `strlen`). Zig’s `[:0]` sentinel pointers allow direct use of string literals with zero overhead, while also providing a type‑safe way to distinguish null‑terminated buffers from arbitrary byte slices. There is no conversion cost – you simply pass the literal.
+
+#### Comptime String Processing
+
+Because string literals are known at compile time, you can manipulate them with normal Zig code during compilation. This eliminates the need for a separate macro or template language:
+
+```zig
+const std = @import("std");
+
+fn toUpperComptime(comptime s: []const u8) []const u8 {
+    var buf: [s.len]u8 = undefined;
+    for (s, 0..) |c, i| {
+        buf[i] = if (c >= 'a' and c <= 'z') c - 32 else c;
+    }
+    return &buf;
+}
+
+const UPPER_HELLO = toUpperComptime("hello");
+pub fn main() void {
+    std.debug.print("{s}\n", .{UPPER_HELLO}); // "HELLO"
+}
+```
+
+No runtime allocation, no separate code generation step – just comptime evaluation of ordinary Zig.
+
+### 13.4 Competing Approaches
+
+#### C: Null‑Terminated Arrays
+
+C strings are `char*` with an implicit null terminator. This design has no length field, leading to O(n) `strlen`, rampant buffer overflows, and no distinction between string and binary data. Zig retains the null terminator for ABI compatibility but adds an explicit length, making string operations safe by default.
+
+#### C++: `std::string`
+
+`std::string` manages heap memory with small‑string optimisation (SSO). It hides allocation, deallocation, and sometimes copy‑on‑write (COW) semantics. While convenient, this violates Zig’s “no hidden control flow” principle – a simple assignment may allocate, throw, or mutate shared state. Zig’s approach forces you to see every allocation and every potential error.
+
+#### Rust: `String` and `&str`
+
+Rust separates owned `String` (heap‑allocated, resizable) from borrowed `&str` (view into UTF-8). Both enforce valid UTF-8 at construction. This eliminates invalid UTF-8 slices, but adds runtime checks for mutation. Zig chooses not to enforce UTF-8 in the type system, leaving validation optional. The trade‑off is control: Zig lets you work with arbitrary byte sequences (e.g., text in ASCII, Latin‑1, or even binary) without overhead, while Rust forces conversion through `from_utf8` or unsafe code.
+
+#### Go: Immutable `string`
+
+Go’s strings are immutable and always valid UTF-8 (though they can contain arbitrary bytes if constructed with `string([]byte)`). The runtime stores strings as a pointer and length, similar to Zig. However, Go’s garbage collector manages the backing memory, and concatenation (`a + b`) allocates a new string. Zig gives you explicit control over allocation (e.g., using an arena for many small concatenations) and avoids GC pauses.
+
+### 13.5 Common Mistakes
+
+1. **Indexing by byte to get a character**
+   `"ñ"[0]` yields `0xC3` (first byte of the two‑byte UTF-8 sequence), not the code point `0xF1`. Always iterate with `std.unicode.Utf8Iterator` or work at the byte level with clear intent.
+
+2. **Slicing in the middle of a code point**
+   ```zig
+   const s = "ñ";
+   const bad = s[0..1]; // first byte only -> invalid UTF-8
+   ```
+   This produces a slice that is not valid UTF-8. Future operations that assume UTF-8 (e.g., printing, iterating) may panic or produce garbage. Use `std.unicode.utf8ValidateSlice` after slicing, or validate boundaries.
+
+3. **Forgetting null terminator when calling C functions**
+   Passing a `[]const u8` to a C function that expects `const char*` leads to undefined behaviour because there is no guaranteed `\0` at the end. Convert with `std.mem.sliceTo` (if the slice contains a null) or allocate a null‑terminated copy with `alloc.dupeZ`.
+
+4. **Inefficient concatenation in a loop**
+   Repeatedly using `std.fmt.allocPrint` inside a loop causes many allocations. Pre‑compute total length or use `std.BoundedArray` (stack) or an `ArrayList(u8)` with a pre‑reserved capacity.
+
+5. **Assuming `std.mem.len` works on `[*c]const u8`**
+   The function `std.mem.len` expects a sentinel‑terminated pointer (like `[*:0]u8`). On a raw C pointer `[*c]const u8`, use `std.mem.sliceTo(ptr, 0)` to obtain a slice, but be aware this does a linear scan for the null terminator.
+
+6. **Not validating untrusted UTF-8**
+   Passing unsanitised input to `Utf8Iterator` or `utf8CountCodepoints` may cause an `InvalidUtf8` error. Always validate external strings with `utf8ValidateSlice` before iterating, or handle the error union returned by `utf8Iterator`.
+
+### 13.6 Performance Considerations
+
+- **Byte operations are cheap** – `len`, indexing, `mem.eql`, and `mem.indexOf` run at memory bandwidth. Avoid unnecessary UTF-8 decoding in hot loops that only process ASCII or binary data.
+
+- **UTF-8 validation is O(n)** – `std.unicode.utf8ValidateSlice` scans every byte. Validate once at input boundaries and then use the unchecked iterator (`Utf8Iterator.initUnchecked`) if you are certain the data is valid. The safe iterator does a bounds and continuation check per code point; that overhead may be acceptable for text processing but not for every byte.
+
+- **Concatenation and allocation** – Use `std.BoundedArray` for strings that fit a predictable maximum size (e.g., formatting a number into a static buffer). For many small concatenations, consider an arena allocator to batch deallocation and reduce fragmentation.
+
+- **String interning** – If you will compare many strings for equality (e.g., dictionary keys), intern them: store a single copy of each distinct string in a hash map, and then compare pointers or indices. This trades allocation for fast equality (`==` on pointers). See Example 13‑4 below.
+
+- **Avoid `std.mem.join` with many tiny slices** – It computes total length first, then allocates and copies once. That’s fine. But if you join in a loop, use `ArrayList(u8)` with `ensureTotalCapacity`.
+
+- **SIMD for bulk operations** – Zig’s standard library uses SIMD internally for some `mem` functions (e.g., `mem.eql`, `mem.indexOf`). Your own loops can use `@Vector` to scan for delimiters or compute hashes faster.
+
+### 13.7 Best Practices
+
+1. **Use `[]const u8` for parameters** – unless you explicitly need the null terminator for C interop. This is the most general and signals that the function does not require a sentinel.
+
+2. **Prefer `std.fmt.allocPrint` over manual concatenation** – It handles formatting, supports many arguments, and avoids off‑by‑one errors.
+
+3. **Validate UTF-8 at module boundaries** – When data enters your system from a file, network, or user input, call `utf8ValidateSlice` once and then use unchecked iterators internally.
+
+4. **Use `std.BoundedArray` for stack strings** – If you know the maximum size at compile time (e.g., a fixed‑width log line), `BoundedArray(u8, N)` gives you a stack‑allocated, resizable buffer without heap allocation.
+
+5. **Return `[]const u8` from functions** – Avoid returning `[:0]const u8` unless the caller specifically needs null termination. Returning a slice is more flexible.
+
+6. **Document byte offsets vs. code point counts** – When a function returns an index, clearly state whether it is a byte index or a code point index. Most Zig stdlib functions use byte indexes; if you need character indexes, you must compute them manually.
+
+7. **Prefer `std.mem.split` and `std.mem.tokenize`** – These work on byte sequences and are far faster than Unicode‑aware splitting when you only need ASCII delimiters (e.g., whitespace, commas).
+
+8. **Use `comptime` string processing for configuration and code generation** – Instead of runtime parsing of format strings or building SQL queries at runtime, move the work to compile time when possible.
+
+### 13.8 Examples
+
+#### Example 13‑1: UTF-8 Validation and Iteration
+
+```zig
+const std = @import("std");
+
+pub fn main() !void {
+    const text = "Zig 💚 UTF-8"; // The heart emoji is 4 bytes
+    std.debug.print("Raw bytes: {any}\n", .{text});
+
+    // Validate once at entry
+    if (!std.unicode.utf8ValidateSlice(text)) {
+        std.debug.print("Invalid UTF-8, aborting\n", .{});
+        return error.InvalidUtf8;
+    }
+
+    // Count code points
+    const cp_count = try std.unicode.utf8CountCodepoints(text);
+    std.debug.print("Code points: {d}\n", .{cp_count});
+
+    // Iterate and print each codepoint as hex
+    var it = std.unicode.Utf8Iterator.initUnchecked(text);
+    var idx: usize = 0;
+    while (it.nextCodepoint()) |cp| {
+        std.debug.print("[{d}] U+{X:0>4}\n", .{ idx, cp });
+        idx += 1;
+    }
+}
+```
+
+#### Example 13‑2: Stack‑Allocated String Builder
+
+```zig
+const std = @import("std");
+
+pub fn main() !void {
+    const part1 = "Zig";
+    const part2 = "In";
+    const part3 = "Depth";
+
+    // Maximum size known at compile time
+    var builder = std.BoundedArray(u8, 64){};
+    const writer = builder.writer();
+
+    try writer.writeAll(part1);
+    try writer.writeAll(" ");
+    try writer.writeAll(part2);
+    try writer.writeAll(" ");
+    try writer.writeAll(part3);
+
+    const result = builder.slice(); // type []const u8, no allocation
+    std.debug.print("{s}\n", .{result}); // "Zig In Depth"
+}
+```
+
+#### Example 13‑3: C Interoperation – Wrapping `strlen`
+
+```zig
+const std = @import("std");
+
+// Declare the C function (from libc, but we'll use the system's)
+extern fn strlen(s: [*:0]const u8) usize;
+
+pub fn main() !void {
+    const my_string = "Hello from Zig";
+    // my_string is *const [15:0]u8, which coerces to [:0]const u8
+    const len = strlen(my_string);
+    std.debug.print("strlen = {d} (Zig len = {d})\n", .{ len, my_string.len });
+    // Both output 15
+}
+```
+
+If you have a runtime `[]const u8` that you need to pass to a C function expecting null termination:
+
+```zig
+fn callWithCString(allocator: std.mem.Allocator, s: []const u8) !void {
+    // dupeZ adds a null terminator and returns [:0]const u8
+    const with_null = try allocator.dupeZ(u8, s);
+    defer allocator.free(with_null);
+    const len = strlen(with_null);
+    _ = len;
+}
+```
+
+#### Example 13‑4: Simple String Interning with Arena
+
+This example stores unique strings in an arena, so that equality can be tested by pointer (or by comparing the slice base pointer and length). Useful for command parsers or symbol tables.
+
+```zig
+const std = @import("std");
+
+const StringPool = struct {
+    arena: std.heap.ArenaAllocator,
+    map: std.StringHashMapUnmanaged(void), // keys are slices owned by arena
+
+    fn init(allocator: std.mem.Allocator) StringPool {
+        return .{
+            .arena = std.heap.ArenaAllocator.init(allocator),
+            .map = .{},
+        };
+    }
+
+    fn deinit(pool: *StringPool) void {
+        pool.map.deinit(pool.arena.child_allocator);
+        pool.arena.deinit();
+    }
+
+    fn intern(pool: *StringPool, str: []const u8) ![]const u8 {
+        const gop = try pool.map.getOrPut(pool.arena.allocator(), str);
+        if (!gop.found_existing) {
+            // Allocate a copy in the arena (persists for pool lifetime)
+            const copy = try pool.arena.allocator().dupe(u8, str);
+            gop.key_ptr.* = copy;
+            gop.value_ptr.* = {};
+        }
+        return gop.key_ptr.*;
+    }
+};
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    var pool = StringPool.init(gpa.allocator());
+    defer pool.deinit();
+
+    const a = try pool.intern("hello");
+    const b = try pool.intern("hello");
+    const c = try pool.intern("world");
+
+    std.debug.print("a == b: {}\n", .{a.ptr == b.ptr}); // true
+    std.debug.print("a == c: {}\n", .{a.ptr == c.ptr}); // false
+}
+```
+
+### 13.9 Summary & Exercises
+
+#### Summary
+
+- Zig strings are slices (`[]const u8` or `[:0]const u8`); there is no dedicated string type.
+- String literals are null‑terminated and stored in read‑only memory.
+- UTF-8 handling is provided by `std.unicode`, but validation is opt‑in, preserving performance for byte‑oriented workloads.
+- Concatenation, formatting, and complex manipulations require explicit allocators.
+- Null‑terminated slices (`[:0]`) are the bridge to C APIs, with zero overhead for literals.
+- Comptime string processing eliminates runtime overhead for many common tasks.
+
+#### Exercises
+
+**Exercise 13‑1: Unicode‑aware case conversion**
+Write a function `toLower(allocator: std.mem.Allocator, s: []const u8) ![]u8` that returns a new UTF-8 string where every letter (as defined by Unicode simple case mapping) is lowercased. *Do not* convert non‑letter characters. Use `std.unicode.Utf8Iterator` to iterate code points, and `std.unicode.utf8CodepointToSlice` to generate output. Test with `"Zig İn Depth"` (Turkish dotless i) and `"GROẞ"` (German sharp s). *(Hint: Use a `std.ArrayList(u8)` to build the result.)*
+
+**Exercise 13‑2: High‑performance string deduplication**
+Extend Example 13‑4 with a `lookup` function that returns `?[]const u8` without inserting. Then add reference counting: each interned string keeps a count of active references, and when the count reaches zero, the memory is freed (or kept for reuse). Implement a `release` function. *Why might an arena be a bad choice for reference counting?* Implement instead with a `std.HashMap` that stores a struct with the slice and a `usize` count, using a separate allocator (e.g., `page_allocator` for the map nodes).
+
+**Exercise 13‑3: UTF-8 validator from scratch**
+Implement `fn utf8Validate(s: []const u8) bool` without using `std.unicode`. Follow the UTF-8 encoding rules: 1‑byte (0xxxxxxx), 2‑byte (110xxxxx 10xxxxxx), 3‑byte (1110xxxx 10xxxxxx 10xxxxxx), 4‑byte (11110xxx 10xxxxxx 10xxxxxx 10xxxxxx). Return `false` on any continuation byte without a start, overlong encoding, invalid byte values, or truncated sequences. Compare your performance against `std.unicode.utf8ValidateSlice` using `std.time.Timer`. *Where does the standard library win?*

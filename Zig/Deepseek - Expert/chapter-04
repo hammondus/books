@@ -1,0 +1,317 @@
+## Chapter 4: Variables, Constants, and Types
+
+Every data item in a Zig program lives in a **variable** or a **constant**—there is no magic, no hidden initialization, and no implicit default value. This chapter establishes the foundational contract that Zig makes with you: if you want a location to hold data, you declare its **mutability** explicitly, you decide whether it has a meaningful initial value, and you are in full control of the bits from the very first instruction.
+
+By the end of this chapter, you will understand how Zig’s `var`/`const` dichotomy gives you performance without surprises, how `undefined` serves as a deliberate “not yet initialized” marker, and how types themselves become first-class values that you can manipulate at compile time.
+
+---
+
+### 1. Basic Usage
+
+Zig requires an explicit mutability annotation for every named entity: `var` for mutable bindings, `const` for immutable ones.
+
+```zig
+const std = @import("std");
+
+pub fn main() !void {
+    // Mutable variable, type i32, initialized to 42
+    var x: i32 = 42;
+
+    // Immutable binding, type f64
+    const pi: f64 = 3.14159;
+
+    // Type can be inferred from the initializer
+    const answer = 42;        // type is comptime_int (compile-time integer)
+    var y: u8 = 200;
+
+    // Mutation only works for var
+    x += 1;
+    // pi += 1.0;            // error: cannot assign to constant
+
+    _ = y; // suppress unused warning
+}
+```
+
+If you omit the type annotation and do not provide an initializer, the compiler will ask for one—Zig refuses to leave a variable’s type ambiguous at runtime:
+
+```zig
+// Error: variable of type 'var' must be initialized
+// var z;        // illegal
+```
+
+You can, however, explicitly defer initialization by using the keyword **`undefined`**:
+
+```zig
+var buffer: [1024]u8 = undefined;
+// buffer is now a 1024-byte array with *no guaranteed content*.
+```
+
+`undefined` is a valid value for **any** type. It literally means “the bits are whatever happens to be in memory; I promise to overwrite them before reading.” It is not a “zero value”; it is the absence of a deliberate initialization. The compiler will not insert a `memset` to zero the buffer.
+
+Constants (`const`) do not need a value known at compile time, but they do need an initializer at the point of declaration:
+
+```zig
+const user_input = try readIntFromUser();  // runtime value, but immutable thereafter
+```
+
+A `const` binding can hold a pointer that points to mutable memory:
+
+```zig
+var data: u32 = 100;
+const ptr: *u32 = &data;   // ptr is immutable (cannot change what it points to)
+ptr.* += 1;                // but the target is mutable (ptr type is *u32, not *const u32)
+```
+
+This separation between the mutability of the variable and the mutability of the pointed-to data is crucial. To make the target immutable too, use `*const u32`.
+
+#### Type inference and `comptime_int`
+
+When you write `const val = 5;`, the type of `val` is **`comptime_int`**, an arbitrary-precision integer that exists only at compile time. It can be coerced to any runtime integer type when needed:
+
+```zig
+const size: usize = 5;      // comptime_int coerces to usize
+var arr: [size]u8 = undefined;
+```
+
+Similarly, `const pi = 3.14;` yields a `comptime_float`. This mechanism eliminates the need for C’s integer literal suffixes like `ULL`; the compiler carries the exact value and only narrows it at coercion points.
+
+---
+
+### 2. Under the Hood
+
+Zig variables are compiled to stack slots (or registers) exactly as you would expect in C. The annotations `var` and `const` exist solely for semantic checking in the frontend—they do not produce any runtime code. The backend (LLVM or the self-hosted x86_64/arm backends) sees only an `alloca` with a write and possible later loads; the difference between a mutable and immutable binding is a compile-time property that restricts which IR instructions are emitted (stores after the initial write are illegal for a `const`). The optimizer may promote a `const` to a read-only section, but this is not guaranteed.
+
+#### `undefined` in the compiler
+
+When the compiler encounters `var x: T = undefined;`, it emits an LLVM `undef` (or equivalent in self-hosted backends) for the initial value. This is a signal to the optimizer that the contents are unpredictable, which can lead to dramatic speedups: a large array that will be filled by a subsequent read from a socket, for instance, never pays the cost of zeroing. However, **reading from `undefined` is unchecked undefined behavior** in `ReleaseFast` and `ReleaseSmall` modes. In `Debug` and `ReleaseSafe`, the compiler inserts runtime safety checks on many operations, but it cannot detect every read of an `undefined` variable—the onus is on you.
+
+#### Types as values
+
+Zig’s type system is **first-class at compile time**. You can store a type in a variable:
+
+```zig
+const T = if (some_comptime_condition) u32 else f64;
+var x: T = 0;
+```
+
+During semantic analysis, the compiler evaluates `T` to a `type` value. This is not string substitution or textual macro; the type graph is fully known to the compiler, enabling type-safe generic programming without templates.
+
+`comptime_int` and `comptime_float` are arbitrary-precision big integers/rationals represented in the compiler’s memory. They never appear in runtime code; any use that survives to the runtime is coerced to a concrete integer or float type.
+
+---
+
+### 3. Why This Design?
+
+Zig’s approach to variables embodies its three core pillars: **no hidden control flow**, **explicit is better than implicit**, and **comptime over runtime magic**.
+
+- **No hidden control flow:** Declaring a variable in Zig never invokes a constructor, a destructor, an allocator, or any operator overloading. `var x: i32 = 5;` does exactly what it says: reserves space for a 32-bit integer and writes `5` into it. There is no RAII, no `Drop`, no default initialization function lurking behind the syntax. This keeps the program’s behavior local and predictable.
+
+- **Explicit is better than implicit:** You must write `var` or `const`. There is no “uninitialized” without the word `undefined`. This forces the programmer to think about the initial state of every piece of data. A reader scanning the code never has to guess whether a variable starts at zero, at `null`, or at some garbage value—the code tells them. Zig’s rejection of default zero values eliminates the false safety of “I don’t know what this is but at least it’s zero.” As every embedded developer knows, a value of `0` can be just as wrong as a random one.
+
+- **Comptime over runtime magic:** Type inference and `comptime_int`/`comptime_float` allow you to express constants precisely without a separate macro language. The compiler carries exact numeric values and does the right thing. This replaces C’s header magic (`#define SIZE 256`) with type-safe, scope-respecting constants that can participate in compile-time evaluation, all using the same language.
+
+The decision to forbid implicit default initialization also has direct performance implications. Zeroing a 1 MiB buffer takes real time. When you are about to `read()` into that buffer anyway, the memset is pure waste. Zig trusts you to know when you need it and when you don’t.
+
+---
+
+### 4. Competing Approaches
+
+- **C:** Local variables are uninitialized by default (reading them is UB), but the language does not force you to mark them as such. Static/global variables are zero-initialized. The difference in behavior between stack and static storage is a constant source of bugs. Zig unifies the model: `undefined` makes the lack of initialization explicit everywhere. C’s `const` is a type qualifier, not a binding mutability marker, which often leads to confusion about pointer targets; Zig’s `const` on the binding is orthogonal to `*const T`.
+
+- **Rust:** Rust’s `let` bindings are immutable by default, and all values must be definitely initialized before use. This is safe but comes at a cost: if you want an uninitialized buffer, you must use `MaybeUninit<T>` and go through `unsafe` to read from it. The ceremony around `MaybeUninit` communicates danger, but it also adds visual noise. Zig’s `undefined` is far more succinct for the common pattern of “I’ll fill this in a moment,” while still being explicit. Rust’s `Default` trait can be derived, which may run arbitrary code; Zig has no such thing, staying true to “no hidden control flow.”
+
+- **Go:** Go initializes every variable to its **zero value** (`0`, `""`, `nil`). This is simple but hides logical errors: a variable that is supposed to be set by a subsequent branch might accidentally remain zero, and the program silently continues. Zig forces you to supply a deliberate initial value or write `undefined`, making the omission visible. Additionally, Go’s zero-value initialization for large structs can be expensive; Zig leaves the choice to the programmer.
+
+- **Python:** Python has no static type declarations; variables are just names bound to objects. The entire concept of stack allocation and uninitialized memory is absent. Zig operates at a lower level, but you still get dynamic-feeling type inference through `comptime_int` coercion and the duck-typing philosophy of comptime generics.
+
+---
+
+### 5. Common Mistakes
+
+**Reading `undefined` too early.** Newcomers from languages that zero-initialize may write:
+
+```zig
+var count: u32 = undefined;
+// some complex control flow ...
+doSomething(count);  // count might not have been written yet
+```
+
+In `Debug` mode this may happen to contain a pattern like `0xaa`, but in `ReleaseFast` the optimizer can produce truly bizarre behavior because LLVM treats `undef` as “can be any value at any time.” Always ensure a write precedes every read on a path that starts with `undefined`.
+
+**Assuming `const` means compile-time known.** A `const` can hold a runtime value, as long as it is assigned at declaration. Only a `const` that is also marked `comptime` or inferred to be `comptime_int`/`comptime_float` is guaranteed to be compile-time evaluable.
+
+**Confusing binding `const` with `*const T`.** The following is legal:
+
+```zig
+var data: i32 = 5;
+const ref = &data;       // ref is of type *i32, data mutable
+ref.* = 10;              // allowed
+```
+
+To prevent modification through the pointer, you must annotate the type: `const ref: *const i32 = &data;`
+
+**Overusing `var` when `const` suffices.** Zig’s compiler does not currently warn on unnecessary mutability, but an immutable binding communicates intent to a reviewer. When a variable is never reassigned, make it `const`.
+
+**Accidentally relying on zero-valued memory.** The idiom `var buf: [n]u8 = undefined;` does not give you zeros. If you need zero-initialization, either write `= [_]u8{0} ** n` or use `std.mem.zeroes`:
+
+```zig
+var buf: [1024]u8 = std.mem.zeroes(@TypeOf(buf));
+// or, simpler:
+var buf = std.mem.zeroes([1024]u8);
+```
+
+---
+
+### 6. Performance Considerations
+
+The most significant performance lever related to variables is the absence of default initialization. In hot loops where you allocate a temporary buffer on the stack, skipping the zeroing can be the difference between a function that runs in 5 cycles and one that takes 500. Zig’s standard library consistently uses `undefined` for buffers that will be completely overwritten (e.g., `std.fmt.bufPrint`’s internal workspace).
+
+`const` bindings can, in some cases, enable the optimizer to place the data in read-only memory or to propagate the exact value, but this is rarely a bottleneck. The real win is the clarity that avoids defensive `memset` calls that a C programmer might add “just to be safe.”
+
+Using `comptime_int` for compile-time arithmetic is free at runtime—it generates the final integer constant directly. However, heavy compile-time computation on large `comptime_int` values (e.g., factorial of 5000) can slow down compilation; keep an eye on `--verbose-llvm-cpu` if your build times spike.
+
+---
+
+### 7. Best Practices
+
+- **Prefer `const` over `var` unless mutation is required.** This simple rule makes data flow obvious.
+
+- **Initialize at declaration whenever possible.** If the value is not yet known, use `undefined` and add a comment explaining where and when the variable will be written. Better yet, restructure the code so that the variable is created at the point where the value becomes available.
+
+- **Use explicit type annotations on public function signatures and module-level constants.** Inside function bodies, lean on type inference for brevity, but ensure the type is obvious from context. For example, `const count = try reader.readIntLittle(u32);` is clear; `const x = someOp();` may not be.
+
+- **Treat `undefined` as a performance optimization, not a default.** For small scalar values (e.g., `var result: u32 = undefined;`), it is almost always better to write `var result: u32 = 0;` unless the zeroing is provably wasteful. The cost of zeroing a single register is negligible, and the safety is worth it.
+
+- **Use `std.mem.zeroes` only when zero is a meaningful initial value.** Do not use it as a blanket initialization for all variables “to be safe”; that defeats Zig’s no-hidden-cost philosophy.
+
+- **Leverage `comptime_int` for named constants.** Instead of a C-style `#define BUFFER_SIZE 4096`, write:
+
+```zig
+const buffer_size = 4096;
+// type is comptime_int; can be used in array sizes, sentinels, etc.
+```
+
+- **When a `const` holds a pointer, document whether the target is expected to be mutated.** If the intent is to share immutable data, use `*const T`.
+
+---
+
+### 8. Examples
+
+The following complete, buildable program demonstrates variables, constants, `undefined`, type inference, and using types as values. It is a toy “command reader” that accepts a command from a pre-defined buffer, parses an integer argument, and prints the result.
+
+```zig
+const std = @import("std");
+
+pub fn main() !void {
+    // Command buffer – filled later, explicitly uninitialized now
+    var cmd_buffer: [64]u8 = undefined;
+
+    // Simulate reading a command (e.g., "SET 42")
+    const simulated_input = "SET 42";
+    @memcpy(cmd_buffer[0..simulated_input.len], simulated_input);
+    const cmd_len = simulated_input.len;
+
+    const cmd_str = cmd_buffer[0..cmd_len];
+
+    // Split into command name and argument
+    const space_pos = std.mem.indexOfScalar(u8, cmd_str, ' ') orelse {
+        std.debug.print("Invalid command\n", .{});
+        return;
+    };
+
+    const name = cmd_str[0..space_pos];
+    const arg_str = cmd_str[space_pos + 1 ..];
+
+    // Parse argument – we use a mutable variable for the result
+    const arg_value = try std.fmt.parseInt(i32, arg_str, 10);
+
+    // Dispatch using a constant mapping of command names to type
+    const result = dispatch(name, arg_value);
+    std.debug.print("Result: {}\n", .{result});
+}
+
+fn dispatch(comptime name: []const u8, value: i32) i32 {
+    // comptime parameter allows compile-time dispatch
+    if (std.mem.eql(u8, name, "SET")) {
+        return value;
+    } else if (std.mem.eql(u8, name, "ADD")) {
+        return value + 1;
+    }
+    // unreachable for this example
+    return 0;
+}
+
+// Test block verifying variable mutability concepts
+test "var vs const and undefined" {
+    // var mutability
+    var x: u32 = 10;
+    x = 20;
+    try std.testing.expectEqual(20, x);
+
+    // const prevents reassignment
+    const y: u32 = 30;
+    // y = 40; // would be compile error
+
+    // undefined followed by write
+    var buffer: [8]u8 = undefined;
+    @memset(&buffer, 0xAA);
+    try std.testing.expectEqual(@as(u8, 0xAA), buffer[0]);
+
+    // type inference
+    const inferred = 42;
+    try std.testing.expectEqual(@as(comptime_int, 42), inferred);
+
+    // type as value
+    const T = if (true) u16 else u8;
+    var val: T = 1000;
+    try std.testing.expectEqual(@as(u16, 1000), val);
+}
+
+test "const pointer to mutable memory" {
+    var data: u32 = 7;
+    const ptr = &data;      // ptr is *u32, immutable binding
+    ptr.* += 1;
+    try std.testing.expectEqual(@as(u32, 8), data);
+}
+
+test "const pointer to const memory" {
+    var data: u32 = 7;
+    const ptr: *const u32 = &data;
+    // ptr.* += 1;        // compile error: cannot assign to const
+    _ = ptr;
+}
+```
+
+This example can be built with `zig build-exe` (or `zig test` for the test blocks). It illustrates explicit mutability, `undefined` usage for a buffer, type inference, and the separation between binding mutability and pointer target mutability.
+
+---
+
+### 9. Summary & Exercises
+
+Zig’s variable model is deliberately minimal and explicit. `var` grants mutation; `const` forbids it. Initialization is always your responsibility, with `undefined` serving as the explicit “don’t touch yet” marker. There is no default zero value, no hidden constructor, and no implicit allocation. Types are first-class compile-time citizens, enabling powerful generic patterns without templates or macros.
+
+**Key takeaways:**
+
+- `var` and `const` enforce mutability at the binding level, orthogonal to pointer constness.
+- `undefined` leaves memory untouched; it is a performance tool, not a value.
+- Zig never zero-initializes variables for you; you must opt in via `std.mem.zeroes` or explicit assignment.
+- Type inference works at compile time and often yields `comptime_int`/`comptime_float`, which can coerce to runtime types.
+- All variables behave predictably—no hidden control flow ever fires from a simple declaration.
+
+**Exercises for the seasoned engineer:**
+
+1. **Delayed initialization guard:** Write a generic wrapper `Maybe(T)` that stores an `undefined` value and a `bool` flag, providing a `set` and `get` method that panics (via `@panic`) if `get` is called before `set`. Ensure the memory for `T` remains completely uninitialized until `set` is called. Compare the generated assembly for `T = i32` with a traditional “optional” that uses a default value.
+
+2. **Type-driven allocator adapter:** Implement a function `allocateArray(comptime T: type, allocator: std.mem.Allocator, count: usize) ![]T` that allocates a slice and initializes every element to the `undefined` value. Then write a separate version that zero-initializes. Measure the performance difference for a large array of `[4096]f64` and discuss when each is appropriate. Use `std.testing.allocator` in tests.
+
+3. **Rewrite a C snippet:** Take the following C code and rewrite it idiomatically in Zig, paying careful attention to variable lifetimes and initialization:
+   ```c
+   void process(int fd) {
+       char buf[256];
+       int n = read(fd, buf, 256);
+       // use buf[0..n] ...
+   }
+   ```
+   In your Zig version, explicitly mark the buffer as `undefined` and add a debug assertion that `read` fills the entire buffer if needed. Then refactor to eliminate the `undefined` entirely by using a slice returned from a function that allocates and reads. Discuss the trade-offs.
+
+These exercises will deepen your understanding of how Zig’s variable semantics interact with performance, safety, and code clarity—themes that resonate throughout the rest of the language.

@@ -1,0 +1,414 @@
+# Chapter 41: WebAssembly (WASM) as a First-Class Target
+
+WebAssembly is no longer a curiosity—it is the universal bytecode of the modern web, embedded runtimes, and plugin systems. Zig treats `wasm32-freestanding` and `wasm32-wasi` as first-class targets, not as afterthoughts bolted on with a separate toolchain. The same compiler, the same standard library (subject to platform availability), and the same explicit philosophy translate directly into a linear memory model that feels native to a systems programmer. This chapter shows how to build, export, interface, and think about Zig when the target is WebAssembly.
+
+---
+
+## 1. Basic Usage
+
+Compiling Zig to WebAssembly requires nothing more than a target triple. For a library that will be consumed by JavaScript or another host, you typically want a freestanding dynamic object (a “reactor” in WASI terminology, or a bare module). The incantation with the build system is:
+
+```zig
+// build.zig
+const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const target = b.resolveTargetQuery(.{
+        .cpu_arch = .wasm32,
+        .os_tag = .freestanding,
+    });
+    const optimize = b.standardOptimizeOption(.{});
+
+    const lib = b.addSharedLibrary(.{
+        .name = "mylib",
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // No entry point; we are exporting functions only.
+    lib.entry = .disabled;
+    b.installArtifact(lib);
+}
+```
+
+Now, inside `src/main.zig`, export a function with the C calling convention:
+
+```zig
+export fn add(a: i32, b: i32) callconv(.C) i32 {
+    return a + b;
+}
+```
+
+The `callconv(.C)` is mandatory. The default Zig calling convention is unstable and specific to the Zig compiler version—it cannot be consumed by external hosts. The C ABI is the lingua franca for WASM exports.
+
+To use the resulting `mylib.wasm` from JavaScript:
+
+```js
+const wasm = await WebAssembly.instantiateStreaming(
+    fetch('mylib.wasm')
+);
+const { add } = wasm.instance.exports;
+console.log(add(2, 3)); // 5
+```
+
+When your library needs to allocate memory that JavaScript will read, you must export an allocator interface. At its simplest, use a bump-pointer allocator backed by the WASM linear memory and expose `alloc` and `dealloc` (or `free`).
+
+```zig
+const std = @import("std");
+
+var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+const allocator = gpa.allocator();
+
+export fn alloc(len: usize) callconv(.C) ?[*]u8 {
+    const slice = allocator.alloc(u8, len) catch return null;
+    return slice.ptr;
+}
+
+export fn dealloc(ptr: [*]u8, len: usize) callconv(.C) void {
+    allocator.free(ptr[0..len]);
+}
+```
+
+JavaScript can then create a view into the WASM memory, call `alloc`, fill the buffer, and call your processing function:
+
+```js
+const memory = wasm.instance.exports.memory;
+const bufPtr = wasm.instance.exports.alloc(inputStr.length);
+const buf = new Uint8Array(memory.buffer, bufPtr, inputStr.length);
+for (let i = 0; i < inputStr.length; i++) buf[i] = inputStr.charCodeAt(i);
+wasm.instance.exports.process(bufPtr, inputStr.length);
+// read output...
+wasm.instance.exports.dealloc(bufPtr, inputStr.length);
+```
+
+This pattern—explicit allocation, manual memory copying, no hidden serialization—is the Zig Way applied to WASM.
+
+**WASI mode** is chosen when you want a more POSIX-like environment (file access, environment variables, standard streams). Use `-target wasm32-wasi` and a normal entry point:
+
+```zig
+pub fn main() !void {
+    const stdout = std.io.getStdOut().writer();
+    try stdout.print("Hello, WASI!\n", .{});
+}
+```
+
+The build system step is identical, except the target becomes `.os_tag = .wasi`. WASI implies the presence of a libc-like layer provided by the host, but Zig uses its own WASI headers and links against the host’s WASI implementation.
+
+---
+
+## 2. Under the Hood
+
+The Zig compiler, using its LLVM backend (or the self-hosted backends in later versions), generates a WebAssembly module with a flat linear memory, a function table, and import/export sections. There is no hidden runtime—the `_start` function is either omitted (freestanding) or a thin shim that calls your `main` (WASI).
+
+**Linear memory and the stack.** Zig’s execution model places the call stack inside the WASM linear memory, starting at a fixed offset (usually 1024 or configured via `--global-base`). The heap follows the stack and grows upward. When you use an allocator like `page_allocator`, Zig calls `memory.grow` via the `@wasmMemoryGrow` intrinsic, requesting more pages (each 64 KiB). This is fully transparent: the compiled code contains the necessary `memory.grow` instructions.
+
+**Exports and imports.** The `export` keyword marks a function to appear in the WASM export section. The compiler respects the specified calling convention and mangles the name accordingly (or not, for C convention). Imports are handled via the Zig build system’s ability to specify external symbols; you can use `extern` declarations:
+
+```zig
+extern "env" fn js_log(ptr: [*]const u8, len: usize) void;
+```
+
+This expects the host to provide an `env.js_log` import. In JavaScript, you supply it in the import object:
+
+```js
+const importObj = {
+    env: {
+        js_log: (ptr, len) => {
+            const msg = new TextDecoder().decode(
+                new Uint8Array(memory.buffer, ptr, len)
+            );
+            console.log(msg);
+        }
+    }
+};
+```
+
+**The `@wasm` builtins.** Zig exposes low-level WASM-specific operations through builtins (available with `comptime` target checks). For example, `@wasmMemorySize(0)` yields the current size of memory index 0, and `@wasmMemoryGrow(0, pages)` grows it. These are rarely needed directly because the standard library’s allocators already abstract them, but they are there when you need fine-grained control.
+
+**Comptime selection.** You can use `@import("builtin").target` to branch at compile time:
+
+```zig
+if (builtin.target.os.tag == .wasi) {
+    const args = try std.process.argsAlloc(allocator);
+    // ...
+} else {
+    // freestanding logic
+}
+```
+
+This allows you to write a single codebase that functions natively for testing and compiles down to WASM without alteration.
+
+**Linking.** `wasm-ld` (LLVM’s WASM linker) is invoked automatically. It resolves imports, lays out the memory, and emits the final `.wasm` binary. Zig’s build system passes appropriate flags for stack size, initial/max memory, and exported symbols. The `lib.install()` step runs `wasm-opt` if optimizations are enabled, stripping dead code and shrinking the output.
+
+---
+
+## 3. Why This Design?
+
+Zig’s WASM story is a direct expression of its overarching philosophy: **no hidden control flow, explicit over implicit, and comptime over runtime magic.**
+
+**No hidden glue.** Other ecosystems generate thick JavaScript wrappers that marshal strings, handle memory automatically, and even simulate async runtimes. Zig provides zero implicit binding generation. The API boundary is exactly what you declare: C-callable functions, primitive numeric types, and opaque pointers. This might feel spartan, but it eliminates entire categories of bugs caused by mismatch between the generated glue and your intentions. You, not a code generator, decide how memory is managed across the boundary.
+
+**Linear memory is an array of bytes—exactly what systems programmers think in.** WASM’s memory is a contiguous, growable `ArrayBuffer`. There are no objects, no vtables, no automatic reference counting. Zig’s explicit pointers, slices, and allocators map onto this model perfectly. You can design your own allocator that uses a bump pointer in a preallocated segment, a pool, or even a full TLSF allocator—all without fighting a hidden runtime.
+
+**Portability and testability.** Because WASM is just another target, you can test your core logic natively with `zig test`. The `export` functions can be tested via C imports or by compiling to native and calling them. There is no “WASM-only” language dialect.
+
+**Why not a `std.wasm.js`?** Zig’s standard library includes `std.wasm` for parsing and manipulating WASM modules, but there is no `js` package like Go’s `syscall/js`. That would require a runtime bridge between Zig’s execution model and JavaScript’s garbage collector, a complexity that contradicts Zig’s “no hidden control flow” rule. Instead, Zig forces you to design a clean, minimal interface—often resulting in smaller, faster binaries and fewer surprises.
+
+---
+
+## 4. Competing Approaches
+
+**C/Emscripten.** Emscripten compiles C/C++ to asm.js/wasm with a comprehensive POSIX emulation layer. It provides a virtual filesystem, a `malloc`/`free` tied to a large `sbrk`, and automatic JS wrapping. The result is a large `.wasm` file and a sizable JS runtime. Zig’s freestanding approach avoids all that by default. When you need a filesystem, you opt into WASI, which is a standardized, capability-based model rather than a custom emulation.
+
+**Rust / `wasm-bindgen`.** Rust’s `wasm-bindgen` is a sophisticated CLI tool and library that automatically generates the JS glue, converts `&str` to JS strings, `Vec<u8>` to `Uint8Array`, and maps closures and promises. This high-level ergonomics come at a cost: opaque code generation, occasional ABI mismatches, and a large dependency tree. Zig’s answer is: *“Write the glue yourself. It’s just a few lines of JavaScript.”* The benefit is full control, zero-generator surprises, and a tiny binary footprint. For projects that need rich JS interop, writing a thin manual binding layer is often more maintainable than a heavy code-generation tool.
+
+**Go / `syscall/js`.** Go compiles to WASM with a full Go runtime, including a garbage collector and a goroutine scheduler. Binary size typically starts at several hundred KB, and the runtime interacts with JavaScript’s event loop via blocking semantics. Zig’s binaries are often below 10 KB for similar logic. No GC means predictable performance, crucial for real-time applications like audio processing or game logic embedded in a browser. The tradeoff is that manual memory management requires more discipline at the interface boundary.
+
+**C++.** C++ on WASM, when used with Emscripten, carries RTTI, exception handling, and heavy STL headers. Zig’s minimalism avoids the overhead. Moreover, comptime generics in Zig are more pleasant to compile to WASM than C++ template metaprogramming, which can balloon compile times and binary size.
+
+---
+
+## 5. Common Mistakes
+
+**Forgetting `callconv(.C)`.** An exported function with the default Zig calling convention may appear to work on some LLVM versions but is not stable. The host will not be able to match the mangled symbol, or parameters will be garbled. Always use `callconv(.C)` for exports.
+
+**Assuming an OS allocator.** On `wasm32-freestanding`, `std.heap.page_allocator` does *not* exist by default because there is no `mmap`. The standard `GeneralPurposeAllocator` and `FixedBufferAllocator` work if you prime them with a backing store from the linear memory (e.g., a static buffer). For a simple library, a fixed-size bump allocator backed by a global byte array is the least error-prone:
+
+```zig
+var heap: [65536]u8 = undefined;
+var fba = std.heap.FixedBufferAllocator.init(&heap);
+const allocator = fba.allocator();
+```
+
+**Ignoring memory growth** from the JavaScript side. When Zig code calls `memory.grow`, the underlying `ArrayBuffer` is detached and a new one is created. If JavaScript holds a view into the old buffer, it becomes invalid. Always re-acquire `memory.buffer` after a call that may grow memory:
+
+```js
+function readString(ptr, len) {
+    return new TextDecoder().decode(
+        new Uint8Array(wasm.instance.exports.memory.buffer, ptr, len)
+    );
+}
+```
+
+If you cache the buffer, refresh it after any `alloc` call.
+
+**Stack overflow.** Zig places the stack inside the linear memory. The default stack size is 1 MiB (configurable with `--stack`). If your recursive or deeply nested function exhausts the stack, the WASM execution will trap. Increase initial memory and stack size in your build script:
+
+```zig
+lib.stack_size = 2 * 1024 * 1024; // 2 MiB
+lib.initial_memory = 256 * 65536; // 16 MiB
+lib.max_memory = 512 * 65536;    // 32 MiB
+```
+
+**Forgetting the `@export` vs `export` distinction.** The keyword `export` on a function definition is the primary mechanism. The `@export` builtin can export a comptime-known symbol dynamically, but it’s rarely needed. Using the wrong one may lead to confusing linker errors.
+
+**Using `std.debug.print` on freestanding.** It simply does nothing unless you implement a writer that sends bytes to the host. If you need console output, either target WASI and use `std.io.getStdOut()` or import a host-provided `console_log` function.
+
+---
+
+## 6. Performance Considerations
+
+**Cross-boundary call overhead.** Every transition from JavaScript into WASM and back incurs a cost: argument marshaling through the stack, potential context switching in the engine, and sometimes a security boundary check. A design that exports a single high-level `process(buffer, length)` is far faster than many small calls like `get_char()`. Batch your interactions.
+
+**Allocator speed.** A bump-pointer allocator with no free is the fastest; use it when you can simply reset per request. For workloads with many small, short-lived allocations, a general-purpose allocator adds overhead but avoids memory exhaustion. Zig’s `std.heap.GeneralPurposeAllocator` uses size classes and caching, striking a balance suitable for many WASM scenarios. Measure with `tracy` or engine profiling to choose.
+
+**No GC jank.** One of Zig’s killer features for WASM is the absence of garbage collection pauses. An exported function that performs audio DSP or an animation step will complete in a deterministic, predictable time. JavaScript’s GC is the primary source of UI jank; moving performance-critical code to Zig/WASM eliminates that entirely.
+
+**SIMD.** WebAssembly’s fixed-width SIMD proposal (128-bit) is widely supported in modern browsers. Zig’s `@Vector(4, f32)` can lower to `v128` operations when targeting WASM with `-mcpu=generic+simd128`. For example:
+
+```zig
+export fn add_four(a: @Vector(4, f32), b: @Vector(4, f32)) callconv(.C) @Vector(4, f32) {
+    return a + b;
+}
+```
+
+The compiler emits `f32x4.add` instructions. Always check that your target environment supports SIMD; provide a scalar fallback if necessary via comptime detection.
+
+**Binary size.** A minimal Zig module exporting a single `add` function can be under 500 bytes with `-O ReleaseSmall` and LTO. This dwarfs the overhead of other languages. The lack of a runtime means you pay only for what you use. Use `zig build-exe -fstrip` to strip debug info.
+
+**Profiling.** The `perf` and `vtune` tools cannot directly profile inside the browser’s WASM, but you can use the browser’s built-in profiler (Chrome DevTools, Firefox profiler) with source maps enabled. Zig can emit DWARF debug info for WASM (`-femit-dwarf`), though browser support varies. For microbenchmarks, compile your function natively for x86 and use `perf` to identify hotspots; the relative performance in WASM will track closely.
+
+---
+
+## 7. Best Practices
+
+**Design the API boundary first.** Before writing Zig code, define the interface table: which functions are exported, what arguments they take, and how memory ownership works. Prefer returning results in caller-provided buffers. If dynamic sizing is unavoidable, export `alloc`/`free` or a combined `alloc_thing`/`free_thing`.
+
+**Use `FixedBufferAllocator` for no-dynamic-growth.** For many browser use cases, you know the maximum input size (e.g., a 4096x4096 image buffer). Statically allocate a buffer and never touch `memory.grow`. This keeps the WASM module simple and avoids the detached-buffer problem.
+
+**Separate platform logic with comptime.** Write a platform-independent core that operates on slices, allocators, and IO-agnostic interfaces. For WASM, implement the IO layer with `extern "env"` functions. For native testing, use real files or sockets. This way, 90% of your code is testable with `zig test`.
+
+**Manage the view into memory carefully on the JS side.** Wrap the WASM instance in a JavaScript class that provides typed views and refreshes them after any call that could grow memory. A clean pattern:
+
+```js
+class WasmModule {
+    constructor(instance) {
+        this.instance = instance;
+        this.memory = instance.exports.memory;
+        this.updateViews();
+    }
+    updateViews() {
+        this.u8 = new Uint8Array(this.memory.buffer);
+        this.i32 = new Int32Array(this.memory.buffer);
+    }
+    callExport(name, ...args) {
+        const result = this.instance.exports[name](...args);
+        this.updateViews();
+        return result;
+    }
+}
+```
+
+**Use WASI for command-line tools.** If your Zig program is meant to run as a standalone WASI binary (e.g., in Node.js with `--experimental-wasi-unstable-preview1`, or in wasmtime), use `wasm32-wasi`. It gives you `std.fs`, `std.process`, and `std.log`. The same binary often runs unchanged on multiple hosts.
+
+**Test early and often.** Use `zig test` with a `test` block that invokes your exported functions (they are just Zig functions, callable from test code). For integration tests, use a WASM runtime like `wasmtime` or Node.js with a simple test harness. Zig’s standard testing allocator can be used, but remember that it may leak detect, which is useful for finding mismatched frees.
+
+---
+
+## 8. Examples
+
+### 8.1 Calculator Library (Minimal)
+
+This example exports a few arithmetic functions and a string length counter. No allocations; pure computation.
+
+```zig
+export fn add(a: i32, b: i32) callconv(.C) i32 { return a + b; }
+export fn subtract(a: i32, b: i32) callconv(.C) i32 { return a - b; }
+export fn multiply(a: i32, b: i32) callconv(.C) i32 { return a * b; }
+
+export fn string_len(ptr: [*]const u8) callconv(.C) usize {
+    return std.mem.len(ptr); // assumes null-terminated string
+}
+```
+
+Build with `zig build-exe src/calc.zig -target wasm32-freestanding -fno-entry -dynamic`. The resulting WASM is a few hundred bytes.
+
+### 8.2 Base64 Encoder with Custom Memory Management
+
+This module encodes a binary buffer to a base64 string. JavaScript provides the input buffer and receives the output in a caller-provided buffer. If the output buffer is too small, the function returns the required size.
+
+```zig
+const std = @import("std");
+
+export fn b64_encode_length(input_len: usize) callconv(.C) usize {
+    return std.base64.standard.Encoder.calcSize(input_len);
+}
+
+export fn b64_encode(
+    input: [*]const u8,
+    input_len: usize,
+    output: [*]u8,
+    output_len: usize,
+) callconv(.C) usize {
+    const in_slice = input[0..input_len];
+    const out_slice = output[0..output_len];
+    const encoded = std.base64.standard.Encoder.encode(out_slice, in_slice);
+    return encoded.len;
+}
+```
+
+JavaScript side:
+
+```js
+const input = new TextEncoder().encode("Hello, Zig!");
+const len = wasm.instance.exports.b64_encode_length(input.length);
+const outPtr = wasm.instance.exports.alloc(len);
+const written = wasm.instance.exports.b64_encode(
+    inputPtr, input.length, outPtr, len
+);
+const output = new TextDecoder().decode(
+    new Uint8Array(memory.buffer, outPtr, written)
+);
+wasm.instance.exports.dealloc(outPtr, len);
+console.log(output);
+```
+
+No hidden string allocation; the caller manages both buffers.
+
+### 8.3 WASI Word Counter
+
+This program reads a file passed as a command-line argument and prints the top 10 most frequent words. It compiles to a WASI binary.
+
+```zig
+const std = @import("std");
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+    if (args.len < 2) {
+        std.debug.print("Usage: {s} <file>\n", .{args[0]});
+        return;
+    }
+    const filename = args[1];
+    const file = try std.fs.cwd().openFile(filename, .{});
+    defer file.close();
+
+    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(content);
+
+    var word_counts = std.StringHashMap(usize).init(allocator);
+    defer word_counts.deinit();
+
+    var it = std.mem.splitScalar(u8, content, ' ');
+    while (it.next()) |word| {
+        if (word.len == 0) continue;
+        const entry = try word_counts.getOrPut(word);
+        if (entry.found_existing) {
+            entry.value_ptr.* += 1;
+        } else {
+            entry.value_ptr.* = 1;
+        }
+    }
+
+    var stdout = std.io.getStdOut().writer();
+    var entries = try allocator.alloc(struct { word: []const u8, count: usize }, word_counts.count());
+    defer allocator.free(entries);
+    {
+        var i: usize = 0;
+        var iter = word_counts.iterator();
+        while (iter.next()) |kv| {
+            entries[i] = .{ .word = kv.key_ptr.*, .count = kv.value_ptr.* };
+            i += 1;
+        }
+    }
+    std.mem.sort(struct { word: []const u8, count: usize }, entries, {}, struct {
+        fn lessThan(_: void, a: @TypeOf(entries[0]), b: @TypeOf(entries[0])) bool {
+            return a.count > b.count;
+        }
+    }.lessThan);
+
+    for (entries) |e| {
+        try stdout.print("{s}: {d}\n", .{ e.word, e.count });
+    }
+}
+```
+
+Run with `wasmtime --dir=. wordcount.wasm myfile.txt`. This demonstrates full stdlib usage in a WASI environment.
+
+---
+
+## 9. Summary & Exercises
+
+Zig’s approach to WebAssembly is an extension of its core tenets: treat the target as just another architecture, leverage explicit memory, and avoid hidden machinery. The result is small, fast, predictable WASM modules that integrate cleanly with JavaScript or WASI hosts. You control the allocation strategy, the API surface, and the performance characteristics.
+
+**Recap:**
+- Use `export fn ... callconv(.C)` to expose functions.
+- Manage memory explicitly through exported alloc/free or caller-provided buffers.
+- Choose between `wasm32-freestanding` (no OS) and `wasm32-wasi` (POSIX-like).
+- Keep cross-boundary calls coarse-grained for performance.
+- Exploit comptime to share code between native and WASM targets.
+- Always refresh `memory.buffer` in JS after a call that could grow memory.
+
+**Exercises:**
+
+1. **Build a Zig sorting library for `[]i32`.** Export a function that sorts an array in-place. The JavaScript side allocates an `Int32Array`, fills it with random numbers, passes the pointer and length, and reads back the sorted array. Implement the sort using `std.mem.sort`. Ensure that the JS side correctly detects memory growth and updates views.
+
+2. **Design a bump-pointer allocator with `reset`.** Implement a custom allocator that uses a fixed global buffer and a bump offset. Export `alloc`, `dealloc` (which does nothing), and `reset` (which sets the offset to zero). From JavaScript, use this allocator for a series of operations without growing memory. Measure the performance difference between this and a `GeneralPurposeAllocator` by calling an exported function that performs many small allocations.
+
+3. **WASI word frequency with binary size optimization.** Starting from the example in 8.3, use `-O ReleaseSmall` and `-fstrip` to minimize the WASM binary. Compare the size to an equivalent C program compiled with Clang (`-target wasm32-wasi`). Investigate which standard library functions pull in the most code (e.g., `format` vs. `print`). Refactor to use a simpler output path (e.g., `std.io.getStdOut().writeAll`) to achieve the smallest possible size.
+
+Zig gives you the tools to ship WebAssembly without abstraction tax. The resulting modules are tiny, the execution is deterministic, and the interface is exactly the one you designed. That is the Zig way—on the web and everywhere else.

@@ -1,0 +1,269 @@
+## Chapter 34. Logging, Metrics, and Observability
+
+Every production system must expose its internal state for diagnosis, performance analysis, and failure investigation. Zig’s standard library provides a minimal, comptime‑configurable logging facade (`std.log`) that never allocates, never throws, and compiles away completely when you don’t need it. This chapter covers the core logging API, how to replace it with structured backends, how to instrument code with metrics, and how to integrate with Tracy for zero‑overhead real‑time profiling. Throughout we maintain the Zig Way: no hidden control flow, no implicit allocations, and compile‑time decisions wherever possible.
+
+### 1. Basic Usage
+
+The entry point for logging is `std.log.scoped`. You give it a comptime scope identifier (usually a string literal, but any `@TypeOf(.enum_literal)` works) and it returns a namespace containing one function per severity level:
+
+```zig
+const std = @import("std");
+const log = std.log.scoped(.my_module);
+
+pub fn main() void {
+    log.debug("hello debug", .{});
+    log.info("server listening on port {d}", .{8080});
+    log.warn("disk usage at {d}%", .{92});
+    log.err("failed to open config: {s}", .{"file not found"});
+}
+```
+
+Each function signature is `fn (comptime format: []const u8, args: anytype) void`. The format string follows `std.fmt` rules. **Crucially, if the global log level is higher (less verbose) than the call’s level, the entire call site is eliminated at compile time** — no branch, no formatting, no runtime cost.
+
+The global log level is set via the `log_level` build option (or by overriding `std.options.log_level` in the root source file). By default it is `.info` for debug builds, `.err` for release builds. You can change it with `-Dlog_level=.debug` when building.
+
+```sh
+$ zig build-exe main.zig -Dlog_level=.debug
+```
+
+The default output goes to stderr, using a globally replaceable log function. In the next sections you’ll see how to redirect it.
+
+### 2. Under the Hood
+
+To understand how Zig achieves zero‑cost logging, let’s look at the machinery behind `std.log.scoped`.
+
+`std.log.scoped` is a function that takes a comptime scope argument (e.g., the `.my_module` enum literal) and returns a struct:
+
+```zig
+pub fn scoped(comptime scope: @TypeOf(.enum_literal)) type {
+    return struct {
+        pub fn debug(comptime format: []const u8, args: anytype) void {
+            const level: Level = .debug;
+            if (@intFromEnum(level) <= @intFromEnum(root.log_level)) {
+                root.logFn(level, scope, format, args);
+            }
+        }
+        // … info, warn, err functions use the same pattern
+    };
+}
+```
+
+- `root.log_level` is a `comptime` value sourced from `std.options.log_level`. Because it is comptime‑known, `@intFromEnum(level) <= @intFromEnum(root.log_level)` is a compile‑time boolean. If false, the entire body, including the call to `logFn` and formatting, is dead code that LLVM eliminates.
+- `root.logFn` is a function pointer stored in a mutable comptime‑time global (`std.options.logFn`). Its signature is:
+
+```zig
+pub const logFn: *const fn (
+    comptime message_level: Level,
+    comptime scope: @TypeOf(.enum_literal),
+    comptime format: []const u8,
+    args: anytype,
+) void = defaultLog;
+```
+
+The default implementation (`defaultLog`) uses `std.debug.print` to write to stderr. `std.debug.print` locks `stderr` (via `std.debug.lockStdErr()`) and writes formatted output, so it is safe for concurrent use from multiple threads, but it does cause serialisation.
+
+No allocation occurs anywhere in the default logging path. The format string is comptime‑validated and translated into a series of writer calls without heap usage. This guarantees that logging will not fail due to memory pressure, and it will not hide allocation‑induced pauses.
+
+When you write `log.info("x={}", .{x})`, the compiler:
+1. Checks comptime log level — if info is suppressed, compiles to nothing.
+2. Inlines the `info` wrapper (the function is trivial, so LLVM inlines it).
+3. Calls the function pointer `logFn` with the comptime level, scope, format, and a tuple of arguments.
+4. Inside `defaultLog`, the formatting uses `std.fmt.format` to write directly to `std.io.getStdErr().writer()`.
+
+This design means the logging infrastructure itself adds zero runtime overhead for suppressed levels, and minimal overhead for active ones (one indirect call + formatting).
+
+### 3. Why This Design?
+
+Zig’s logging model is a deliberate reaction against the heavyweight logging frameworks common in other ecosystems. The design principles are:
+
+- **No hidden allocations.** Logging must never cause an out‑of‑memory situation or unpredictable latency spikes. The default backend uses only stack memory and a static buffer for formatting.
+- **Compile‑time gating, not runtime checks.** Filtering by log level is a comptime decision, so there is no branch predictor pollution for disabled levels, and the format string and arguments are never even evaluated.
+- **Pluggable but not plugin‑architecture.** The global `logFn` is a simple function pointer, not an interface with dynamic dispatch, registration, or configuration files. Changing the logging behaviour is as simple as assigning a different function at the root of your program (or library). There is no runtime cost for “plugin” indirection.
+- **Scopes are comptime literals, not strings.** Using enum literals (`.my_module`) prevents accidental typos, allows tooling to statically list all scopes, and removes the need for runtime string comparison.
+- **The logger is not a framework.** There is no concept of “appender”, “logger hierarchy”, or “MDC”. If you need structured output, rate limiting, or asynchronous writing, you implement exactly that logic in your custom `logFn`, without paying for it when you don’t need it.
+
+Compare this to Go’s `slog`: it requires passing a context for every log call, has runtime level checks, and allocates strings for attributes. Java’s Log4j relies on classloader‑based configuration, MDC maps, and reflection. Rust’s `log` crate is similar in spirit (macro‑based, compile‑time filtering), but the Rust ecosystem often couples it with complex runtime initialisation and global logger registration that requires a `Once` lock. Zig’s global is a simple assignable variable — you set it and forget it.
+
+### 4. Competing Approaches
+
+**C**: Logging typically uses `printf`/`fprintf` directly, or macros like `#define LOG_ERR(...)`. There is no standardisation, and filtering requires runtime branches or preprocessor tricks. No way to swap backends without recompilation. Zig’s comptime filtering is more robust because it uses the language’s type system rather than a textual preprocessor.
+
+**C++**: Libraries like `spdlog` offer compile‑time format checking and sinks, but often depend on dynamic memory, thread‑local storage, and runtime configuration. The default logger is a singleton with mutex locking. Zig’s approach avoids all hidden global state and allocation, aligning with the “no hidden control flow” pillar.
+
+**Rust**: The `log` crate + `env_logger` ecosystem is similar: macros filter at compile time, and a global logger can be set. However, setting the global logger requires calling `log::set_logger` inside a `Once` (or `set_boxed_logger`), and the logger trait involves vtables and dynamic dispatch. Zig’s function pointer is monomorphic at each call site (since it can be a direct call after inlining), which is simpler and often faster.
+
+**Go**: `log` package and `slog` are runtime‑oriented, always incurring at least a level check and often an allocation. The “structured” slog adds context‑passing and attribute slices. Zig’s logging can be just as structured by writing a custom `logFn` that serialises key‑value pairs, but you only pay for what you use.
+
+**Python**: The standard `logging` module is incredibly flexible but involves global state, configuration files, and considerable runtime overhead (attribute creation, filter chains). Zig’s logging would be embedded inside an extension module written in C or Zig; you’d export a function to set the log function, providing the minimal surface area.
+
+### 5. Common Mistakes
+
+- **Forgetting to set the log level.** Newcomers often write `log.debug(...)` and see no output because the default release log level is `.err`. Always build with `-Dlog_level=.debug` during development, or override `std.options.log_level` in your root file.
+- **Using `log` for extremely high‑frequency events.** Even though a suppressed level has no runtime cost, if the level is active, the formatting and indirect call happen on the hot path. For per‑packet or per‑frame statistics, consider using atomically‑updated counters and a separate reporting thread rather than a log call per event.
+- **Assuming `log` is async or non‑blocking.** The default backend writes to stderr synchronously. If stderr is a pipe or file, that I/O can block. For low‑latency threads, set a custom `logFn` that pushes into a lock‑free ring buffer or simply discards.
+- **Calling `log` from a signal handler.** The default backend uses a mutex (`lockStdErr`). Calling it from a signal handler that interrupted a thread holding that mutex will deadlock. Use a signal‑safe custom backend.
+- **Library authors who assume the application configures logging.** If your library uses `std.log`, the application may not have set `logFn` or may have a different log level expectation. Provide a way for the application to override your library’s logging by exposing your own function pointer or by using the global `logFn` directly but documenting the dependency.
+- **Using `catch unreachable` on `std.debug.print` failures.** Although `print` can fail (e.g., when writing to a broken pipe), the default `logFn` ignores errors. Do not assume logs never fail — design your custom backend to handle write errors gracefully.
+
+### 6. Performance Considerations
+
+When a log call is completely disabled by the comptime log level, the compiler removes all code associated with it, including the format string and argument evaluation. For the following snippet:
+
+```zig
+log.debug("x={d}, y={d}", .{ expensive(), another() });
+```
+
+If the debug level is suppressed, `expensive()` and `another()` are never called. This is a stronger guarantee than Rust’s `debug!` macro, which still evaluates its arguments (unless you use the `if log_enabled!` pattern).
+
+When active, the performance cost consists of:
+- One indirect call via `logFn`. In practice, because `logFn` is a comptime‑known function pointer (if assigned before compilation), the call can be devirtualised and inlined by LLVM, turning it into a direct call to your custom function.
+- Formatting: `std.fmt.format` does stack‑based formatting without allocation, but it still iterates over the format string and writes bytes to the writer. For a simple integer, this is a few dozen instructions. For complex structures, it can be more. You can control this by designing your log backend to use efficient serialisation (e.g., binary protocol buffers) or to sample aggressively.
+
+The global log function is not synchronised. If multiple threads call `log.info` concurrently, the custom log function must handle thread safety. The default `defaultLog` uses a mutex around `stderr`, which serialises all logging output. For high‑throughput systems, you can implement a per‑thread ring buffer that a dedicated thread drains to disk, avoiding contention.
+
+**Tracy integration** deserves special mention: when connected to the Tracy profiler, zone markers and message plots can be inserted with C macros. Zig can call these directly via `@cImport`. However, these calls are **not** part of `std.log`; they are separate instrumentation. The overhead when Tracy is not connected is a single load‑and‑branch (the profiler is inactive), which is negligible. In the best‑practice section you’ll see how to integrate both.
+
+### 7. Best Practices
+
+- **Define a log scope for every significant module.** Use the name of the file or the subsystem, like `log = std.log.scoped(.network);`. This produces consistent output that can be filtered by scope in a custom backend.
+- **Override `std.options.log_level` in your root file** for development builds, but respect that libraries might rely on the default. You can set it via `-Dlog_level=.debug` from the build system.
+- **Always pass a `std.mem.Allocator` to the custom log function if it needs to allocate** (e.g., for JSON formatting). The default log function allocates nothing, but a structured backend might need to build a key‑value map. Make the allocator a comptime parameter or a closure captured in your custom log function.
+- **Use structured logging for production.** Instead of concatenating strings, design your `logFn` to accept a format and arguments that represent a template and a set of typed parameters, and serialise them to JSON or a binary log format. For example, `log.info("http_request", .{ .method = "GET", .path = "/", .status = 200 })`; your custom backend interprets the scope `.http_request` and the arguments as a record.
+- **Do not rely on global state inside your custom log function.** It should be pure enough that a library can call it without initialisation. Provide an explicit initialisation function for applications to install the logger.
+- **For metrics, use dedicated counters.** Rather than logging every event and aggregating later, use `std.atomic.Int` to increment counters on the hot path, then expose them via a separate mechanism (e.g., a Prometheus endpoint). Zig’s atomics are low‑overhead; a simple `counter.fetchAdd(1, .monotonic)` compiles to a single `lock inc` on x86.
+- **When using Tracy**, conditionally compile instrumentation blocks with a comptime flag (e.g., `const enable_tracy = @hasDecl(@import("root"), "enable_tracy") and root.enable_tracy;`). This ensures zones are completely removed in release builds that don’t need them.
+
+### 8. Examples
+
+#### 8.1 Custom Log Function to a File
+
+This complete program replaces the global log function with one that appends to a file. It uses an arena allocator for the file path and a mutex for thread safety.
+
+```zig
+const std = @import("std");
+
+var log_file: std.fs.File = undefined;
+var log_mutex: std.Thread.Mutex = .{};
+
+pub fn fileLogFn(
+    comptime level: std.log.Level,
+    comptime scope: @TypeOf(.enum_literal),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    // Thread safety: lock around the write.
+    log_mutex.lock();
+    defer log_mutex.unlock();
+
+    // Format prefix: level and scope.
+    const level_str = @tagName(level);
+    const scope_str = @tagName(scope);
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const writer = fbs.writer();
+
+    writer.print("[{s}] ({s}): " ++ format ++ "\n", .{level_str, scope_str} ++ args) catch return;
+    // Write the formatted line to the file.
+    log_file.writeAll(fbs.getWritten()) catch {};
+}
+
+pub fn main() !void {
+    // Set the global log function before any log calls.
+    std.options.logFn = fileLogFn;
+
+    // Open a log file (in current directory).
+    log_file = try std.fs.cwd().createFile("app.log", .{});
+    defer log_file.close();
+
+    const log = std.log.scoped(.example);
+    log.info("application started, version {s}", .{"1.0.0"});
+    log.err("simulated failure: {s}", .{"disk full"});
+}
+```
+
+Build and run it; `app.log` will contain:
+
+```
+[info] (example): application started, version 1.0.0
+[err] (example): simulated failure: disk full
+```
+
+Notice that we did not allocate any memory for the logging itself — the fixed buffer stream uses stack space.
+
+#### 8.2 Structured Logging Backend (JSON Lines)
+
+A custom `logFn` that outputs JSON objects, one per line, with typed fields. We assume arguments are a struct with named fields.
+
+```zig
+const std = @import("std");
+const json = std.json;
+
+pub fn jsonLogFn(
+    comptime level: std.log.Level,
+    comptime scope: @TypeOf(.enum_literal),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    // We'll write JSON to stderr for simplicity.
+    const stderr = std.io.getStdErr().writer();
+    var counting_writer = std.io.countingWriter(stderr);
+    const writer = counting_writer.writer();
+
+    // Build a JSON object manually; no allocation needed.
+    writer.writeAll("{") catch return;
+    writer.print("\"ts\":{d},", .{std.time.milliTimestamp()}) catch return;
+    writer.print("\"level\":\"{s}\",", .{@tagName(level)}) catch return;
+    writer.print("\"scope\":\"{s}\",", .{@tagName(scope)}) catch return;
+    writer.print("\"msg\":", .{}) catch return;
+    json.stringify(format, .{}, writer) catch return;
+    writer.print(",\"fields\":", .{}) catch return;
+    json.stringify(args, .{}, writer) catch return;
+    writer.writeAll("}\n") catch return;
+}
+```
+
+Then assign `std.options.logFn = jsonLogFn;`. Calls like `log.info("user login", .{ .user_id = 42, .ip = "10.0.0.1" })` will produce a JSON line. This approach remains allocation‑free because `json.stringify` works directly on the writer.
+
+#### 8.3 Integrating Tracy for Real‑Time Profiling
+
+Zig can call Tracy’s C API directly. First, add the Tracy source to your project (or use a package). The following demonstrates manual instrumentation.
+
+```zig
+const c = @cImport({
+    @cDefine("TRACY_ENABLE", "1"); // only when enabled
+    @cInclude("tracy/TracyC.h");
+});
+
+const log = std.log.scoped(.tracy_example);
+
+pub fn main() void {
+    // Mark a zone.
+    c.___tracy_scoped_zone(0, "Main Loop", 0, 0, 0);
+
+    var sum: u64 = 0;
+    for (0..100_000) |i| {
+        // A named zone inside the loop.
+        c.___tracy_scoped_zone(0, "Iteration", 0, 0, 0);
+        sum +%= i;
+    }
+    log.info("sum = {d}", .{sum});
+}
+```
+
+You can also emit plot points and messages. The macros are zero‑cost when `TRACY_ENABLE` is not defined. Wrap the Tracy includes in a comptime‑enabled module to keep the release build clean.
+
+### 9. Summary & Exercises
+
+**Summary**
+
+- `std.log` provides a compile‑time‑filtered, allocation‑free logging facade.
+- The global `logFn` is a simple function pointer that you replace to redirect or transform log output.
+- Log scopes are comptime enum literals, keeping them efficient and toolable.
+- Zig’s design ensures that suppressed log levels are entirely absent from the binary, with no hidden branching.
+- Metrics and observability go beyond logging: use atomics for counters and integrate Tracy for fine‑grained profiling.
+
+**Exercises**
+
+1. **Ring‑buffer logging backend.** Implement a custom `logFn` that stores log entries into a lock‑free multi‑producer single‑consumer ring buffer. A separate thread reads from the buffer and writes to disk in batches. Measure the throughput improvement compared to a mutex‑based file logger.
+2. **Structured metrics with a Prometheus endpoint.** Extend the structured JSON logger to also maintain counters and gauges. Every time a log scope and level is emitted, also update a corresponding Prometheus metric. Then write an HTTP handler that exposes `/metrics` in the Prometheus text format.
+3. **Tracy‑based system call tracing.** Using Zig’s `std.os.linux` or `std.os.windows`, write a wrapper around a few system calls that emits a Tracy zone for each call. Ensure that when Tracy is disabled, the wrapper imposes zero overhead (comptime branching). Profile a simple file‑copy loop to visualise I/O latency.

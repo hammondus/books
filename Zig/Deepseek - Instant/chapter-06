@@ -1,0 +1,746 @@
+## Chapter 6: Control Flow
+
+Control flow in Zig looks familiar at first glance – `if`, `while`, `for`, `switch` – but each comes with subtle superpowers and intentional limitations. The language’s “no hidden control flow” principle applies here too: what you see is what executes. No operator overloading that secretly calls functions, no implicit truthiness conversions, no fall‑through in `switch` statements. This chapter dissects each construct, shows you how the compiler thinks about them, and reveals why Zig’s approach eliminates entire classes of bugs found in C, C++, and even Rust.
+
+---
+
+### 1. Basic Usage
+
+#### `if` and `else`
+
+The simplest conditional works exactly as expected:
+
+```zig
+const std = @import("std");
+
+pub fn main() void {
+    const x: i32 = 42;
+    if (x > 0) {
+        std.debug.print("positive\n", .{});
+    } else if (x == 0) {
+        std.debug.print("zero\n", .{});
+    } else {
+        std.debug.print("negative\n", .{});
+    }
+}
+```
+
+**Key difference from C:** The condition *must* be a `bool`. No `if (ptr)`, no `if (err)` – you write `if (ptr != null)` or `if (err != error.Success)` explicitly.
+
+`if` can also be an **expression** returning a value:
+
+```zig
+const status = if (x > 0) "positive" else "non-positive";
+```
+
+Both branches must produce the same type (or coerce to a common type). This replaces C’s ternary operator `? :` with a more readable form.
+
+#### `if` with Error Unions
+
+Error unions (`!T`) are so common that Zig provides special syntax to capture the payload or the error:
+
+```zig
+fn mightFail() !u32 {
+    return 123;
+}
+
+pub fn example() void {
+    // Capture the success value
+    if (mightFail()) |value| {
+        std.debug.print("got {d}\n", .{value});
+    } else |err| {
+        std.debug.print("failed with {}\n", .{err});
+    }
+}
+```
+
+This replaces the need for a separate `errdefer` or `catch` when you need to handle both paths explicitly.
+
+#### `while` Loops
+
+Basic `while`:
+
+```zig
+var i: u32 = 0;
+while (i < 10) {
+    std.debug.print("{d} ", .{i});
+    i += 1;
+}
+```
+
+**Continue expression:** A powerful Zig addition – the expression after the loop body runs at the end of each iteration, even if `continue` is called inside:
+
+```zig
+var i: u32 = 0;
+while (i < 10) : (i += 1) {
+    if (i % 2 == 0) continue;
+    std.debug.print("{d} ", .{i}); // prints odd numbers
+}
+```
+
+This keeps the increment logic attached to the loop header, similar to a `for` loop’s third clause in C, but without the confusion of empty bodies.
+
+**`while` with Optionals / Error Unions:** You can loop while an optional has a value:
+
+```zig
+var it = std.mem.splitScalar(u8, "a,b,c", ',');
+while (it.next()) |part| {
+    std.debug.print("{s}\n", .{part});
+}
+```
+
+Or while an error‑returning function succeeds:
+
+```zig
+var reader = std.io.getStdIn().reader();
+var buf: [256]u8 = undefined;
+while (reader.readUntilDelimiterOrEof(&buf, '\n') catch null) |line| {
+    std.debug.print("read: {s}\n", .{line});
+}
+```
+
+**`else` clause on loops:** Executed when the loop condition becomes false (i.e., normal termination, not via `break`).
+
+```zig
+var found = false;
+var i: u32 = 0;
+while (i < 10) : (i += 1) {
+    if (array[i] == target) {
+        found = true;
+        break;
+    }
+} else {
+    // Executed only if loop finished without `break`
+    std.debug.print("not found\n", .{});
+}
+```
+
+#### `for` Loops
+
+Zig’s `for` iterates over arrays, slices, or ranges:
+
+```zig
+const arr = [_]i32{ 10, 20, 30 };
+for (arr) |value| {
+    std.debug.print("{d} ", .{value});
+}
+
+// With index
+for (arr, 0..) |value, i| {
+    std.debug.print("arr[{d}] = {d}\n", .{ i, value });
+}
+
+// Iterate over two sequences in parallel
+const names = [_][]const u8{ "Alice", "Bob" };
+const ages = [_]u32{ 30, 25 };
+for (names, ages) |name, age| {
+    std.debug.print("{s} is {d}\n", .{ name, age });
+}
+```
+
+**Range syntax:** `0..10` produces values 0 through 9. The exclusive upper bound matches slice indexing.
+
+`for` also supports a **continue expression** and an **`else` clause** identical to `while`.
+
+#### `switch`
+
+`switch` in Zig is exhaustive – it must handle every possible value of the input. No fall‑through; each case is separate.
+
+```zig
+const color: enum { red, green, blue } = .green;
+switch (color) {
+    .red => std.debug.print("R\n", .{}),
+    .green => std.debug.print("G\n", .{}),
+    .blue => std.debug.print("B\n", .{}),
+}
+```
+
+Multiple cases can share the same body:
+
+```zig
+switch (x) {
+    1, 2, 3 => std.debug.print("small\n", .{}),
+    4, 5, 6 => std.debug.print("medium\n", .{}),
+    else => std.debug.print("other\n", .{}),
+}
+```
+
+The `else` clause covers all remaining values (useful for non‑exhaustive enums or integer ranges).
+
+**Capture payloads** from tagged unions:
+
+```zig
+const Value = union(enum) { int: i32, float: f64, none };
+var v: Value = .{ .int = 42 };
+switch (v) {
+    .int => |i| std.debug.print("int {d}\n", .{i}),
+    .float => |f| std.debug.print("float {d}\n", .{f}),
+    .none => std.debug.print("nothing\n", .{}),
+}
+```
+
+#### Labeled Blocks and `break`
+
+Any block can be given a label, and `break` can exit that block, optionally returning a value:
+
+```zig
+const result = blk: {
+    if (some_condition) break :blk 100;
+    const y = computeSomething();
+    break :blk y * 2;
+};
+```
+
+This is Zig’s replacement for the “ghetto” `goto` or the `do { … } while(0)` trick in C macros. It also allows early exit from deep nesting without introducing a separate function.
+
+Labeled `break` works inside loops too:
+
+```zig
+outer: for (matrix) |row| {
+    for (row) |cell| {
+        if (cell == 0) break :outer;
+    }
+}
+```
+
+`continue` also supports labels.
+
+---
+
+### 2. Under the Hood
+
+#### Lowering to LLVM IR
+
+Zig uses LLVM as its primary backend (the self‑hosted backend is maturing, but the mental model remains similar). Each control flow construct maps predictably to LLVM’s `br` (branch) and `phi` instructions.
+
+**`if` statement:** Generates a `br` on the condition. Example Zig:
+
+```zig
+if (x > 0) { a(); } else { b(); }
+```
+
+Becomes (simplified LLVM IR):
+
+```llvm
+%cmp = icmp sgt i32 %x, 0
+br i1 %cmp, label %then, label %else
+
+then:
+  call @a()
+  br %merge
+else:
+  call @b()
+  br %merge
+merge:
+  ...
+```
+
+**`if` as an expression:** Requires a `phi` node to merge the two possible result values.
+
+**`switch` with dense integer cases:** Compiled into a jump table (array of branch targets) for O(1) dispatch. Sparse cases become a binary search tree or linear cascade, depending on the optimizer’s heuristics. You can inspect this with `zig build-obj` and `llvm-objdump`.
+
+**`while` and `for` loops:** Lowered to a loop block with a conditional branch at the top (or bottom if the compiler unrolls). The continue expression is simply appended at the end of the loop body before the back‑edge branch.
+
+**Comptime elimination:** When the condition of an `if` or `switch` is known at compile time, Zig’s semantic analysis prunes the dead branch completely – no runtime code is generated. This is not an optimization pass; it happens in the front‑end before IR generation.
+
+```zig
+const debug = true;
+if (debug) {
+    // This block disappears entirely when debug == false
+    std.debug.print("debug on\n", .{});
+}
+```
+
+Similarly, `switch` on a `comptime_int` eliminates all but the taken case.
+
+#### Error Union `if` Capture
+
+The `if (foo()) |value| else |err|` syntax desugars to:
+
+```zig
+const result = foo();
+if (result) |value| {
+    // use value
+} else |err| {
+    // handle err
+}
+```
+
+Under the hood, the compiler creates an anonymous error union and inspects its tag (the error set or payload presence). This is a runtime check, but the layout of an error union is a simple struct: a payload field and an error code field (or a single pointer when the payload is also a pointer – see Chapter 17). The branch is just a comparison of the error code against zero (zero means success in Zig’s ABI).
+
+#### `defer` and `errdefer` (brief mention)
+
+Although Chapter 16 covers these in depth, note that `defer` pushes a cleanup action onto a hidden stack attached to the current block. When the block exits (normally or via `break`, `return`, `continue`), the deferred statements execute in reverse order. This is not a destructor call – it’s an explicit list of function calls inserted by the compiler at every exit point. The generated code duplicates `defer` cleanups on every return path.
+
+---
+
+### 3. Why This Design?
+
+#### No Implicit Truthiness
+
+In C, `if (ptr)` checks for non‑null; `if (errno)` checks for non‑zero. This brevity hides intent and causes bugs (e.g., using `=` instead of `==` compiles, and non‑zero is “true”). Zig requires an explicit `bool` expression. The result is self‑documenting code and elimination of the `if (x = y)` classic error.
+
+**Benefits:**
+- Reading `if (ptr != null)` immediately tells you we’re testing a pointer.
+- The compiler rejects `if (err)` – you write `if (err != error.Success)` or `if (err)` would be a type mismatch.
+
+#### No Fall‑through in `switch`
+
+C’s fall‑through is a known source of bugs (missing `break`). Zig’s `switch` executes exactly one case. If you want to fall through, you must combine cases explicitly: `1, 2 =>`. This makes the control flow explicit and reviewable.
+
+#### Exhaustiveness Checking
+
+Every `switch` must handle all possible values of the input. For enums, the compiler verifies you’ve listed every tag. For integers, you must provide an `else` clause unless the range is fully covered (e.g., `0…1` for a `u1`). This eliminates the “unhandled enum variant” bugs that plague C and even Rust (where `_` is often used carelessly).
+
+#### Labeled Blocks as Structured `goto`
+
+C programmers sometimes need `goto` for error cleanup or breaking out of nested loops. Zig provides labeled blocks and labeled `break`/`continue` – a structured form that cannot jump into the middle of a block or skip initializations. This keeps control flow graph reasonable while offering the same expressive power.
+
+```zig
+// Cleanup without `goto`
+const result = cleanup: {
+    const a = allocate();
+    errdefer free(a);
+    if (condition) break :cleanup error.Failure;
+    // ...
+    break :cleanup success;
+};
+```
+
+#### Continue Expression
+
+Many loops need an “advance” step that runs at the end of the body. In C you write `for (i = 0; i < n; i++)`, but `while` loops require manual increment at the bottom – easy to forget when you `continue`. Zig’s `while (cond) : (continue_expr)` attaches the step to the loop header, guaranteeing it executes on every iteration before re‑checking the condition, even after a `continue`.
+
+This design reflects the philosophy: *explicit is better than implicit, but repetition should be eliminated in the syntax itself*.
+
+#### No Special‑Purpose Loop Constructs
+
+Zig has no `do-while` (use `while (true) { …; if (cond) break; }`), no `for-each` (use `for`), and no ranged `for` with custom iterators (use `while` with a manual iterator). The small set of constructs reduces cognitive load and makes the language easier to learn deeply.
+
+---
+
+### 4. Competing Approaches
+
+| Language | Key Control Flow Features | Zig’s Differentiator |
+|----------|--------------------------|----------------------|
+| **C** | Fall‑through `switch`, implicit truthiness, `goto`, `do-while`, ternary `?:` | No fall‑through, explicit bools, labeled blocks instead of `goto`, `if` expression replaces ternary. |
+| **C++** | Same as C plus `if constexpr` (compile‑time), range‑based `for`, exceptions | Zig’s `comptime` `if` is more general than `if constexpr` (runs any Zig code). Exceptions vs. Zig’s error unions change control flow dramatically. |
+| **Rust** | `if let`, `while let`, `match` (exhaustive, no fall‑through), `loop` (infinite) with labeled `break`, `?` operator for early return | Zig’s `if`/`while` capture syntax is similar to `if let` but works on error unions as well. Rust’s `match` is more expressive (patterns, guards) but also more complex. Zig’s `switch` is deliberately simpler. |
+| **Go** | `switch` with optional fall‑through, `select` for channels, `defer`, no ternary | Zig shares `defer` but adds `errdefer`. Go’s `switch` allows expressions as cases; Zig’s is stricter. Zig has no `select` (concurrency handled by libraries). |
+| **Python** | `elif`, `for-else`, `while-else`, ternary `x if cond else y` | Zig’s `else` on loops works similarly. Python’s dynamic nature means less compile‑time analysis; Zig’s `comptime` eliminates dead branches before runtime. |
+
+**Notable missing features from Zig:**
+- No `do-while` – considered unnecessary; `while (true)` + `break` is clearer.
+- No `goto` – labeled blocks provide structured jumps without the risks.
+- No `? :` ternary – `if` expression is more readable and avoids the ambiguity of C’s precedence.
+- No implicit conversions to `bool` – avoids the `if (x = y)` trap.
+- No pattern matching beyond tagged union capture – the design philosophy favours simplicity over feature bloat.
+
+**Why Zig doesn’t need `if let` (Rust) or `switch` with patterns:**
+Zig’s `if` captures both optionals and error unions directly. Tagged unions are inspected with `switch`. The language deliberately avoids deep pattern matching because that often requires complex grammar and semantics. Instead, you write explicit conditions and captures – more lines, but each line is obviously correct.
+
+---
+
+### 5. Common Mistakes
+
+#### 1. Forgetting that `if` condition must be `bool`
+
+```zig
+// Wrong
+var ptr: ?*u32 = null;
+if (ptr) { … }  // error: expected bool, found ?*u32
+
+// Correct
+if (ptr != null) { … }
+// Or
+if (ptr) |p| { … }  // capture syntax works
+```
+
+#### 2. Using `if (err)` instead of error capture
+
+```zig
+fn mayFail() !void { return error.Foo; }
+const result = mayFail();
+if (result) { … }  // error: expected bool, found error union
+if (result) |_| { … }  // OK, but captures void payload
+if (result) |_| else |err| { … }  // handle both
+```
+
+#### 3. Non‑exhaustive `switch` on integers
+
+```zig
+const x: u8 = 42;
+switch (x) {
+    0 => {},
+    1 => {},
+    // error: switch must handle all values (0…255)
+}
+// Fix: add `else => {}` or cover entire range
+```
+
+#### 4. Using `break` without label in nested loops (breaks only the innermost)
+
+```zig
+while (cond1) {
+    while (cond2) {
+        if (something) break;  // breaks inner loop only
+    }
+}
+// To break outer, label it:
+outer: while (cond1) {
+    while (cond2) {
+        if (something) break :outer;
+    }
+}
+```
+
+#### 5. `continue` skipping continue expression
+
+In a `while (cond) : (continue_expr)`, `continue` still runs the continue expression. This is by design, but newcomers sometimes expect `continue` to jump straight to the condition test.
+
+#### 6. Using `else` on loops when you meant `else` after `if`
+
+```zig
+while (cond) {
+    if (foo) break;
+} else {
+    // This runs only if loop didn't break
+}
+```
+
+It’s easy to confuse with `if-else`. Use comments or refactor to clarify.
+
+#### 7. Capturing the same name multiple times
+
+```zig
+if (maybeValue()) |x| {
+    // x is in scope here
+    _ = x;
+} else |err| {
+    // err is in scope here
+}
+// x and err are *not* in scope outside
+```
+
+Attempting to use `x` after the `if` block causes a compile error.
+
+---
+
+### 6. Performance Considerations
+
+#### Branch Prediction and Error Unions
+
+Every `if (foo()) |val| else |err|` introduces a branch that checks the error union’s tag. In tight loops where errors are rare (but possible), this branch is highly predictable. However, if errors occur frequently, the branch misprediction penalty can be significant. Consider restructuring hot code to check errors less often, or use `catch` with a fallback value to eliminate the branch.
+
+Example of eliminating branch:
+
+```zig
+// Branch each iteration
+while (reader.readByte()) |byte| {
+    process(byte);
+} else |err| {
+    handle(err);
+}
+
+// Instead: batch reads
+var buf: [1024]u8 = undefined;
+while (true) {
+    const n = reader.read(&buf) catch |err| {
+        if (err == error.EndOfStream) break;
+        handle(err);
+        break;
+    };
+    for (buf[0..n]) |byte| {
+        process(byte);  // no branching per byte
+    }
+}
+```
+
+#### `switch` Jump Table Costs
+
+For dense integer ranges, `switch` generates a jump table – an array of code pointers. This is O(1) but consumes memory in the code section (one pointer per case). For sparse ranges, the compiler generates a binary search or linear comparisons. If performance is critical, profile and consider manually transforming a `switch` into a computed `goto` using an array of function pointers.
+
+#### Comptime‑Eliminated Branches
+
+Use `comptime` booleans to remove debug code or configuration checks. The following generates no runtime branch:
+
+```zig
+const assert_enabled = true; // or false, determined at compile time
+if (assert_enabled) {
+    // This block is removed entirely if false
+    std.debug.assert(x > 0);
+}
+```
+
+#### Loop Unrolling
+
+Zig does not automatically unroll loops aggressively (LLVM may, but it’s unpredictable). For performance‑sensitive fixed‑iteration loops, unroll manually with comptime:
+
+```zig
+comptime var i = 0;
+inline while (i < 4) : (i += 1) {
+    // This loop body is duplicated 4 times
+    doSomething(i);
+}
+```
+
+The `inline while` (and `inline for`) forces the compiler to unroll the loop at compile time. Use sparingly – it increases binary size.
+
+#### Avoid Unnecessary Bounds Checking
+
+`for` loops over slices perform bounds checking in `Debug` and `ReleaseSafe` modes. In `ReleaseFast`, the compiler may eliminate checks it can prove safe, but not always. To completely remove bounds checking, use pointer arithmetic or `while` loops with manual indexing and `@compileError` patterns – but only after profiling shows it matters.
+
+---
+
+### 7. Best Practices
+
+#### Prefer `if` capture over `.?` or `catch unreachable`
+
+```zig
+// Idiomatic
+if (maybe_value) |v| {
+    use(v);
+} else {
+    handle_missing();
+}
+
+// Avoid unless you know it's never null
+const v = maybe_value.?;  // may panic
+```
+
+#### Use `switch` with `else` for integers, never `unreachable`
+
+```zig
+switch (x) {
+    0 => handleZero(),
+    1 => handleOne(),
+    else => handleOther(x), // always include else for safety
+}
+```
+
+`unreachable` in a `switch` case is a promise to the compiler that the value never occurs; if it does, the program exhibits undefined behavior.
+
+#### Label blocks to avoid deep nesting
+
+Instead of:
+
+```zig
+if (cond1) {
+    if (cond2) {
+        if (cond3) {
+            return compute();
+        }
+    }
+}
+return error.Missing;
+```
+
+Write:
+
+```zig
+const result = blk: {
+    if (!cond1) break :blk error.Missing;
+    if (!cond2) break :blk error.Missing;
+    if (!cond3) break :blk error.Missing;
+    break :blk compute();
+};
+return result;
+```
+
+This flattens the logic and makes error paths explicit.
+
+#### Use `while` with continue expression for iterators
+
+```zig
+var i: usize = 0;
+while (i < n) : (i += 1) {
+    // Use i
+}
+```
+
+This matches the behaviour of C’s `for` but avoids the separate variable scope confusion.
+
+#### For parallel iteration, `for` over multiple slices is clearer than `while`
+
+```zig
+for (slice1, slice2) |a, b| {
+    // a and b have the same length checked at runtime
+}
+```
+
+The compiler inserts a runtime check that both slices have equal length – a good safety net.
+
+#### Use `inline for` for compile‑time known sequences
+
+```zig
+const fields = std.meta.fields(MyStruct);
+inline for (fields) |field| {
+    // Generate code for each field
+}
+```
+
+But avoid `inline` loops over large comptime sequences – compile time can explode.
+
+---
+
+### 8. Examples
+
+#### Example 1: Command-line argument parser with control flow
+
+This program demonstrates `if` capture, `while` loop with optional, `switch`, and labeled block.
+
+```zig
+const std = @import("std");
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+
+    if (args.len < 2) {
+        std.debug.print("Usage: {s} [--verbose] [--output <file>] <input>\n", .{args[0]});
+        return error.InvalidArguments;
+    }
+
+    var verbose = false;
+    var output_file: ?[]const u8 = null;
+    var input_file: ?[]const u8 = null;
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--verbose")) {
+            verbose = true;
+        } else if (std.mem.eql(u8, arg, "--output")) {
+            i += 1;
+            if (i >= args.len) return error.MissingOutputPath;
+            output_file = args[i];
+        } else {
+            // assume it's the input file
+            if (input_file != null) return error.TooManyInputs;
+            input_file = arg;
+        }
+    }
+    const input = input_file orelse return error.MissingInput;
+
+    const result = process: {
+        if (verbose) std.debug.print("Processing {s}...\n", .{input});
+        if (output_file) |out| {
+            std.debug.print("Output to {s}\n", .{out});
+        }
+        break :process true;
+    };
+    _ = result;
+}
+```
+
+#### Example 2: State machine using `switch` on a tagged union
+
+```zig
+const std = @import("std");
+
+const State = union(enum) {
+    idle,
+    reading: u32,      // bytes read so far
+    done: []const u8,  // result
+    error: anyerror,
+};
+
+pub fn run(allocator: std.mem.Allocator) void {
+    var state = State.idle;
+    var result_buf: [100]u8 = undefined;
+
+    // Simulate a sequence of events
+    const events = [_]State{
+        .idle,
+        .{ .reading = 0 },
+        .{ .reading = 42 },
+        .{ .done = "success" },
+    };
+
+    for (events) |event| {
+        state = switch (state) {
+            .idle => switch (event) {
+                .reading => event,
+                else => .{ .error = error.InvalidTransition },
+            },
+            .reading => |bytes| switch (event) {
+                .reading => |new_bytes| .{ .reading = bytes + new_bytes },
+                .done => |result| blk: {
+                    const final_result = try std.fmt.bufPrint(&result_buf, "Read {} bytes: {s}", .{ bytes, result });
+                    break :blk .{ .done = final_result };
+                },
+                else => .{ .error = error.InvalidTransition },
+            },
+            .done => |result| {
+                std.debug.print("Final result: {s}\n", .{result});
+                return;
+            },
+            .error => |err| {
+                std.debug.print("Error: {}\n", .{err});
+                return;
+            },
+        };
+    }
+}
+
+pub fn main() void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    run(gpa.allocator());
+}
+```
+
+#### Example 3: Comptime‑eliminated debugging
+
+```zig
+const std = @import("std");
+
+const LogLevel = enum { debug, info, warn, err };
+const current_log_level = LogLevel.info;  // change this at compile time
+
+pub fn log(comptime level: LogLevel, comptime fmt: []const u8, args: anytype) void {
+    if (@intFromEnum(level) >= @intFromEnum(current_log_level)) {
+        std.debug.print(fmt, args);
+    }
+}
+
+pub fn main() void {
+    // These calls become no-ops when current_log_level is higher than debug
+    log(.debug, "debug: x = {d}\n", .{42});
+    log(.info, "info: program started\n", .{});
+    // The condition is evaluated at compile time, so no runtime branch exists.
+}
+```
+
+Compile with `zig build-exe` and inspect the generated machine code – you’ll see the `log(.debug, ...)` call is entirely absent when `current_log_level` is `.info` or higher.
+
+---
+
+### 9. Summary & Exercises
+
+**Summary**
+
+- Zig’s control flow is explicit: conditions must be `bool`, `switch` has no fall‑through and is exhaustive.
+- `if` and `while` capture optionals and error unions directly, eliminating separate `isSome()` checks.
+- `for` iterates over arrays, slices, and ranges; parallel iteration over multiple sequences is built‑in.
+- Labeled blocks (`blk: { … }`) and labeled `break`/`continue` provide structured `goto`‑like control.
+- Continue expressions in `while` keep loop advancement attached to the header.
+- Comptime‑known conditions eliminate dead code at compile time, removing runtime branches.
+- `inline while` and `inline for` force loop unrolling for performance when needed.
+- Performance considerations: branch prediction on error unions, `switch` jump tables, bounds checking elimination.
+
+**Exercises**
+
+1. **Implement a simple tokenizer**
+   Write a function `tokenize(allocator: std.mem.Allocator, input: []const u8) ![]Token` where `Token` is a tagged union of `identifier`, `number`, `operator`, and `eof`. Use a `while` loop over the input bytes, a `switch` on the current character, and labeled blocks to break out of nested loops (e.g., reading a multi‑digit number). Ensure the function handles errors gracefully (invalid characters). Test it with a sample input.
+
+2. **Optimize a hot loop using `inline while`**
+   Given a fixed‑size array of 8 `f32` values, write a function that computes the sum of squares. Implement it twice: once with a normal `for` loop, once with an `inline while` (or `inline for`). Compile both in `ReleaseFast` and compare the assembly output (`zig build-obj` then `objdump -d`). Observe how the unrolled version eliminates loop overhead and may enable SIMD. Write a benchmark using `std.time.Timer`.
+
+3. **Build a finite state machine for a network protocol**
+   Implement a simplified version of the TCP connection state machine (LISTEN, SYN‑SENT, SYN‑RECEIVED, ESTABLISHED, etc.) using `switch` on a tagged union `State`. Each state transition should be triggered by events (e.g., `.send_syn`, `.receive_syn_ack`). Use a labeled block to encapsulate the main event loop. Ensure exhaustive handling – the compiler should complain if you miss a state‑event pair. Simulate a sequence of events and print the state after each.
+
+These exercises will reinforce explicit control flow, exhaustive `switch`, and the practical use of labeled blocks for state machines.

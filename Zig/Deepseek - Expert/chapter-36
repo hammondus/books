@@ -1,0 +1,406 @@
+# Chapter 36: Common Anti-Patterns
+
+Seasoned engineers coming to Zig often bring battle-tested idioms from C++, Rust, Go, or Java. Some of those idioms are excellent; others are actively hostile to the “Zig Way.” This chapter identifies the most persistent anti-patterns, explains why they damage correctness, performance, or clarity in Zig, and demonstrates the idiomatic alternative. The patterns we will dissect are:
+
+- **Implementing OOP with vtables** (the “C++-style Zig”)
+- **Over-abstracting with interfaces** instead of using tagged unions or comptime
+- **`catch unreachable` as a crutch** for error handling
+- **Premature `packed`-ification** of structs
+
+Each section explores the mechanism, the philosophy, and the practical consequences so that you can recognise—and avoid—these traps in your own code.
+
+---
+
+## 1. Basic Usage
+
+This section is not about teaching syntax; it is about recognising the anti-pattern in the wild. Below are minimal, compilable snippets that illustrate the “wrong” approach next to the “right” one for each of the four topics.
+
+### 1.1 OOP with vtables
+
+**Anti-pattern** – a struct that carries a vtable pointer, emulating C++ dynamic dispatch:
+
+```zig
+const std = @import("std");
+
+const Animal = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    const VTable = struct {
+        speak: *const fn (ptr: *anyopaque) []const u8,
+    };
+
+    pub fn speak(self: Animal) []const u8 {
+        return self.vtable.speak(self.ptr);
+    }
+};
+
+const Dog = struct {
+    name: []const u8,
+    fn speak(ptr: *anyopaque) []const u8 {
+        const self = @as(*Dog, @ptrCast(@alignCast(ptr)));
+        return self.name;
+    }
+};
+
+pub fn main() !void {
+    const fido = Dog{ .name = "Fido" };
+    const animal = Animal{
+        .ptr = @constCast(&fido),
+        .vtable = &.{ .speak = Dog.speak },
+    };
+    std.debug.print("{s}\n", .{animal.speak()});
+}
+```
+
+**Idiomatic** – a tagged union with an exhaustive `switch`:
+
+```zig
+const std = @import("std");
+
+const Animal = union(enum) {
+    dog: Dog,
+    cat: Cat,
+
+    const Dog = struct { name: []const u8 };
+    const Cat = struct { name: []const u8 };
+
+    pub fn speak(self: Animal) []const u8 {
+        return switch (self) {
+            .dog => |d| d.name,
+            .cat => |c| c.name,
+        };
+    }
+};
+
+pub fn main() !void {
+    const animal: Animal = .{ .dog = .{ .name = "Fido" } };
+    std.debug.print("{s}\n", .{animal.speak()});
+}
+```
+
+### 1.2 Over‑abstracting with interfaces
+
+**Anti-pattern** – a generic “Writer” interface struct that bundles a function pointer with a context pointer:
+
+```zig
+const Writer = struct {
+    ptr: *anyopaque,
+    writeFn: *const fn (ptr: *anyopaque, bytes: []const u8) anyerror!void,
+
+    pub fn write(self: Writer, bytes: []const u8) !void {
+        return self.writeFn(self.ptr, bytes);
+    }
+};
+```
+
+**Idiomatic** – pass the concrete writer or use a `std.io.Writer` from the standard library, which is just a namespace for functions that accept a specific error-union-aware context type. Even simpler: accept a file or an array list directly, letting comptime specialization eliminate the abstraction.
+
+```zig
+fn writeHello(writer: anytype) !void {
+    try writer.writeAll("Hello");
+}
+```
+
+### 1.3 `catch unreachable` as a crutch
+
+**Anti-pattern** – silencing an error that is very much reachable, because “it works on my machine”:
+
+```zig
+const value = std.fmt.parseInt(u32, "999999999999", 10) catch unreachable;
+```
+
+**Idiomatic** – handle the error or propagate it:
+
+```zig
+const value = try std.fmt.parseInt(u32, "999999999999", 10);
+// or
+if (std.fmt.parseInt(u32, "999999999999", 10)) |v| {
+    // use v
+} else |err| {
+    std.log.err("parse failed: {}", .{err});
+    return err;
+}
+```
+
+### 1.4 Premature `packed`-ification
+
+**Anti-pattern** – applying `packed` to every struct in hopes of saving memory:
+
+```zig
+const Point = packed struct {
+    x: u32,
+    y: u32,
+};
+```
+
+**Idiomatic** – default, natural‑alignment struct unless you have a wire‑protocol or register‑layout requirement:
+
+```zig
+const Point = struct {
+    x: u32,
+    y: u32,
+};
+```
+
+---
+
+## 2. Under the Hood
+
+What actually happens when you commit these anti-patterns?
+
+**OOP vtables.** Zig’s compiler does not recognise vtables as a first‑class concept. A struct holding a `*anyopaque` context and a function pointer table is just a pair of pointers. Every method call involves an indirect call through a function pointer. The compiler cannot inline those calls, cannot propagate constants, and cannot perform comptime‑driven optimization because the target is unknown until runtime. Moreover, the `@ptrCast` and `@alignCast` required to recover the concrete type from `*anyopaque` bypass Zig’s type system and are a rich source of misalignment and undefined behavior.
+
+**Interface abstraction.** The “interface” pattern (function pointer + `*anyopaque`) is essentially the same as the vtable anti-pattern but on a per‑function basis. It suffers from the same optimisation barriers. Worse, it often introduces hidden allocations: the interface implementor must place state somewhere, and the caller has no idea whether that state is on the stack or heap, or what lifetime it has.
+
+**`catch unreachable`.** The `unreachable` built‑in tells the compiler “this code path will never be executed.” In safe build modes (`ReleaseSafe`, `Debug`) Zig inserts an `@panic` if unreachable is reached. In `ReleaseFast` and `ReleaseSmall` the compiler is allowed to assume the condition truly never happens and may delete surrounding safety checks entirely. If you use `catch unreachable` on an error that *can* occur, the program enters undefined behaviour territory – the same kind of chaos that Zig was designed to eliminate.
+
+**Premature `packed`.** A `packed struct` tells the compiler to lay out fields with no padding, even if that results in misaligned fields. Accessing a misaligned field might require the compiler to emit a sequence of byte loads and shifts rather than a single aligned load instruction. On some architectures misaligned access is a hardware fault. The compiler also cannot assume natural alignment for SIMD or atomic operations. The result is slower code and a hidden trap for portability.
+
+---
+
+## 3. Why This Design?
+
+Each anti-pattern violates one or more of Zig’s core pillars.
+
+**No Hidden Control Flow.** An OOP vtable call looks like a simple method invocation, but behind the scenes it dereferences a function pointer, potentially through multiple levels of indirection. Zig’s design treats every function call as a direct, visible transfer unless you explicitly write an indirect call through a `*const fn`. The vtable hides that indirection, breaking the principle.
+
+**Explicit is Better Than Implicit.** The interface pattern wraps a context pointer and a function pointer in a struct, concealing the fact that every call goes through a manual dispatch. Zig’s standard library provides `std.io.Writer`, but it works by accepting a context type that provides a `write` function—the dispatch is resolved at comptime, not at runtime, and the cost is visible in the type signature. Error handling with `catch unreachable` is the opposite of explicit: it announces “I refuse to handle this error,” pushing the program toward undefined behavior instead of forcing the programmer to confront the failure case.
+
+**Comptime Over Runtime Magic.** Both OOP vtables and interface abstractions rely on runtime dispatch. Zig’s comptime metaprogramming lets you write generic algorithms that specialise to concrete types, eliminating the need for runtime polymorphism in the vast majority of cases. A tagged union with `switch` resolves the variant at runtime, but the code paths are static and fully inlinable, unlike a virtual method table. Premature `packed`-ification goes against the *correctness first* spirit: memory layout should be left to the compiler unless you have a precise, documented reason to override it.
+
+---
+
+## 4. Competing Approaches
+
+**C++** encourages vtables as the primary mechanism for runtime polymorphism. A Zig programmer coming from C++ might reach for the pattern by instinct. In C++, the compiler manages the vtable pointer and guarantees its correct placement in the object; Zig gives you no such machinery, so you must build it manually and hope you get it right. Rust’s `dyn Trait` is a vtable under the hood, but it is integrated into the language with borrow‑checker guarantees. Zig deliberately stays at a lower level: if you need dynamic dispatch, you write the function pointer yourself, making the cost explicit.
+
+**Go** uses interface values that bundle a type pointer and a vtable pointer—exactly the pattern we are calling an anti‑pattern in Zig. Go relies on garbage collection to manage the lifetime of the enclosed value, whereas Zig would force you to manage that memory manually, adding complexity. Zig’s stance is that if you are already managing memory explicitly, you should also own the dispatch mechanism explicitly, and tagged unions almost always suffice.
+
+**Rust** handles error propagation with the `?` operator, which early‑returns the error. Zig’s `try` does the same. Rust’s `unwrap()` panics on `None`/`Err`, and while panics are not undefined behaviour, they can still abort the process. Zig’s `catch unreachable` is far more dangerous because in release modes it is true undefined behaviour, not a safe panic. Zig expects you to either propagate the error with `try` or handle it explicitly, because errors are values, not exceptions.
+
+**C** developers routinely pack structs to match hardware registers or protocol headers, but they also often “pack everything” out of a mistaken belief that it saves memory. Zig carries forward C’s `packed` semantics but makes the default struct layout natural‑align, forcing you to opt in to the performance pitfalls deliberately.
+
+---
+
+## 5. Common Mistakes
+
+**Vtable life‑cycle woes.** The anti‑pattern example above stores a pointer to a local variable on the stack. If the `Animal` outlives that local, the program accesses dangling memory. Mitigating this requires an allocator and careful lifetime management—exactly the hidden complexity Zig aims to avoid. New Zig programmers often forget that the vtable itself is a global constant but the object pointer must remain valid.
+
+**Misusing `@ptrCast` and `@alignCast`.** To recover the concrete type from `*anyopaque` you must cast the pointer. If the original object is not properly aligned for the target type, `@alignCast` triggers undefined behavior in safety‑checked builds, but silently corrupts data in release modes. This is a frequent source of “it works in Debug but crashes in ReleaseFast” bugs.
+
+**Over‑abstracting before profiling.** A developer might create a generic “Database” interface with a function pointer for `query`, thinking they will later swap SQLite for Postgres. In Zig, that swap is almost always better achieved by passing a concrete type via comptime generics or by using a simple tagged union for a fixed set of backends. Building the interface first adds indirection, complicates error handling, and often leads to premature allocation of context state.
+
+**`catch unreachable` on allocation failure.** A classic blunder: `const buf = try allocator.alloc(u8, n) catch unreachable`. The programmer assumes “if allocation fails, the program is dead anyway.” Zig’s `GeneralPurposeAllocator` can report out‑of‑memory, but the operating system may overcommit, so the failure may not be immediate. Catching `unreachable` discards the error and, in release mode, removes the null‑pointer check that would have turned the failure into a panic—leading to silent memory corruption.
+
+**Packed structs for “frequent access” data.** A developer might pack a struct that holds a time series point, thinking the cache will be happier. The resulting misaligned access pattern often causes the CPU to perform multiple memory operations per field, negating any space savings. Worse, it may prevent the compiler from emitting SIMD instructions that expect aligned data.
+
+---
+
+## 6. Performance Considerations
+
+**Vtable indirection cost.** A virtual call goes through at least one pointer indirection, preventing the CPU’s branch predictor from learning a static target. The called function cannot be inlined, so the caller misses the opportunity to eliminate the call overhead entirely. If the set of possible implementations is known at compile time, a comptime dispatch or a `switch` on a tagged union can be transformed into a direct call or even inlined. Benchmarks of a simple shape‑area computation show a 3–5× speedup when moving from a vtable to a tagged union switch, purely from inlining and constant propagation.
+
+**Interface abstraction overhead.** Beyond the indirect call, the interface pattern often encourages heap allocation of the concrete implementation so that the context pointer remains stable. This scatters data across the heap, hurting cache locality. A comptime‑generic function that takes a concrete writer, on the other hand, can monomorphise the entire call tree, keeping all data on the stack or in a single contiguous buffer.
+
+**`catch unreachable` in ReleaseFast.** When the compiler proves that an error path is unreachable, it may remove the error branch entirely. This can eliminate bounds checks, null checks, and overflow checks that would have caught the error. The “performance gain” is real but comes at the cost of safety; in a well‑designed Zig program you should achieve that performance by writing code that cannot fail, not by pretending failures cannot happen.
+
+**Packed struct field access.** Accessing a misaligned `u64` inside a packed struct may compile to four `mov` instructions plus shifts on x86‑64 instead of a single `mov`. On ARMv6 and earlier, it may cause a `SIGBUS`. On modern ARMs with strict alignment checking enabled, the cost is a trap handler invocation, which is catastrophically slow. Always measure before opting into `packed`.
+
+---
+
+## 7. Best Practices
+
+**Prefer tagged unions over vtables.** When you have a closed set of variants, a `union(enum)` with an exhaustive `switch` is the Zig way. It gives the compiler full visibility into all possible code paths, enabling inlining and dead‑code elimination. If the set of variants is truly open (e.g., a plugin system), then a function pointer is acceptable, but make it a simple `*const fn` rather than an entire virtual table, and document the lifetime requirements clearly.
+
+**Use comptime generics instead of interface structs.** Write functions that accept `anytype` and rely on compile‑time duck typing. Zig’s standard library is filled with such functions. For example, `std.fs.File.writeAll` accepts any `std.io.Writer`‑like type, but the concrete type is known at comptime, so there is no runtime dispatch. If you must build a dynamic dispatch, consider whether a tagged union would suffice first.
+
+**Handle every error consciously.** Before typing `catch unreachable`, ask: “Is this really impossible?” If you are certain (e.g., `std.math.divExact` where the divisor is known to be non‑zero), use `catch unreachable` but leave a comment explaining why it is safe. For all other cases, propagate the error with `try` or handle it with `if`. Use `errdefer` to clean up resources on the error path, and let the error bubble up to a place where a decision can be made.
+
+**Default struct layout is *not* packed.** Use a plain `struct` unless you are:
+- Matching the exact bit layout of an on‑wire protocol (e.g., a TCP header)
+- Interfacing with hardware registers that require bit‑exact positioning
+- Creating a `packed struct` that will only be accessed via byte arrays or volatile pointers
+
+When you do use `packed`, add a comment explaining why and, if possible, write a test that verifies the layout with `@bitSizeOf` and `@offsetOf`.
+
+**Avoid `*anyopaque` for generic context.** If a function absolutely needs an opaque pointer, consider whether the caller can pass an `anytype` instead. The standard library uses `*anyopaque` sparingly, mostly in C interop or when building truly generic callback interfaces. Before reaching for it, explore whether the pattern can be solved by passing a concrete type through a comptime argument or using an enum to tag a union.
+
+---
+
+## 8. Examples
+
+Here is a complete, buildable example that demonstrates all four anti‑patterns and their corrections side‑by‑side. You can compile it with `zig build-exe`.
+
+```zig
+const std = @import("std");
+
+// ─────────────────────────────────────────────────
+// Anti-pattern 1: OOP with vtables
+// ─────────────────────────────────────────────────
+const ShapeVtable = struct {
+    area: *const fn (ptr: *anyopaque) f64,
+};
+
+const VtableShape = struct {
+    ptr: *anyopaque,
+    vtable: *const ShapeVtable,
+    pub fn area(self: VtableShape) f64 {
+        return self.vtable.area(self.ptr);
+    }
+};
+
+const VCircle = struct {
+    radius: f64,
+    fn area(ptr: *anyopaque) f64 {
+        const self = @as(*VCircle, @ptrCast(@alignCast(ptr)));
+        return std.math.pi * self.radius * self.radius;
+    }
+};
+
+// ─────────────────────────────────────────────────
+// Idiomatic: Tagged union
+// ─────────────────────────────────────────────────
+const Shape = union(enum) {
+    circle: Circle,
+    rectangle: Rectangle,
+
+    pub const Circle = struct { radius: f64 };
+    pub const Rectangle = struct { width: f64, height: f64 };
+
+    pub fn area(self: Shape) f64 {
+        return switch (self) {
+            .circle => |c| std.math.pi * c.radius * c.radius,
+            .rectangle => |r| r.width * r.height,
+        };
+    }
+};
+
+// ─────────────────────────────────────────────────
+// Anti-pattern 2: Over‑abstracted interface
+// ─────────────────────────────────────────────────
+const Output = struct {
+    ptr: *anyopaque,
+    writeFn: *const fn (ptr: *anyopaque, bytes: []const u8) anyerror!void,
+
+    pub fn write(self: Output, bytes: []const u8) !void {
+        return self.writeFn(self.ptr, bytes);
+    }
+};
+
+// ─────────────────────────────────────────────────
+// Idiomatic: Accept anytype writer
+// ─────────────────────────────────────────────────
+fn printArea(writer: anytype, shape: Shape) !void {
+    try writer.print("area = {d}\n", .{shape.area()});
+}
+
+// ─────────────────────────────────────────────────
+// Anti-pattern 3: catch unreachable on a real error
+// ─────────────────────────────────────────────────
+fn parseIntCrutch(s: []const u8) u32 {
+    return std.fmt.parseInt(u32, s, 10) catch unreachable;
+}
+
+// ─────────────────────────────────────────────────
+// Idiomatic: explicit handling
+fn parseIntSafe(s: []const u8) !u32 {
+    return try std.fmt.parseInt(u32, s, 10);
+}
+
+// ─────────────────────────────────────────────────
+// Anti-pattern 4: Premature packed
+// ─────────────────────────────────────────────────
+const PackedPoint = packed struct {
+    x: u32,
+    y: u32,
+};
+
+// ─────────────────────────────────────────────────
+// Idiomatic: natural alignment
+const Point = struct {
+    x: u32,
+    y: u32,
+};
+
+pub fn main() !void {
+    const stdout = std.io.getStdOut().writer();
+
+    // Vtable usage (anti-pattern)
+    const vcircle = VCircle{ .radius = 3.0 };
+    var vshape = VtableShape{
+        .ptr = @constCast(&vcircle),
+        .vtable = &.{ .area = VCircle.area },
+    };
+    try stdout.print("vtable area = {d}\n", .{vshape.area()});
+
+    // Tagged union (idiomatic)
+    const shape = Shape{ .circle = .{ .radius = 3.0 } };
+    try printArea(stdout, shape);
+
+    // catch unreachable (anti-pattern)
+    const bad = parseIntCrutch("42");
+    try stdout.print("bad: {d}\n", .{bad});
+
+    // Proper error handling (idiomatic)
+    const good = parseIntSafe("42") catch |err| {
+        std.log.err("parse failed: {}", .{err});
+        return err;
+    };
+    try stdout.print("good: {d}\n", .{good});
+
+    // Packed vs natural
+    const pp = PackedPoint{ .x = 1, .y = 2 };
+    const p = Point{ .x = 1, .y = 2 };
+    _ = pp; _ = p;
+}
+```
+
+The idiomatic sections of this example can be compiled and run without any allocations or hidden control flow. Notice that the tagged‑union version of `area` is trivially inlinable, while the vtable version forces an indirect call. The `printArea` function accepts any writer type, demonstrating how comptime genericity replaces interface abstractions. The integer parsing calls show that the error is either propagated or handled, never silently discarded.
+
+---
+
+## 9. Summary & Exercises
+
+**Summary**
+
+- **OOP with vtables** is foreign to Zig. Replace it with tagged unions and exhaustive `switch` for a closed set of variants; if the set is open, use a simple function pointer and document lifetime.
+- **Interface over‑abstraction** hides indirection and often leads to unnecessary heap allocations. Zig’s comptime generics (`anytype`) resolve types at compile time, eliminating runtime overhead.
+- **`catch unreachable`** must be reserved for truly impossible error conditions, not as a shortcut to avoid proper error handling. In release builds it invites undefined behaviour.
+- **Premature `packed`‑ification** harms performance and portability. Keep structs naturally aligned unless you have a precise, documented need for exact bit layout.
+
+**Exercises**
+
+1. **Refactor the vtable hierarchy.**
+   Below is a C++‑flavoured Zig snippet that models a UI widget system with `draw` and `onClick` methods via a vtable. Rewrite it using a tagged union so that a single `draw` function handles all widget types. Ensure the new version compiles and produces the same output.
+
+   ```zig
+   const Widget = struct {
+       ptr: *anyopaque,
+       vtable: *const VTable,
+       const VTable = struct {
+           draw: *const fn (ptr: *anyopaque) void,
+       };
+       pub fn draw(self: Widget) void { self.vtable.draw(self.ptr); }
+   };
+   const Button = struct {
+       label: []const u8,
+       fn draw(ptr: *anyopaque) void {
+           const self = @as(*Button, @ptrCast(@alignCast(ptr)));
+           std.debug.print("Button: {s}\n", .{self.label});
+       }
+   };
+   const TextBox = struct {
+       text: []const u8,
+       fn draw(ptr: *anyopaque) void {
+           const self = @as(*TextBox, @ptrCast(@alignCast(ptr)));
+           std.debug.print("TextBox: {s}\n", .{self.text});
+       }
+   };
+   ```
+
+2. **Audit for `catch unreachable` abuse.**
+   Given a module that parses a configuration file, find every instance of `catch unreachable` and decide whether it should be replaced by proper error propagation, a fallback value, or a genuine assertion. Write the corrected version and explain why each change is safe. (Provide a snippet with several such usages; the student must transform it.)
+
+3. **Measure the impact of packed structs.**
+   Write a benchmark that creates an array of 1,000,000 `Point` structs (natural alignment) and an array of 1,000,000 `PackedPoint` structs. In a tight loop, compute the sum of all `x` and `y` fields. Use `std.time.Timer` to compare the access time. Report the difference and explain the underlying hardware reason. (Hint: you can use `zig build-exe` with `-O ReleaseFast` and run the binary.)

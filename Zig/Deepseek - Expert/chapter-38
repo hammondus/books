@@ -1,0 +1,606 @@
+# Chapter 38: Common System-Programming Recipes
+
+Systems programmers reach for a familiar toolbox: memory-mapped I/O, ring buffers, lock-free queues, custom allocators, argument parsers, and binary protocol decoders. Zig’s transparency, comptime, and no-hidden-control-flow philosophy make each of these recipes *direct*, *observable*, and *composable*. This chapter presents the recipes with the full Zig anatomy: the how, the why, the gotchas, and the performance story.
+
+---
+
+## 1. Basic Usage
+
+Each recipe is self-contained, compilable with `zig build-exe`, and uses the standard library as much as possible. We’ll move from OS-level facilities to higher-level construction.
+
+### Memory-Mapped Files
+
+Mapping a file into virtual memory is a single call—no wrapper library needed:
+
+```zig
+const std = @import("std");
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const file = try std.fs.cwd().openFile("data.bin", .{ .mode = .read_write });
+    defer file.close();
+
+    const stat = try file.stat();
+    const len = stat.size;
+
+    // Map entire file read-write, private (changes not written back unless explicit).
+    const map = try std.os.mmap(
+        null,
+        @as(usize, @intCast(len)),
+        std.os.PROT.READ | std.os.PROT.WRITE,
+        std.os.MAP.PRIVATE,
+        file.handle,
+        0,
+    );
+    defer std.os.munmap(map);
+
+    // Read/write like a slice.
+    var bytes = map[0..len];
+    bytes[0] = 0x42;
+    std.debug.print("First byte: {x}\n", .{bytes[0]});
+}
+```
+
+**Portability note:** On Windows you’d use `std.os.windows.VirtualAlloc` and friends; a cross-platform abstraction exists in `std.os.mmap` on POSIX. Production code often wraps this in a struct that also handles file resizing.
+
+### Ring Buffer (Single Producer/Consumer)
+
+A fixed-size circular buffer using plain indices and no atomic operations (single-threaded or externally synchronized):
+
+```zig
+const std = @import("std");
+
+pub fn RingBuffer(comptime T: type, comptime capacity: usize) type {
+    return struct {
+        buf: [capacity]T = undefined,
+        read_idx: usize = 0,
+        write_idx: usize = 0,
+        count: usize = 0,
+
+        const Self = @This();
+
+        pub fn push(self: *Self, item: T) ?T {
+            if (self.count == capacity) return item; // full, reject
+            self.buf[self.write_idx] = item;
+            self.write_idx = (self.write_idx + 1) % capacity;
+            self.count += 1;
+            return null; // success
+        }
+
+        pub fn pop(self: *Self) ?T {
+            if (self.count == 0) return null;
+            const item = self.buf[self.read_idx];
+            self.read_idx = (self.read_idx + 1) % capacity;
+            self.count -= 1;
+            return item;
+        }
+    };
+}
+```
+
+### Lock-Free SPSC Queue
+
+For true concurrent single-producer/single-consumer, we need atomic indices. Zig provides both `std.atomic.Value` and builtins like `@atomicLoad`/`@atomicStore`. We’ll use the builtins for maximum clarity.
+
+```zig
+const std = @import("std");
+const builtin = @import("builtin");
+
+pub fn SpscQueue(comptime T: type, comptime capacity: comptime_int) type {
+    // capacity must be a power of two to use bitwise modulo for performance.
+    if (!std.math.isPowerOfTwo(capacity)) @compileError("capacity must be power of two");
+
+    return struct {
+        const Mask = capacity - 1;
+        buf: [capacity]T = undefined,
+        // Align to cache line to avoid false sharing.
+        write_idx: usize align(std.atomic.cache_line) = 0,
+        read_idx: usize align(std.atomic.cache_line) = 0,
+
+        const Self = @This();
+
+        // Producer: returns true if enqueued, false if full.
+        pub fn push(self: *Self, item: T) bool {
+            const w = @atomicLoad(usize, &self.write_idx, .acquire);
+            const r = @atomicLoad(usize, &self.read_idx, .acquire);
+            if (w - r == capacity) return false;
+            self.buf[w & Mask] = item;
+            @atomicStore(usize, &self.write_idx, w + 1, .release);
+            return true;
+        }
+
+        // Consumer: returns null if empty.
+        pub fn pop(self: *Self) ?T {
+            const r = @atomicLoad(usize, &self.read_idx, .acquire);
+            const w = @atomicLoad(usize, &self.write_idx, .acquire);
+            if (r == w) return null;
+            const item = self.buf[r & Mask];
+            @atomicStore(usize, &self.read_idx, r + 1, .release);
+            return item;
+        }
+    };
+}
+```
+
+### Fast Arenas Beyond the Standard Library
+
+Zig’s `std.heap.ArenaAllocator` is excellent, but its reset only frees all memory at once. Sometimes you want a *bump allocator* that can also be “checkpointed” and reset to a previous state without losing later allocations—or an arena that never frees during its lifetime but can be reset entirely. We’ll build a simple bump pointer allocator backed by a fixed buffer, which is essentially a single-reset arena.
+
+```zig
+const std = @import("std");
+
+pub const BumpAllocator = struct {
+    buffer: []u8,
+    offset: usize = 0,
+
+    const Self = @This();
+
+    pub fn init(buf: []u8) Self {
+        return .{ .buffer = buf };
+    }
+
+    pub fn alloc(self: *Self, n: usize, log2_align: u8, ret_addr: usize) ?[*]u8 {
+        const align = @as(usize, 1) << @as(Allocator.Log2Align, @intCast(log2_align));
+        const addr = @intFromPtr(self.buffer.ptr) + self.offset;
+        const aligned = std.mem.alignForward(usize, addr, align);
+        const padding = aligned - addr;
+        const total = padding + n;
+        if (self.offset + total > self.buffer.len) return null;
+        const result = self.buffer.ptr + self.offset + padding;
+        self.offset += total;
+        return result;
+    }
+
+    pub fn reset(self: *Self) void {
+        self.offset = 0;
+    }
+
+    pub fn allocator(self: *Self) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = std.mem.Allocator.noResize,
+                .free = std.mem.Allocator.noFree,
+            },
+        };
+    }
+};
+```
+
+**Pool Allocator (Free List)**
+For fixed-size objects, a free list is trivial and fast.
+
+```zig
+pub const PoolAllocator = struct {
+    free_list: ?*FreeNode = null,
+    block_size: usize,
+
+    const FreeNode = struct {
+        next: ?*FreeNode,
+    };
+
+    pub fn init(comptime T: type) PoolAllocator {
+        return .{ .block_size = @sizeOf(T) };
+    }
+
+    pub fn alloc(self: *PoolAllocator, alloc_parent: std.mem.Allocator) !*anyopaque {
+        if (self.free_list) |node| {
+            self.free_list = node.next;
+            return @ptrCast(node);
+        }
+        // Allocate a new block from parent.
+        return @alignCast(@ptrCast(try alloc_parent.alloc(u8, self.block_size)));
+    }
+
+    pub fn free(self: *PoolAllocator, ptr: *anyopaque) void {
+        const node: *FreeNode = @ptrCast(@alignCast(ptr));
+        node.next = self.free_list;
+        self.free_list = node;
+    }
+};
+```
+
+### Command-Line Argument Parser
+
+Zig’s standard library provides `std.process.args()` and a basic parser, but building a custom, type-safe parser with comptime is a classic recipe.
+
+```zig
+const std = @import("std");
+
+const Options = struct {
+    input: []const u8 = "",
+    verbose: bool = false,
+    retries: u16 = 3,
+};
+
+pub fn parseArgs(comptime T: type, allocator: std.mem.Allocator) !T {
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+
+    var opts: T = .{};
+    var i: usize = 1; // skip exe name
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--input") and i + 1 < args.len) {
+            i += 1;
+            opts.input = args[i];
+        } else if (std.mem.eql(u8, arg, "--verbose")) {
+            opts.verbose = true;
+        } else if (std.mem.eql(u8, arg, "--retries") and i + 1 < args.len) {
+            i += 1;
+            opts.retries = try std.fmt.parseInt(u16, args[i], 10);
+        }
+    }
+    return opts;
+}
+```
+
+### Parsing Binary Network Protocols with `packed struct`
+
+A TCP header fits perfectly into a `packed struct`. We can overlay a byte slice directly.
+
+```zig
+const std = @import("std");
+
+const TcpHeader = packed struct(u160) { // 20 bytes = 160 bits
+    src_port: u16,
+    dst_port: u16,
+    seq_number: u32,
+    ack_number: u32,
+    data_offset: u4,   // in 32-bit words
+    reserved: u6 = 0,
+    flags: u8,
+    window: u16,
+    checksum: u16,
+    urgent_ptr: u16,
+};
+
+pub fn parseTcp(bytes: []const u8) !TcpHeader {
+    if (bytes.len < 20) return error.InvalidLength;
+    return @bitCast(bytes[0..20].*); // direct reinterpretation, endian-sensitive
+}
+```
+
+---
+
+## 2. Under the Hood
+
+Each recipe peels back a layer of abstraction to reveal the underlying mechanics.
+
+- **Memory-mapped files:** `std.os.mmap` eventually calls the OS’s `mmap` (or `MapViewOfFile` on Windows). The kernel sets up page-table entries that fault-in file pages on demand. The returned `[]u8` is direct virtual memory; no copies happen between kernel and user space after the initial mapping. The `MAP.PRIVATE` flag means writes are copy-on-write and not written back. For persistence, use `MAP.SHARED` with `msync`. Zig leaves the `msync`/`munmap` calls explicit because they have observable side-effects (I/O errors) that should not be hidden.
+
+- **Ring buffer:** The non-atomic version relies on simple arithmetic: the `count` variable tracks occupancy, preventing the classic ambiguity between full and empty. The modulo operation `% capacity` can be replaced with `& (capacity-1)` if capacity is a power of two, saving a division instruction. The lock-free SPSC queue uses *monotonic* indices that wrap only at the power-of-two boundary via `& Mask`. The atomic loads use **acquire** semantics to ensure the data written by the producer is visible to the consumer, and **release** semantics to ensure the consumer’s read of the index sees the up-to-date value. No locks are involved; the hardware memory model provides the necessary ordering.
+
+- **Bump allocator:** The allocation boils down to a single pointer increment and alignment adjustment. The `alloc` function is a comptime-known vtable entry that avoids indirect function calls when the allocator type is known at comptime (common in Zig). The `reset` just moves the offset back to zero, but any pointers handed out become dangling; Zig’s explicit, allocator-parameterized style makes this lifetime clear to the caller.
+
+- **Pool allocator:** The free list is an intrusive linked list embedded in the freed memory itself. The `alloc` function first checks the list; if empty, it falls back to a parent allocator. This avoids per-object allocation calls and fragmentation. The `free` operation is O(1) push onto a stack.
+
+- **Argument parser:** The parser here is simplistic, but a comptime-driven version could iterate over the fields of a struct using `@typeInfo`, generate matching logic, and produce help text—all at compile time. Zig’s comptime allows turning the struct definition into a grammar without a runtime DSL.
+
+- **Binary protocol parsing:** `@bitCast` (or `@as(*const TcpHeader, @ptrCast(&bytes[0])).*`) reinterprets bytes as the packed struct. Because the struct is `packed`, the compiler guarantees no padding and the exact bit layout specified. The CPU’s endianness is used; network protocols are big-endian, so on little-endian machines you’d need a `std.mem.nativeToBig` conversion, or use a helper that swaps bytes. The comptime metaprogramming can generate swizzled accessors if needed.
+
+---
+
+## 3. Why This Design?
+
+Zig’s design for each recipe flows from the “no hidden control flow” and “explicit is better than implicit” pillars.
+
+- **No hidden allocations:** `mmap` doesn’t allocate from the heap; it’s a kernel operation. The ring buffer, queue, and allocators all accept a caller-provided backing store or a parent allocator. The argument parser explicitly allocates arguments with `argsAlloc` and frees them with `argsFree`. No function silently calls `malloc` without you seeing it.
+
+- **Comptime over runtime magic:** The ring buffer and SPSC queue are generic types generated at comptime for a specific `T` and `capacity`. This eliminates vtable indirection and size checks. The pool allocator’s `init` takes a comptime type, tailoring the block size. The argument parser can be made generic over any options struct, generating parsing logic at compile time without macros or reflection overhead at runtime.
+
+- **Explicit error handling:** `mmap` returns an error union; failure to map is not a panic. The queue’s `push` and `pop` return booleans/optionals rather than throwing or blocking. The bump allocator returns `null` on exhaustion, letting the caller decide to fall back or fail. Errors are values, always visible in the function signature.
+
+- **Control over memory layout:** `packed struct` gives precise bit-level layout, essential for protocols. The `align(std.atomic.cache_line)` on SPSC indices prevents false sharing, a performance detail that is impossible to hide in a safe, zero-cost way without explicit control.
+
+Zig intentionally leaves out garbage collection, implicit constructors/destructors, and exceptions, ensuring that every system-level operation is a direct consequence of the code you write—no behind-the-scenes stack unwinding or finalization.
+
+---
+
+## 4. Competing Approaches
+
+### C
+
+- **mmap:** C’s `mmap` is identical in semantics; Zig adds error unions and slices, avoiding raw `void*` and manual length tracking.
+- **Ring buffer/queue:** C often uses hand-rolled volatile or atomic operations with `_Atomic` and `atomic_load`. Zig’s builtins provide clearer ordering semantics and avoid the pitfalls of C’s `volatile` (which does not guarantee atomicity or ordering).
+- **Allocators:** Arena allocators in C are often ad-hoc bump pointers, prone to alignment bugs. Zig’s `Allocator` interface ensures alignment is always considered.
+- **Argument parsing:** `getopt` is stringly-typed and error-prone. Zig’s comptime parser can give type-safe results.
+- **Binary protocols:** C relies on `#pragma pack` or `__attribute__((packed))`. Zig’s `packed struct` is part of the language, with defined layout and portable bit ordering.
+
+### Rust
+
+- Rust’s `memmap2` crate wraps `mmap` safely, but the safety guarantees can be too restrictive (e.g., requiring `unsafe` for mutable slices). Zig trusts the programmer with raw pointers but provides slices and bounds checking in safe modes.
+- Lock-free queues in Rust are often provided by `crossbeam`, which uses atomic types and memory orderings. Zig’s builtins are similar but integrated directly into the language, avoiding the need for external crates and ensuring that ordering semantics are always explicit.
+- Rust’s arena allocators like `typed_arena` rely on lifetimes to prevent use-after-free. Zig’s bump allocator relies on programmer discipline and explicit `reset`, but this simplicity often leads to less cognitive overhead when the arena’s lifetime matches a clear phase (e.g., per-request).
+- CLI parsing: `clap` is feature-rich but heavy. Zig’s approach encourages building exactly what you need; a 30-line comptime parser can replace a dependency.
+- Packed structs: Rust’s `#[repr(C, packed)]` is analogous; Zig’s `packed struct` is arguably cleaner because the compiler can optimize field access better and bitfields are explicit.
+
+### Go
+
+- Go’s `syscall.Mmap` returns a `[]byte` and an error, but Go’s garbage collector and escape analysis may move data, requiring careful pinning. Zig’s manual memory avoids this.
+- Go channels are high-level abstractions that hide synchronization and buffering; a lock-free SPSC in Zig is explicit, with no goroutine scheduler overhead.
+- Arena allocators in Go are third-party (`arena` was experimental and removed). Zig’s standard `ArenaAllocator` and user-defined bump allocators are idiomatic.
+- CLI: Go’s `flag` package is simple; Zig’s comptime parser can be equally simple without reflection, and errors are compile-time checked.
+
+### C++
+
+- `boost::iostreams::mapped_file` and `std::pmr::monotonic_buffer_resource` provide similar functionality but often involve inheritance, virtual calls, and exception-based error handling. Zig’s flat, vtable-optional design avoids hidden indirections.
+- C++’s atomics (`std::atomic`) have the same memory ordering concepts; Zig’s `@atomicLoad` and `@atomicStore` with `.acquire`/`.release` are a thin, direct mapping to LLVM’s atomic operations, without the complex `std::memory_order` enum class.
+- C++ templates can generate parsers like Zig’s comptime, but they do so with a Turing-complete metalanguage that is notoriously difficult to debug. Zig uses the same language for compile-time execution, making metaprograms straightforward.
+
+---
+
+## 5. Common Mistakes
+
+### Memory-Mapped Files
+
+- **Forgetting `munmap`:** Without `defer std.os.munmap(map)`, the mapping leaks virtual address space, eventually exhausting it on 32-bit systems. Zig’s `defer` guarantees cleanup, but it must be placed immediately after `mmap`.
+- **Assuming fixed file size:** If another process truncates the file, the mapped memory may cause a `SIGBUS`. Always check file size if modifications are possible, or use `MAP.SHARED` with `fallocate`.
+- **Alignment:** `mmap` returns page-aligned memory; casting to a slice of a type with higher alignment may be UB. Always verify or use `@alignCast`.
+
+### Ring Buffers
+
+- **Off-by-one in full/empty detection:** Using `write_idx == read_idx` to mean both full and empty is a classic bug. The `count` field avoids this, but if you omit it, you must waste one slot to disambiguate.
+- **Integer overflow:** With a power-of-two capacity and monotonic indices, indices can wrap correctly even when they overflow `usize` (since `a & Mask` works). But if capacity is not a power of two, the modulo operation on overflowing indices leads to bugs. Always enforce power-of-two in comptime.
+
+### Lock-Free SPSC Queue
+
+- **Memory ordering too weak:** Using `.monotonic` (relaxed) for loads can cause the consumer to see the updated index but stale data. Always pair an `acquire` load of the write index with the data store, and `release` store of the write index after writing data.
+- **False sharing:** If `write_idx` and `read_idx` share a cache line, the producer and consumer will bounce the cache line despite never accessing each other’s index. The `align(std.atomic.cache_line)` is critical; forgetting it can reduce throughput by an order of magnitude.
+- **Assuming lock-free means wait-free:** This SPSC queue is lock-free but not wait-free; a slow producer can block the consumer from seeing new items. Designing around this requires understanding the application’s concurrency model.
+
+### Bump Arenas
+
+- **Using memory after `reset`:** The bump allocator has no mechanism to prevent dangling pointers. Callers must not retain references to arena-allocated data after a reset. This is a contractual obligation, similar to stack memory after a function returns.
+- **Alignment bugs:** Failing to align the offset can cause misaligned accesses, which on some architectures crash. The `alignForward` logic is correct but must be carefully tested.
+- **Overflow:** If `self.offset + total` overflows `usize`, the check fails; but in practice, buffer lengths are far below the address space limit. Still, production code should check for wraparound.
+
+### Pool Allocators
+
+- **Incorrect block size:** If `block_size` is smaller than `@sizeOf(T)`, memory corruption ensues. Using `@sizeOf(T)` at init time ensures correctness.
+- **Type confusion:** The free list stores `FreeNode`, but the allocator returns `*anyopaque`. The user must cast to the correct type. A safer design wraps the pool in a generic type that returns `*T`.
+
+### Argument Parsing
+
+- **Assuming UTF-8 validity:** OS arguments may not be valid UTF-8 on all platforms. Zig’s `argsAlloc` returns `[]const u8` that may be arbitrary bytes; use `std.unicode` utilities if you require valid text.
+- **Not handling `--`:** The parser should stop option processing after `--` to support positional arguments that start with dashes.
+- **Integer parsing errors:** `std.fmt.parseInt` returns an error; ignoring it leads to zero-initialized values that may cause silent misconfiguration.
+
+### Binary Protocol Parsing
+
+- **Endianness:** Network protocols are big-endian; most CPUs are little-endian. Direct `@bitCast` produces native-endian values, leading to swapped bytes. Always use `std.mem.bigToNative` or `@byteSwap` where necessary.
+- **Bit-field ordering:** The order of bits in a packed struct is well-defined (least-significant to most-significant within a field, fields packed from least-significant bit upward), but this may differ from protocol documentation. Always verify with known test vectors.
+- **Unaligned access:** On some architectures, reading a multi-byte value from an unaligned address causes a fault. The byte slice of a packet may be unaligned; using `@bitCast` on a `*const [20]u8` that is not aligned to `u32` can be UB. Use `@as(*align(1) const TcpHeader, @ptrCast(&bytes[0])).*` or copy the header to a local variable.
+
+---
+
+## 6. Performance Considerations
+
+- **Memory-mapped files:** For sequential access, `mmap` can avoid double-buffering; pages are loaded directly into the buffer cache. Random access benefits from the page fault mechanism, but many small faults can be slower than a single `read` if access is sparse. Large mappings may cause TLB pressure; on 64-bit systems this is rarely an issue. `MAP.POPULATE` (Linux) can pre-fault pages. Benchmark to choose between `mmap` and explicit I/O.
+
+- **Ring buffer:** The non-atomic version costs a few integer operations. The modulo `%` can be replaced with bitwise AND if capacity is a compile-time-known power of two. The lock-free SPSC’s atomics typically add 20–50 cycles per operation on x86, but this is amortized over many items. False sharing can multiply that cost by 10×; cache-line alignment is non-negotiable.
+
+- **Bump allocator:** Allocation is just a few instructions: alignment, increment, bounds check. It’s the fastest general-purpose allocation strategy, often beating `malloc` by an order of magnitude. The trade-off is the inability to free individual objects; resetting the arena invalidates all pointers.
+
+- **Pool allocator:** `alloc` is O(1) if the free list is non-empty, or delegates to a parent allocator. Free list operations are pointer writes, which can cause cache misses if the list is long. For high-performance, keep the pool small and batch replenishment.
+
+- **Argument parser:** Parsing arguments at startup is not a hot path. However, comptime generation of the parser eliminates runtime branching and string comparisons, reducing binary size and startup time marginally.
+
+- **Binary protocol parsing:** `@bitCast` generates zero instructions; the compiler simply reinterprets the memory. If endianness conversion is needed, using `@byteSwap` on the whole struct or individual fields may compile to `bswap` instructions. `packed struct` access may generate bit-extraction sequences if fields are not byte-aligned, but modern LLVM optimizes these well.
+
+---
+
+## 7. Best Practices
+
+- **Wrap OS resources:** For `mmap`, create a `MappedFile` struct that holds the mapping and its length, and implements `deinit` to `munmap`. This enforces cleanup.
+- **Use `defer` and `errdefer`:** Always pair `mmap` with `defer munmap` in the same scope. For error cases, consider `errdefer` if you need to unmap on error but keep it on success.
+- **Align for concurrency:** In any shared-mutable state, use `align(std.atomic.cache_line)` and also pad structures to avoid false sharing. Zig’s `std.atomic.cache_line` is target-aware.
+- **Prefer `@atomicLoad`/`@atomicStore` with explicit ordering:** Avoid `@atomicRmw` unless necessary; the SPSC queue only needs simple stores.
+- **Arena lifetime clarity:** Document when an arena is reset, and never stash arena pointers beyond that point. Consider a scoped callback pattern: `arena.run(.{ ... })` that resets at the end.
+- **Comptime-generate parsers:** For argument parsing, use `@typeInfo` on your options struct to iterate fields and their types, generating `--field` flags automatically. Provide help text from doc comments using `@typeInfo`’s `decls`.
+- **Test with sanitizers:** Use `zig build test -fsanitize-thread` to detect data races in lock-free code, and `-fsanitize-undefined` for alignment issues in packed structs.
+
+---
+
+## 8. Examples
+
+Here are three complete, buildable examples that crystallize the recipes.
+
+**Example 1: Lock-free SPSC queue with producer/consumer threads**
+
+```zig
+const std = @import("std");
+
+pub fn SpscQueue(comptime T: type, comptime capacity: comptime_int) type {
+    if (!std.math.isPowerOfTwo(capacity)) @compileError("capacity must be power of two");
+    return struct {
+        const Mask = capacity - 1;
+        buf: [capacity]T = undefined,
+        write_idx: usize align(std.atomic.cache_line) = 0,
+        read_idx: usize align(std.atomic.cache_line) = 0,
+        const Self = @This();
+
+        pub fn push(self: *Self, item: T) bool {
+            const w = @atomicLoad(usize, &self.write_idx, .acquire);
+            const r = @atomicLoad(usize, &self.read_idx, .acquire);
+            if (w - r == capacity) return false;
+            self.buf[w & Mask] = item;
+            @atomicStore(usize, &self.write_idx, w + 1, .release);
+            return true;
+        }
+
+        pub fn pop(self: *Self) ?T {
+            const r = @atomicLoad(usize, &self.read_idx, .acquire);
+            const w = @atomicLoad(usize, &self.write_idx, .acquire);
+            if (r == w) return null;
+            const item = self.buf[r & Mask];
+            @atomicStore(usize, &self.read_idx, r + 1, .release);
+            return item;
+        }
+    };
+}
+
+pub fn main() !void {
+    var queue: SpscQueue(i32, 8) = .{};
+
+    const producer = try std.Thread.spawn(.{}, struct {
+        fn run(q: *@TypeOf(queue)) void {
+            var i: i32 = 0;
+            while (i < 100) {
+                while (!q.push(i)) {} // busy-wait
+                i += 1;
+            }
+        }
+    }.run, .{&queue});
+    const consumer = try std.Thread.spawn(.{}, struct {
+        fn run(q: *@TypeOf(queue)) void {
+            var received: i32 = 0;
+            while (received < 100) {
+                if (q.pop()) |val| {
+                    std.debug.print("{d}\n", .{val});
+                    received += 1;
+                }
+            }
+        }
+    }.run, .{&queue});
+
+    producer.join();
+    consumer.join();
+}
+```
+
+**Example 2: Comptime-powered argument parser**
+
+```zig
+const std = @import("std");
+
+const Options = struct {
+    input: []const u8 = "default.txt",
+    verbose: bool = false,
+    count: u32 = 1,
+};
+
+pub fn parse(comptime T: type, allocator: std.mem.Allocator) !T {
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+
+    var opts: T = .{};
+    const fields = @typeInfo(T).Struct.fields;
+    var i: usize = 1;
+    while (i < args.len) {
+        const arg = args[i];
+        if (std.mem.startsWith(u8, arg, "--")) {
+            const name = arg[2..];
+            var found = false;
+            inline for (fields) |fld| {
+                if (std.mem.eql(u8, name, fld.name)) {
+                    if (i + 1 >= args.len) return error.MissingValue;
+                    i += 1;
+                    const val = args[i];
+                    switch (@typeInfo(fld.type)) {
+                        .Bool => @field(opts, fld.name) = true,
+                        .Int => @field(opts, fld.name) = try std.fmt.parseInt(fld.type, val, 10),
+                        .Pointer => |ptr| if (ptr.size == .Slice and ptr.child == u8) {
+                            @field(opts, fld.name) = val;
+                        } else @compileError("unsupported type"),
+                        else => @compileError("unsupported type"),
+                    }
+                    found = true;
+                }
+            }
+            if (!found) return error.UnknownOption;
+        } else {
+            // positional argument handling could go here
+        }
+        i += 1;
+    }
+    return opts;
+}
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const opts = try parse(Options, gpa.allocator());
+    std.debug.print("input={s} verbose={} count={d}\n", .{ opts.input, opts.verbose, opts.count });
+}
+```
+
+**Example 3: Binary protocol parser with endianness correction**
+
+```zig
+const std = @import("std");
+
+const Ipv4Header = packed struct {
+    version_ihl: u8, // version (4 bits) + IHL (4 bits)
+    dscp_ecn: u8,
+    total_length: u16,
+    identification: u16,
+    flags_fragment: u16,
+    ttl: u8,
+    protocol: u8,
+    header_checksum: u16,
+    src_addr: u32,
+    dst_addr: u32,
+};
+
+pub fn parseIpv4(bytes: []const u8) !Ipv4Header {
+    if (bytes.len < 20) return error.InvalidLength;
+    // Copy to aligned stack variable to avoid alignment issues.
+    var aligned: [20]u8 align(4) = undefined;
+    @memcpy(&aligned, bytes[0..20]);
+    const native_hdr: Ipv4Header = @bitCast(aligned);
+    // Convert multi-byte fields to host byte order.
+    return Ipv4Header{
+        .version_ihl = native_hdr.version_ihl,
+        .dscp_ecn = native_hdr.dscp_ecn,
+        .total_length = std.mem.bigToNative(u16, native_hdr.total_length),
+        .identification = std.mem.bigToNative(u16, native_hdr.identification),
+        .flags_fragment = std.mem.bigToNative(u16, native_hdr.flags_fragment),
+        .ttl = native_hdr.ttl,
+        .protocol = native_hdr.protocol,
+        .header_checksum = std.mem.bigToNative(u16, native_hdr.header_checksum),
+        .src_addr = std.mem.bigToNative(u32, native_hdr.src_addr),
+        .dst_addr = std.mem.bigToNative(u32, native_hdr.dst_addr),
+    };
+}
+
+pub fn main() !void {
+    const packet = [_]u8{
+        0x45, 0x00, 0x00, 0x3c, 0x1c, 0x46, 0x40, 0x00,
+        0x40, 0x06, 0xb1, 0xe6, 0xc0, 0xa8, 0x00, 0x68,
+        0xc0, 0xa8, 0x00, 0x01,
+    };
+    const hdr = try parseIpv4(&packet);
+    std.debug.print("src={d}.{d}.{d}.{d} dst={d}.{d}.{d}.{d}\n", .{
+        (hdr.src_addr >> 24) & 0xff,
+        (hdr.src_addr >> 16) & 0xff,
+        (hdr.src_addr >> 8) & 0xff,
+        hdr.src_addr & 0xff,
+        (hdr.dst_addr >> 24) & 0xff,
+        (hdr.dst_addr >> 16) & 0xff,
+        (hdr.dst_addr >> 8) & 0xff,
+        hdr.dst_addr & 0xff,
+    });
+}
+```
+
+---
+
+## 9. Summary & Exercises
+
+**Summary:**
+Zig’s systems recipes are characterized by *directness*. Memory-mapped files become slices. Ring buffers are simple index arithmetic, elevated to lock-free queues with explicit atomics. Custom allocators become trivial bump pointers or free lists, integrated into the standard `Allocator` interface. Argument parsers and protocol decoders exploit comptime to turn type definitions into logic with zero runtime overhead and no external dependencies. The common thread is that Zig hides nothing: every allocation, every atomic ordering, every byte layout is under your control and visible in the source.
+
+**Exercises:**
+
+1. **Multi-producer/multi-consumer queue:** Extend the SPSC design to an MPMC queue using a lock-free linked list or array with compare-and-swap. Benchmark its throughput against a `std.Thread.Mutex`-protected version.
+
+2. **Slab allocator:** Implement an allocator that manages fixed-size slots but batches them into pages from a parent allocator. It should support both `alloc` and `free`, and cache freed slots per thread to reduce contention. Test with `std.heap.GeneralPurposeAllocator` as the backing store.
+
+3. **Advanced CLI parser:** Write a comptime function that takes a `struct` type and returns a parser that automatically generates `--help` text from field doc comments (using `@typeInfo`). Support subcommands via nested structs or tagged unions. Fuzz the parser with random input.
+
+4. **TCP header with options:** Extend the IPv4 parser to handle options that follow the fixed header. The IHL field indicates the header length in 32-bit words; dynamically parse the options as a slice of bytes and then interpret common options like MSS using further packed structs. Write fuzz tests with AFL or Zig’s `std.testing.fuzz`.

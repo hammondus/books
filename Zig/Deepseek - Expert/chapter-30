@@ -1,0 +1,348 @@
+## Chapter 30: Build System as Code
+
+Zig ships with a build system that feels like a natural extension of the language itself. Instead of a separate configuration language, you write a `build.zig` file—a regular Zig program that constructs a directed acyclic graph of *steps*. Every aspect of the build is expressed in code, with full access to the standard library and compile-time logic. The result is a declarative specification of what to build that remains completely programmable, enabling custom workflows without resorting to external shell scripts or ad‑hoc tools.
+
+This chapter dissects the build system from its most mundane usage to the creation of sophisticated, multi‑target pipelines. We assume you have already compiled a few simple projects; now we'll go deep.
+
+---
+
+### 1. Basic Usage
+
+Every project starts with a `build.zig` file whose public `build` function is the entry point. The build runner (`zig build`) compiles this file on the fly, calls `build`, and executes the resulting step graph.
+
+```zig
+const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    // 1. Declare standard options.
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    // 2. Create an executable artifact.
+    const exe = b.addExecutable(.{
+        .name = "myapp",
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // 3. Install the executable to the output directory.
+    b.installArtifact(exe);
+
+    // 4. Add a "run" step that builds and runs the program.
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_cmd.addArgs(args);
+    }
+    const run_step = b.step("run", "Run the app");
+    run_step.dependOn(&run_cmd.step);
+
+    // 5. Add a test step.
+    const tests = b.addTest(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&b.addRunArtifact(tests).step);
+}
+```
+
+Key points:
+
+- `b.standardTargetOptions` and `b.standardOptimizeOption` provide cross‑compilation and optimization mode selection via `-Dtarget=…` and `-Doptimize=…` command‑line overrides. This is the idiomatic way to let users control the build.
+- `b.addExecutable` returns a `*std.Build.Step.Compile`, which represents a compilation artifact. You can further configure it by adding include paths, linking libraries, or attaching other source files.
+- `b.installArtifact` tells the build system to copy the final executable into the standard installation prefix (`zig-out/bin` by default). Without this, nothing appears in the output tree.
+- Steps form a dependency graph. `run_step` depends on `run_cmd`, which itself depends on the compilation of the executable (implicitly through the artifact). Using `dependOn` ensures proper ordering; the build system topologically sorts the graph before execution.
+- `LazyPath` is the currency for files: `b.path("src/main.zig")` returns a `LazyPath` that the build system will resolve to an absolute path. This allows you to refer to source files without worrying about the current working directory. It also enables generated files to be treated transparently.
+
+A build command like `zig build run -Dtarget=aarch64-macos` will cross‑compile and run, with no special toolchain installation—Zig’s embedded multi‑target support handles everything.
+
+---
+
+### 2. Under the Hood
+
+When you invoke `zig build`, the Zig compiler:
+
+1. Compiles your `build.zig` file (with the host compiler) into a temporary binary.
+2. Runs that binary, passing a `*std.Build` handle. Your `build` function populates this handle with a graph of `Step` nodes.
+3. After `build` returns, the build runner evaluates the step that was requested on the command line (defaults to the "install" step, which is created automatically). It topologically sorts all dependencies and executes them concurrently where possible.
+
+#### Steps and the `make` Interface
+
+Every build action is a `*std.Build.Step`. The fundamental operations are:
+
+- `step.make(progress_node: *std.Progress.Node) anyerror!void` – performs the actual work (compilation, file copy, command execution, etc.). It is called at most once per step per invocation.
+- `step.dependOn(other_step: *Step) void` – declares that this step depends on the completion of `other_step`. The dependency graph is built before any `make` calls.
+
+The build system ships with many predefined step types:
+
+- `Step.Compile` – wraps `zig build-exe`, `zig build-lib`, etc. It handles tracking source files, build options, and output paths.
+- `Step.Run` – runs an arbitrary command (or a compiled artifact) and captures its output, exit code, and standard streams.
+- `Step.WriteFile` – writes a string or bytes to a file, useful for generating source code or configuration.
+- `Step.InstallArtifact`, `Step.InstallFile`, `Step.InstallDirectory` – copy files into the installation prefix.
+- `Step.Fmt` – runs `zig fmt` on specified paths.
+- `Step.TranslateC` – runs `zig translate-c`.
+
+Custom steps are created by embedding a `std.Build.Step` in your own struct and implementing a `make` method. We'll explore that in Section 8.
+
+#### `LazyPath` – A Promise for a Path
+
+A `LazyPath` abstracts the location of a file that may be a static source file or the output of a step. Internally it holds:
+
+- A `path: ?[]const u8` – a literal path if known.
+- A `generated: ?*Step` – a pointer to the step that creates the file, plus a sub‑path.
+
+When a `Step.Compile` asks for the root source file, it receives a `LazyPath`. The build system resolves it just before running the compilation command by calling `getPath2` (or its internal equivalent) on the `LazyPath`. This mechanism enables a uniform treatment of source and generated files.
+
+#### Concurrency Model
+
+Steps that are independent can run in parallel. The build runner uses a thread pool (by default the number of CPU cores) to execute `make` on multiple steps simultaneously. For safety, all shared mutable state is hidden behind the `*std.Build` and its arena allocator; individual steps should not share data without synchronization. In practice, because each step is self‑contained, the parallelism is transparent.
+
+#### The Build Cache
+
+Zig's build system currently does not maintain a persistent, fine‑grained cache of step outputs. Each `zig build` invocation re‑evaluates the graph and re‑executes steps whose inputs have changed (based on file system timestamps). This is a deliberate simplification that avoids the complexity and brittleness of many caching schemes. For most projects, re‑compilation is fast enough; for extreme cases, you can implement custom caching inside a step (e.g., by comparing hash sums of inputs).
+
+---
+
+### 3. Why This Design?
+
+The Zig build system is *a program that builds your program*. This design springs from a few convictions.
+
+**No hidden control flow.** A `build.zig` file is explicit: you create steps, wire their dependencies, and that's all. There are no implicit rules that magically compile a `.c` file into an object, no mysterious global state that changes semantics based on the platform. If you want something compiled, you must write `b.addCSourceFile`. The graph you build is exactly the graph that executes.
+
+**Full language power for build logic.** Need to parse a JSON file at build time to configure feature flags? Use `std.json`. Need to shell out to `git` to embed a commit hash? Use `std.process.Child`. None of this requires learning a new DSL or escaping to external scripts—you already know Zig. This dramatically lowers the barrier to sophisticated build customisation.
+
+**Cross‑compilation as a first‑class citizen.** A target (like `aarch64-linux-musl`) is a value you pass around, not a separate toolchain. The same `build.zig` produces binaries for a dozen platforms without any conditional branches, because the compiler itself is a cross‑compiler. The `standardTargetOptions` function exposes this uniformly.
+
+**Unification of build and test.** Adding a test step is a matter of `b.addTest(...)` and `b.addRunArtifact(...)`. The build system handles dependency tracking for test executables just like any other artifact. There is no separate test runner configuration.
+
+The alternative—the approach taken by CMake, Autotools, and even Cargo—is to separate the *description* of the build (config files, manifests) from the *execution* (shell, make). That separation invariably creates a rift between what you think will happen and what actually happens. In Zig, the build script is the executable; there is no rift.
+
+---
+
+### 4. Competing Approaches
+
+**CMake.** The dominant C/C++ build generator. It uses a custom scripting language (CMakeLists.txt) that generates Ninja, Makefiles, or IDE projects. Zig’s approach eliminates the generator layer: `zig build` compiles and executes your build logic directly. CMake’s language is notoriously idiosyncratic; Zig gives you a real, familiar language. However, CMake has mature caching and dependency scanning; Zig’s build system is simpler and currently lacks sophisticated incremental compilation caching at the step level.
+
+**Rust’s Cargo.** Cargo uses a `Cargo.toml` manifest for declarative configuration, plus an optional `build.rs` script that runs before compilation. `build.rs` can print cargo directives to influence the build, but it cannot directly manipulate the compilation graph. In Zig, the entire graph is malleable: you can add compilation units, pass options, and generate source files without an intermediate protocol. Cargo’s model is safer for beginners, but Zig’s model gives you unrestricted control.
+
+**Go’s `go build`.** Go’s tooling is convention‑driven: file location determines package membership, and there is no build script. This is elegant for standard projects but becomes painful when you need custom pre‑processing, CGo flags, or multi‑target outputs. Zig’s build system scales from the trivial (just a few lines) to the highly customized without a cliff.
+
+**Bazel.** Bazel offers hermetic, reproducible builds with a domain‑specific language (Starlark). It is much more complex to set up but provides remote caching and distributed execution. Zig’s build system does not aim to compete with Bazel’s scale; it is designed to be “good enough” for 99% of projects. For the remaining 1%, you can invoke `zig build` from a Bazel rule—the standardised CLI makes integration straightforward.
+
+**Meson.** Meson uses a Python‑like DSL and generates Ninja files. Its strength is speed and simplicity. Zig’s build system is comparable in spirit, but it is tightly integrated with the compiler (e.g., `addCSourceFile` can compile C files using Zig’s own clang‑based C compiler). You don’t need to install a separate tool; `zig build` is the only entry point.
+
+---
+
+### 5. Common Mistakes
+
+**Forgetting to install artifacts.** A compilation step (`addExecutable`, `addLibrary`) only creates the binary in the build cache. To place it into the output directory (`zig-out`), you must call `b.installArtifact`. Without this, `zig build` succeeds but leaves no trace of the binary.
+
+**Misunderstanding `LazyPath` vs. string.** Accessing the build cache directory directly (`b.cache_root`) and constructing paths by string concatenation bypasses the dependency tracking. If a file is supposed to be tracked as a dependency, always use a `LazyPath` (e.g., `b.path("data/config.json")`). A string is *not* a `LazyPath`, and passing a string where a `LazyPath` is expected will not be automatically tracked.
+
+**Circular dependencies.** The build system rejects cycles. A common scenario: you generate a source file with `Step.Run`, and the run step executes an artifact that itself depends on that source file. Break the cycle by separating the generator into a stand‑alone executable that does not depend on the generated code.
+
+**Not using `standardTargetOptions` and `standardOptimizeOption`.** Hard‑coding `.target = .{}` (native) and `.optimize = .Debug` prevents users from cross‑compiling or benchmarking. Always expose these options.
+
+**Assuming steps share an arena allocator.** `*std.Build` uses an arena that lives for the entire build invocation, but custom steps should still accept an allocator parameter and follow the standard memory discipline—you may want your step to be reusable in other contexts.
+
+**Race conditions with custom steps that modify shared files.** If two parallel steps write to the same output file, the build is non‑deterministic. Every output should be a unique `LazyPath`, typically one per step.
+
+**Placing expensive logic in `build.zig` outside steps.** The `build` function itself runs single‑threaded. If you generate a large lookup table inside `build`, it will block the start of the build. Instead, create a step that does the generation; it can run in parallel with other early steps.
+
+**Neglecting to add `--` before argument forwarding.** When using `zig build run -- some args`, the `--` separator is consumed by `zig build` to split its own arguments from user arguments. Your `run` step should forward `b.args` only if present; otherwise the double dash may appear as a user argument.
+
+---
+
+### 6. Performance Considerations
+
+**Compilation of `build.zig`.** For small projects, this is negligible. For huge projects, the `build.zig` script may do substantial comptime work (e.g., parsing a large configuration). You can mitigate this by moving heavy work into a custom step that runs as part of the graph, allowing parallel execution.
+
+**Step parallelism.** The default thread pool uses all logical CPUs. You can limit it with `zig build -jN`. The speed‑up is linear as long as steps are I/O or CPU bound and don’t contend for shared resources. Be aware that `Step.Compile` for C files spawns a separate `zig` subprocess for each translation unit; this can saturate memory on large codebases. Future versions may unify this under a single process.
+
+**Incremental builds.** The build system does not cache compiled object files between `zig build` invocations; that’s the compiler’s job. Zig’s compiler itself caches binaries based on their hash. The build system only re‑runs a `Step.Compile` if any of its inputs (source files, compiler flags) have changed—it uses the `LazyPath` dependency graph to detect staleness. For most projects, rebuilds are fast because Zig’s compiler is fast.
+
+**Custom step caching.** If a custom step is expensive (e.g., downloading a dataset), you can implement your own caching by checking a file stamp or a hash of inputs. Store the stamp in the step’s state and skip the work if nothing changed.
+
+**Linking and installation.** The final link step is CPU‑intensive but typically runs only once per artifact. Installation (`install` step) merely copies files; its overhead is I/O. Avoid doing an installation if you are just testing; use `zig build run` which skips the copy to `zig-out`.
+
+---
+
+### 7. Best Practices
+
+1. **Use `standardTargetOptions` and `standardOptimizeOption`.** This single decision makes your project cross‑compilable and configurable without extra effort.
+2. **Provide a `run` step.** Users expect `zig build run` to compile and execute the main binary. Forward `b.args` as shown in the basic example.
+3. **Provide a `test` step.** Run all tests with `zig build test`. This integrates with CI trivially.
+4. **Keep `build.zig` readable.** Even though you have the full language, avoid deep abstraction. A flat sequence of step creation and wiring is easier to understand than a generic factory function that hides the graph.
+5. **Use `LazyPath` for all file references.** Pass `b.path("src/foo.zig")` not `"src/foo.zig"`. This ensures the build system tracks changes and works when the build directory differs from the source directory.
+6. **Expose feature flags with `b.option`.** For example:
+   ```zig
+   const enable_tracy = b.option(bool, "tracy", "Enable Tracy profiling") orelse false;
+   if (enable_tracy) exe.linkLibC(); exe.linkSystemLibrary("tracy");
+   ```
+7. **Separate configuration from build logic.** If your project needs to discover system libraries or tools, encapsulate that in a helper function that returns options. The `build` function should remain a high‑level recipe.
+8. **Use `b.dependency` for external packages.** If your project uses a Zig library from another repository, add it to `build.zig.zon` and reference it via `b.dependency(...).artifact(...)`. This keeps dependencies explicit and reproducible.
+9. **`addCSourceFile` with `linkLibC()`.** When including C source, don’t forget to call `exe.linkLibC();` to provide the C standard library.
+10. **For complex generation, write a separate tool.** Instead of embedding generation logic in `build.zig`, create a small Zig program (or use `zig run` step) whose output is captured by a `Step.Run` and fed as a `LazyPath`. This keeps the build script clean and allows the generator to be tested independently.
+
+---
+
+### 8. Examples
+
+Let’s construct a realistic `build.zig` for a project named `data-pipe` that:
+
+- Compiles a Zig executable from several source files.
+- Links a C library (`libcurl`) using system pkg‑config.
+- Cross‑compiles for `aarch64-linux-musl` and `riscv64-linux-musl` (via `zig build -Dtarget=...`).
+- Generates a Zig module from a JSON schema at build time (a custom step).
+- Provides `run`, `test`, and a `lint` step (running `zig fmt`).
+
+**Project layout:**
+
+```
+data-pipe/
+  build.zig
+  build.zig.zon
+  src/
+    main.zig
+    parser.zig
+    schema.json
+  libcurl/  (optional bundled C sources)
+```
+
+We’ll assume `libcurl` is available on the system via `pkg-config`. Alternatively, you could bundle the library; for brevity we use system detection.
+
+**Complete `build.zig`:**
+
+```zig
+const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    // Standard options for target and optimization
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    // Custom step: generate a Zig module from a JSON schema.
+    // We'll write a tiny generator script inline (in reality, this would be a separate file).
+    const schema_path = b.path("src/schema.json");
+    const generated_zig = genZigSchema(b, schema_path);
+
+    // Create the executable.
+    const exe = b.addExecutable(.{
+        .name = "data-pipe",
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Add other Zig sources.
+    exe.addModule("parser", b.createModule(.{
+        .root_source_file = b.path("src/parser.zig"),
+    }));
+    // Add the generated module.
+    exe.addModule("schema", b.createModule(.{
+        .root_source_file = generated_zig,
+    }));
+
+    // Link system libcurl.
+    exe.linkSystemLibrary("curl");
+    exe.linkLibC(); // curl requires the C standard library
+
+    // Install the executable.
+    b.installArtifact(exe);
+
+    // Run step.
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_cmd.addArgs(args);
+    const run_step = b.step("run", "Run the app");
+    run_step.dependOn(&run_cmd.step);
+
+    // Test step.
+    const tests = b.addTest(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    tests.addModule("parser", exe.modules.get("parser").?);
+    tests.addModule("schema", exe.modules.get("schema").?);
+    tests.linkSystemLibrary("curl");
+    tests.linkLibC();
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&b.addRunArtifact(tests).step);
+
+    // Lint step: run `zig fmt` on all source files.
+    const fmt_step = b.addFmt(.{
+        .paths = &.{ b.path("src"), b.path("build.zig") },
+    });
+    const lint_step = b.step("lint", "Check formatting");
+    lint_step.dependOn(&fmt_step.step);
+}
+
+// Helper: custom step that reads schema.json and generates schema.zig.
+// In a real project this would likely be a small tool compiled with `b.addExecutable` and run as a Step.Run.
+// For illustration, we embed the generation logic using a WriteFile step that writes the resulting source.
+fn genZigSchema(b: *std.Build, schema_lazy: std.Build.LazyPath) std.Build.LazyPath {
+    const generated_file = b.addWriteFile("schema.zig", schema_gen_writer);
+    // Make the generation depend on the schema file (so it regenerates when schema changes).
+    // WriteFile accepts a function that receives a writer; we'll read the schema inside that function.
+    // Since the function is called at build time, we need to actually read the file there.
+    // This is a bit tricky with LazyPath; we use a Step.Run to achieve proper dependency tracking.
+    // Simpler: we create a Run step that invokes our generator tool.
+    // But for brevity, we'll show the idiomatic approach: compile a small generator and run it.
+
+    const gen_tool = b.addExecutable(.{
+        .name = "schema-gen",
+        .root_source_file = b.path("tools/schema_gen.zig"),  // assumes existence
+        .target = b.graph.host,  // build for host, not target
+        .optimize = .Debug,
+    });
+
+    const run_gen = b.addRunArtifact(gen_tool);
+    run_gen.addFileArg(schema_lazy);
+    const out_path = run_gen.addOutputFileArg("schema.zig");  // captures stdout as a LazyPath
+    return out_path;
+}
+```
+
+In this snippet, `genZigSchema` illustrates the correct pattern: a host‑compiled tool that reads `schema.json` and prints generated Zig code. The `addOutputFileArg` captures stdout as a `LazyPath` that can be fed directly to the main executable. The main executable sees the generated file as a dependency, so any change to `schema.json` triggers re‑generation and re‑compilation.
+
+To cross‑compile for RISC‑V, simply run:
+```
+zig build -Dtarget=riscv64-linux-musl
+```
+The `standardTargetOptions` picks up the triple, and the Zig compiler automatically provides the appropriate sysroot. No additional toolchain is required.
+
+The `build.zig.zon` file would contain package metadata:
+
+```zig
+.{
+    .name = "data-pipe",
+    .version = "0.1.0",
+    .dependencies = .{},
+}
+```
+
+---
+
+### 9. Summary & Exercises
+
+The Zig build system is a first‑class programming environment that gives you precise control over every build action while maintaining a declarative, graph‑based structure. Key takeaways:
+
+- `build.zig` is a regular Zig program that constructs a step graph; `zig build` runs it and executes the requested step.
+- `LazyPath` decouples file references from their physical location, enabling transparent handling of generated files.
+- Standard options (`standardTargetOptions`, `standardOptimizeOption`) make cross‑compilation a `-Dtarget=...` switch away.
+- Custom steps are ordinary Zig types implementing a `make` method, integrated into the dependency graph.
+- Common pitfalls include forgetting to install artifacts, misusing `LazyPath`, and introducing circular dependencies.
+
+**Exercises:**
+
+1. **Add a custom `docs` step.** Extend the example `build.zig` to include a step `zig build docs` that uses `zig build-lib -femit-docs` to generate documentation for your library. The step should depend on the compilation and copy the generated HTML to `zig-out/docs`. (Hint: use `b.addSystemCommand` or create a custom step with `Step.Run`.)
+
+2. **Multi‑target package.** Write a `build.zig` for a library that, when you run `zig build package`, compiles a static library for three targets (`x86_64-linux-gnu`, `aarch64-linux-musl`, `riscv64-linux-musl`) and archives them all into a single directory. Use a loop over an array of targets; demonstrate that the build script is just code.
+
+3. **Auto‑discovery of C dependencies.** Modify the example to use `b.addSystemCommand` to call `pkg-config --cflags --libs libcurl` and extract the necessary flags. Make the build fail gracefully if `libcurl` is not found by printing a helpful message and returning an error from `build` (remember you can use `try` and return an error union from `build` in newer Zig versions).
+
+These exercises force you to internalise the philosophy: if you can write it in Zig, you can automate it in your build. The line between tooling and the build system disappears.

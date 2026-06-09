@@ -1,0 +1,305 @@
+# Chapter 35: Effective Zig & Style
+
+Zig is a language of deliberate constraints. The absence of hidden control flow, implicit allocations, and exceptions does not automatically produce good code—it *enables* good code, but the engineer must still make wise choices. This chapter distills the conventions, patterns, and judgment calls that separate idiomatic Zig from “Zig written like C++ with a different syntax.” We cover naming, commenting, the inseparable trio of allocator/error handling/defer, API design for composability, and the art of exposing comptime parameters. By the end, you should be able to read and write Zig that feels native to the standard library and the broader ecosystem.
+
+## 1. Basic Usage
+
+Style begins with the visible surface: names, comments, and file organization.
+
+**Naming Conventions.** Zig follows a predictable scheme:
+- Types (structs, enums, unions, opaque types) use `PascalCase`: `ArrayList`, `File`, `GeneralPurposeAllocator`.
+- Functions, variables, and module-level constants use `snake_case`: `append`, `capacity`, `page_size`.
+- Type parameters (comptime `type`) are typically `T`, `K`, `V`, or a descriptive `Context`; the standard library often uses `T` for the primary element type.
+- Error sets use `PascalCase` as well, since they are types: `error{OutOfMemory, InvalidArgument}`.
+- Files representing modules are `snake_case.zig`, and the module name matches (minus the `.zig`).
+
+There are no exceptions for acronyms: write `HttpServer`, not `HTTPServer`. Acronyms blend into the word: `Cpu`, `Tcp`, `Io`. The standard library is a reliable reference.
+
+```zig
+const std = @import("std");
+
+// Type: PascalCase
+const RequestHandler = struct {
+    // fields: snake_case
+    max_body_size: usize,
+    allocator: std.mem.Allocator,
+};
+
+// function: snake_case, verb-first
+pub fn handle_request(self: *RequestHandler, data: []const u8) !void {
+    _ = self;
+    _ = data;
+}
+```
+
+**Comment Etiquette.** Zig provides two comment styles: `// line` and `//! doc` / `/// doc`. Doc comments attach to the following declaration and feed `zig build-exe -femit-docs`. Use `//!` for top-level file or module documentation, `///` for item-level. Comments should explain *why*, not *what*—the code already says what. Exceptions exist for non-obvious algorithms or hardware-specific subtleties.
+
+```zig
+//! A thread-safe, fixed-capacity ring buffer.
+//! All operations are lock-free on supported targets.
+
+const RingBuffer = struct {
+    /// Writes a single element, returning error.OutOfMemory if full.
+    pub fn put(self: *RingBuffer, item: u32) !void {
+        // The ABA problem is avoided here because we never reuse
+        // sequence numbers while readers hold a reference.
+        ...
+    }
+};
+```
+
+Inline comments (inside functions) should be rare. Use them to clarify intent that cannot be expressed through good names.
+
+## 2. Under the Hood
+
+Style is not compiler-enforced; it is a social contract. However, the compiler *does* surface certain style violations through warnings (or compile errors in the case of unused variables/parameters with `_ = x;` required if intentionally ignored). The language’s design encourages certain styles implicitly.
+
+- **No function overloading:** Because there is no function overloading, names must carry distinguishing information. The pattern `parseFromSlice`, `parseFromFile`, `parseFromReader` emerges naturally instead of multiple `parse` overloads. This makes call sites unambiguous.
+- **Explicit error unions:** The compiler requires handling of errors at each call site; good style leverages `try`, `catch`, and `if (err)` to keep error paths visible. The absence of exceptions means error-handling policy is not hidden in a distant `catch` block.
+- **`comptime` duck-typing:** The compiler evaluates `comptime` code with the same language, meaning that generic code can introspect types. This replaces templates and trait bounds. Style leverages this for clean API generation, but requires discipline to avoid compile-time performance pitfalls.
+- **Build system as Zig:** Because `build.zig` is ordinary Zig, build logic follows the same style rules as runtime code. A consistent style across the project boundary reduces cognitive load.
+
+The standard library’s source code is the ultimate style guide. Reading `std.ArrayList.zig` or `std.json.zig` reveals patterns of naming, error handling, and allocator passing that should be mirrored.
+
+## 3. Why This Design?
+
+Zig’s stylistic norms are not arbitrary—they flow from the language’s philosophy of explicitness and avoidance of hidden control flow.
+
+- **Naming conventions separate types and values instantly.** In C++, `vector` could be a template or a variable, and the difference is context-dependent. In Zig, `Vector` is unmistakably a type. This aids reading and reduces the mental cost of disambiguation.
+- **Explicit allocators as parameters force allocation to be visible in the call graph.** Any function that might allocate accepts an `Allocator` and returns an error union. This is a stylistic rule backed by a language constraint: you cannot allocate without an allocator, and the standard library does not provide a global allocator. Code that follows this rule is trivially auditable for allocation failures and memory usage.
+- **`defer` / `errdefer` replace destructors and `finally` blocks with a linear, explicit sequence.** Style dictates placing `defer` immediately after resource acquisition, making cleanup predictable and reviewable in a single screenful. This contrasts with RAII where destruction order depends on object lifetimes and member order, which can be surprising.
+- **Error handling via `try` and `catch` keeps the happy path on the left.** Zig style encourages early returns with `try` for fatal-to-the-current-function errors, and explicit `catch` blocks for recovery. This mirrors the “if err != nil { return err }” of Go, but with type-safe error sets and payload-carrying unions.
+
+The design pushes the developer toward a style where every line of code reveals its cost and side effects.
+
+## 4. Competing Approaches
+
+**C:** C has no official style guide beyond what a project adopts. Naming often mixes `snake_case`, `camelCase`, and `Hungarian`. Error handling is done through return codes or `errno`, which are easily ignored. Zig’s style eliminates the possibility of forgetting to check an error because the compiler requires it. Allocator passing in C is often through globals (`malloc`) or ad-hoc context pointers; Zig standardizes it. The stylistic result: Zig codebases are more uniform and less prone to silent resource leaks and unchecked errors.
+
+**Rust:** Rust’s official style mandates `snake_case` for everything, and traits/generics provide abstraction. Error handling with `Result` and the `?` operator is similar to Zig’s `!T` and `try`, but Rust’s `?` can perform implicit type conversions via `From` traits, hiding control flow. Zig’s style avoids such conversions—`try` only works on error unions that match the calling function’s error set, making every error path explicit. The allocator pattern in Rust is moving toward explicit `&mut impl Allocator` parameters, converging with Zig’s design, but many existing Rust libraries still use global allocators. Zig’s style forbids the global allocator assumption from the start.
+
+**Go:** Go’s naming conventions (`PascalCase` for exported, `camelCase` for unexported) are similar, but Go does not distinguish types from values by case alone. Error handling is explicit (`if err != nil`), but lacks the exhaustiveness check of Zig’s error unions. Go’s `defer` is analogous but is scoped to the function, not the block, and can be used in loops without extra discipline; Zig’s `defer` is block-scoped, which encourages more precise resource management. The allocator is a global GC, so Go style never considers allocator parameters. Zig’s style forces memory management to be part of the API signature.
+
+**C++:** C++ naming is conventionally `PascalCase` for classes, `camelCase` for functions, or vice versa. Zig’s separation of types and values reduces ambiguity. RAII hides cleanup; Zig’s `defer` makes it explicit and linear, which is less error-prone in complex error paths (though more verbose). C++ error handling mixes exceptions, error codes, and `std::expected`; Zig unifies it. The result is a style where the cost of an operation is never hidden behind an assignment operator.
+
+Zig’s style choices are deliberately conservative, aiming for a codebase that can be understood without an IDE’s semantic analysis, much like C, but with stronger guarantees.
+
+## 5. Common Mistakes
+
+**Mistaking `defer` for a function-level cleanup mechanism.** `defer` executes when the enclosing *block* exits, not the function. This surprises Go developers. In a loop, a `defer` inside the block will execute at the end of each iteration. Use an enclosing block explicitly if you need per-iteration cleanup.
+
+```zig
+// Wrong: defer inside loop runs every iteration (maybe desired, but often unintended)
+for (items) |item| {
+    const resource = try acquire(item);
+    defer resource.release();
+    // use resource
+}
+// Correct if you want cleanup after entire loop:
+{
+    const resource = try acquireGlobal();
+    defer resource.release();
+    for (items) |item| {
+        // use resource
+    }
+}
+```
+
+**`catch unreachable` as a crutch.** It is tempting to silence error unions with `catch unreachable` during prototyping, but leaving it in production code erodes the reliability guarantees Zig provides. Even for “impossible” errors, use `catch |err| std.debug.panic("unexpected error: {}", .{err})` or handle it gracefully. The `unreachable` keyword marks truly unreachable code paths; misusing it on error unions is a sign of incomplete error handling design.
+
+**Putting allocators in global state.** A global `var gpa = ...` may seem convenient, but it breaks explicit dependency injection and makes testing (especially with `std.testing.allocator`) impossible. Every function that needs to allocate must take an `Allocator` parameter. This is a hard-won lesson: the style of passing allocators explicitly is non-negotiable for robust, testable code.
+
+**Overusing `anyopaque` and `@ptrCast`.** Zig’s type system is strong; opaque types and arbitrary pointer casts bypass safety checks and make code difficult to follow. Prefer generics with `anytype` parameters and comptime type reflection over `anyopaque`. If you must use type erasure, wrap it in a well-documented, narrow interface.
+
+**Placing doc comments on the wrong side of a declaration.** `///` must immediately precede the declaration, not be separated by a blank line. A blank line terminates the doc comment’s association.
+
+**Overcomplicating error sets.** Creating a unique error set for every function leads to error set proliferation and conversion fatigue. Group errors by domain (e.g., `error{ InvalidInput, OutOfMemory, DeviceError }`) and use `try` and `catch` to propagate. Zig’s error set inference allows functions to declare `!void` and have the compiler infer the set, which is often sufficient.
+
+## 6. Performance Considerations
+
+Style choices can affect performance, not merely aesthetics.
+
+- **Allocator selection in public APIs:** If a function accepts an `Allocator`, the caller can choose a fast bump allocator, a stack-like `FixedBufferAllocator`, or a general-purpose allocator. The style of passing allocators enables this without code changes. Avoid internal `page_allocator` calls; always let the caller decide.
+- **`defer` does not introduce overhead.** It is a compiler-level mechanism that emits cleanup code at the end of the block. There is no runtime registration or function call overhead—it’s equivalent to manually writing the cleanup at each exit point, just less error-prone.
+- **Error returns via `try` are efficient.** The ABI for error unions returns an error code (usually an integer) alongside the value in a register pair. `try` simply checks the error code and jumps if non-zero. This is cheaper than C++ exception unwinding and comparable to returning an `int` error code, but with type safety.
+- **Explicit naming of operations can guide the optimizer.** For example, writing a `readAll` function that loops and appends to an `ArrayList` is clear, but if performance matters, a more specialized `readAllIntoBuffer` that avoids reallocations might be warranted. The style of descriptive function names helps the programmer see where allocations happen and optimize accordingly.
+- **Comptime parameters vs. runtime parameters:** Exposing a comptime parameter (e.g., a block size) allows the compiler to generate specialized code with constant-propagation and loop unrolling. This is a style decision: public APIs often use comptime parameters for configuration that is known at compile time (buffer sizes, algorithm choice), improving performance without sacrificing clarity. But overuse can increase compile times; balance is key.
+
+The theme: Zig’s style ensures that performance-relevant decisions (allocation, error propagation, dispatch) are visible. This transparency enables targeted optimization.
+
+## 7. Best Practices
+
+### The Holy Trinity: Allocator, Error Handling, Defer
+
+Every non-trivial function that acquires resources should exhibit this pattern:
+
+```zig
+fn processFile(allocator: std.mem.Allocator, path: []const u8) !Result {
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+
+    const contents = try file.readToEndAlloc(allocator, 4 * 1024 * 1024);
+    defer allocator.free(contents);
+
+    // use contents...
+}
+```
+
+- **Allocator:** first among parameters, or second after `self` in methods. The type `std.mem.Allocator` is the interface. Accepting it enables testing and composition.
+- **Error handling:** Use `try` for errors the function cannot recover from. If you can recover, use `catch` and handle the error, perhaps returning a default value or retrying. Never discard an error silently.
+- **Defer:** Place immediately after acquisition, on the next line. For `errdefer`, use it when the cleanup should only happen on error (e.g., freeing a partially-built list). This trinity makes resource leaks nearly impossible.
+
+### API Design for Composability and Clarity
+
+- **Use `self` for method receivers.** The first parameter of a method is `self: *@This()` or `self: @This()`. This convention makes method calls feel like typical OOP syntax, though behind the scenes it’s just a function call.
+- **Avoid deep nesting of `switch` and `if` inside function bodies.** Extract complex logic into smaller functions, possibly with comptime parameters for specialization. A function should ideally fit on a single screen.
+- **Embrace the options struct pattern.** When a function has many optional or configurable parameters, define a public struct with sensible defaults and accept that struct. This is how `std.fs.Dir.openFile` accepts `OpenFlags`. The pattern avoids long parameter lists and allows future extension.
+
+```zig
+const ParseOptions = struct {
+    max_depth: u32 = 10,
+    allow_trailing_comma: bool = false,
+};
+
+fn parse(allocator: std.mem.Allocator, input: []const u8, opts: ParseOptions) !Ast {
+    // ...
+}
+```
+
+- **For libraries, expose comptime parameters when the choice affects the type.** For example, a generic `HashMap(K, V, Context)` takes a comptime `Context` (hash and equality functions). The caller’s code is specialized at compile time without runtime dispatch. In public APIs, document the trade-off: compile-time parameterization increases code size but yields zero-overhead abstraction.
+- **Use `anytype` sparingly in public interfaces.** While convenient for duck-typing, `anytype` obscures the contract. In a stable library, prefer concrete comptime `type` parameters with clear documentation of required declarations (e.g., “`T` must have `fn init(allocator) !T`”). Comptime reflection (`@typeInfo`) can enforce this at compile time, providing better error messages.
+- **Return error sets that are minimal and coherent.** A function should return the specific errors it can produce, not a large catch-all set. Let the compiler infer the error set whenever possible (`!void` rather than `error{OutOfMemory, ...}!void`). When defining a library, document the possible errors.
+- **Write tests alongside your code.** Use `test` blocks and `std.testing`. The `testing.allocator` checks for memory leaks. The style of test-as-documentation is a first-class part of Zig culture.
+
+### When to Expose Comptime Parameters in a Public API
+
+Comptime parameters create a compile-time specialization boundary. Expose them when:
+
+1.  **The parameter affects the in-memory layout or type structure.** A ring buffer’s capacity, a fixed-point number’s fractional bits, or a matrix’s dimensions. Example: `fn Matrix(comptime rows: usize, comptime cols: usize) type`.
+2.  **You want to eliminate runtime branches that depend on a configuration known at build time.** Example: a logging library that takes a comptime `level: std.log.Level` and compiles away log statements below that level.
+3.  **You are building a generic data structure that must be specialized per type.** `HashMap(K, V, Context)` is the classic example. The `Context` must be a compile-time-known type because it provides methods called at comptime.
+
+Do *not* expose a comptime parameter if the value is truly runtime-determined (e.g., user input). In such cases, accept a runtime parameter and pay the small cost. Over-comptimization leads to explosion of specialized copies and slow compile times, without meaningful performance benefit.
+
+A good API finds the seam between compile-time and runtime. The style: prefer runtime parameters for data, comptime parameters for types and fixed constraints.
+
+## 8. Examples
+
+### Example 1: A Configurable Logger with Comptime Filtering
+
+```zig
+const std = @import("std");
+
+/// A logger that can compile out messages below a given severity.
+pub fn Logger(comptime min_level: std.log.Level) type {
+    return struct {
+        const Self = @This();
+
+        /// Log a message if level >= min_level.
+        pub fn log(
+            self: *const Self,
+            comptime level: std.log.Level,
+            comptime format: []const u8,
+            args: anytype,
+        ) void {
+            _ = self;
+            if (@intFromEnum(level) >= @intFromEnum(min_level)) {
+                std.debug.print(format ++ "\n", args);
+            }
+        }
+    };
+}
+
+test "compile-time logger filtering" {
+    const DebugLogger = Logger(.debug);
+    const ReleaseLogger = Logger(.err);
+
+    const debug_logger = DebugLogger{};
+    debug_logger.log(.info, "info: {d}", .{42}); // printed
+    debug_logger.log(.debug, "debug: {s}", .{"hello"}); // printed
+
+    const release_logger = ReleaseLogger{};
+    release_logger.log(.info, "info: {d}", .{42}); // compiled out!
+}
+```
+
+This demonstrates a comptime parameter (`min_level`) that affects code generation. The style follows conventions: `Logger` is PascalCase, methods take `self`, and `anytype` is used for the format arguments.
+
+### Example 2: The Holy Trinity in a Network Client
+
+```zig
+const std = @import("std");
+
+const Request = struct {
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+
+    pub fn init(allocator: std.mem.Allocator, stream: std.net.Stream) Request {
+        return .{ .allocator = allocator, .stream = stream };
+    }
+
+    pub fn fetch(self: *Request, url: []const u8) ![]u8 {
+        // Build HTTP request string using allocator
+        var req_buf = std.ArrayList(u8).init(self.allocator);
+        defer req_buf.deinit();
+        try req_buf.writer().print("GET {s} HTTP/1.1\r\nHost: example.com\r\n\r\n", .{url});
+
+        _ = try self.stream.write(req_buf.items);
+
+        // Read response into allocator-owned buffer
+        const response = try self.stream.reader().readAllAlloc(self.allocator, 1024 * 1024);
+        errdefer self.allocator.free(response); // free only if we return error
+
+        // Process response...
+        return response;
+    }
+};
+```
+
+Here the `Allocator` is a struct field, passed at init. `defer` and `errdefer` manage resources. Errors propagate with `try`. The style is explicit and leak-safe.
+
+### Example 3: Options Struct and Generic Function
+
+```zig
+const CompressOptions = struct {
+    level: u8 = 6,
+    dictionary: ?[]const u8 = null,
+};
+
+fn compress(
+    allocator: std.mem.Allocator,
+    data: []const u8,
+    opts: CompressOptions,
+) ![]u8 {
+    _ = allocator;
+    _ = data;
+    _ = opts;
+    // ...
+}
+
+// A generic function accepting any type with a `write` method.
+fn writeAll(writer: anytype, items: []const u8) !void {
+    var pos: usize = 0;
+    while (pos < items.len) {
+        pos += try writer.write(items[pos..]);
+    }
+}
+```
+
+The options struct uses defaults, so callers provide only what they need. The generic `writeAll` uses `anytype` but documents the required method. The style is clean and discoverable.
+
+## 9. Summary & Exercises
+
+This chapter cemented the style guidelines that make Zig code instantly recognizable and maintainable. We covered the rationale behind naming, comments, the “holy trinity” of allocator/error handling/defer, API design with options structs and comptime parameters, and how these choices reflect Zig’s fundamental principles of no hidden control flow and explicit resource management.
+
+The key takeaway: Zig style is not about rigid rules but about consistent application of the language’s philosophy. When you write a function, make every allocation visible, every error path explicit, and every cleanup deterministic. Use names that reveal intent, and let the standard library be your template.
+
+### Exercises
+
+1. **Refactor a C-style Zig Module:** Take a piece of code that uses a global allocator, ignores errors with `catch unreachable`, and has inconsistent naming. Rewrite it in idiomatic Zig, following all the conventions in this chapter. Verify that your version compiles and passes `zig test` with the testing allocator.
+
+2. **Design a Comptime-Configurable Data Structure:** Create a generic `BoundedArray(T, max_size: comptime usize)` that stores elements inline (like `std.BoundedArray` but with a different API). Expose a method `append` that returns an error if full. Write comprehensive tests. Consider: should `max_size` be a comptime parameter? What are the implications for code size and performance? Document your design decisions.
+
+3. **Audit a Public API:** Examine the public interface of a module you wrote earlier in this book (or any non-trivial Zig code). Identify any places where `anytype` could be replaced with a concrete comptime type for better documentation, or where an options struct could improve call-site readability. Propose changes and explain the trade-offs.
+
+4. **Implement the “Holy Trinity”:** Write a function that opens a file, reads a JSON payload, parses it into a custom struct, and returns the result. Ensure that every resource (file, memory) is cleaned up on both success and error paths using `defer` and `errdefer`. Pass an allocator explicitly. Write a test that uses a leaking-check allocator and verify no leaks occur.

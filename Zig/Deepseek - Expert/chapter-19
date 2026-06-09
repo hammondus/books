@@ -1,0 +1,352 @@
+## Chapter 19. Debugging and Safety Modes
+
+A systems language lives or dies by its ability to produce code that runs both fast and correctly. Zig’s build modes—Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall—are not just compiler flags you toggle; they are a deliberate taxonomy of trade-offs between safety, performance, and binary size. This chapter details how to wield them, what changes under the hood, and how to combine runtime diagnostics and debuggers to extract maximum insight with minimum noise.
+
+---
+
+### 1. Basic Usage
+
+Zig exposes its four build modes through the `-O` (or `--release`) flag when using `zig build-exe`, and through the `optimize` field in `build.zig`. The mode is a first-class concept available at comptime via `@import("builtin").mode`.
+
+```zig
+const builtin = @import("builtin");
+
+pub fn main() void {
+    switch (builtin.mode) {
+        .Debug => @import("std").debug.print("Debug mode\n", .{}),
+        .ReleaseSafe => @import("std").debug.print("ReleaseSafe mode\n", .{}),
+        .ReleaseFast => @import("std").debug.print("ReleaseFast mode\n", .{}),
+        .ReleaseSmall => @import("std").debug.print("ReleaseSmall mode\n", .{}),
+    }
+}
+```
+
+Compile and run with each mode:
+
+```
+$ zig build-exe mode_demo.zig                  # defaults to Debug
+$ ./mode_demo
+Debug mode
+
+$ zig build-exe mode_demo.zig -O ReleaseSafe
+$ ./mode_demo
+ReleaseSafe mode
+
+$ zig build-exe mode_demo.zig -O ReleaseFast
+$ ./mode_demo
+ReleaseFast mode
+
+$ zig build-exe mode_demo.zig -O ReleaseSmall
+$ ./mode_demo
+ReleaseSmall mode
+```
+
+When using the build system, the target’s optimization is set via `b.standardOptimizeOption`:
+
+```zig
+// build.zig
+const exe = b.addExecutable(.{
+    .name = "app",
+    .root_source_file = b.path("src/main.zig"),
+    .target = target,
+    .optimize = b.standardOptimizeOption(.{}), // picks up -Doptimize
+});
+```
+
+The user then invokes `zig build -Doptimize=ReleaseSafe`.
+
+**What the modes guarantee** (and what they don’t):
+
+- **Debug** (`-O Debug`): All runtime safety checks enabled: array bounds, integer overflow/wrapping for signed integers, shift amount overflow, division by zero, null pointer dereference assertions, and `@setRuntimeSafety` defaults to `true`. Debug info emitted (DWARF), optimizations off. Binary is large and slow, but crashes loudly at the first misstep.
+
+- **ReleaseSafe** (`-O ReleaseSafe`): Optimizations enabled (similar to `-O2` in C), but *runtime safety checks remain on*. This is the production-safe sweet spot: you get most of the speed, but buffer overflows and overflows trap instead of corrupting memory. Debug info can be stripped or left in; assertions from `std.debug.assert` are still active unless overridden.
+
+- **ReleaseFast** (`-O ReleaseFast`): Full optimizations, runtime safety checks **off**. This includes bounds checks, integer overflow checks, and null checks on non-optional pointers. You trade safety for the last few percent of performance. The compiler may also exploit undefined behavior for optimization (e.g., signed overflow is UB in Zig just as in C, so it can assume it doesn’t happen). `std.debug.assert` is compiled away (becomes a no-op).
+
+- **ReleaseSmall** (`-O ReleaseSmall`): Like ReleaseFast but optimized for size (`-Os`) rather than speed. Runtime safety checks off, assertions removed. Useful for embedded targets or WASM where every byte counts.
+
+Zig allows per-scope overrides with `@setRuntimeSafety(false)` and `@setRuntimeSafety(true)`. This enables “safe fast” inner loops while the rest of the application remains guarded.
+
+```zig
+fn hot_loop(data: []u32) u32 {
+    @setRuntimeSafety(false); // we've verified indices in the caller
+    var sum: u32 = 0;
+    for (data) |x| sum +|= x;
+    return sum;
+}
+```
+
+When you need an assertion that always fires—even in ReleaseFast—use `std.debug.assert` with the global `debug_assert` option set at compile time (via `-Ddebug_assert=true`), or roll your own using `if (condition) @panic("msg")`.
+
+---
+
+### 2. Under the Hood
+
+Zig’s safety checks are not magical compiler passes layered on top of the language—they are ordinary Zig code inserted during comptime evaluation of the runtime safety logic. When `@setRuntimeSafety` is `true` (and the build mode allows it), the compiler emits guarded instructions for:
+
+- Array and slice indexing: a bounds check precedes the index computation. On failure, it calls the panic handler with the index and length.
+- Integer arithmetic: signed addition, subtraction, multiplication, negation, and division/remainder each check for overflow using LLVM’s `llvm.sadd.with.overflow` intrinsics (or the equivalent for the self-hosted backend). Unsigned arithmetic wraps by definition; if you need overflow detection, use the `@addWithOverflow` builtins.
+- Shift operations: shift amounts are checked against the bit width.
+- Null dereferences: dereferencing an optional pointer `?*T` without first unwrapping triggers a check similar to `if (ptr == null) @panic(...)`.
+- Casts: `@intCast` and `@floatCast` that lose precision or change sign validate the value fits.
+
+All these checks compile into simple conditional branches that jump to a call to the panic function when violated. The `std.debug` module provides a default panic handler that prints a stack trace and the offending location, then calls `abort()`. You can override the panic handler with a custom one via the root source file’s `pub fn panic(...)`.
+
+**Build modes and LLVM passes:**
+Debug passes `-O0`, no inline, minimal optimization. ReleaseSafe and ReleaseFast both enable the LLVM optimizer pipeline at a high level; the difference is a single flag: Zig’s internal `safety` boolean, which controls whether those runtime checks are code-generated. The LLVM optimizer does not know about Zig’s safety semantics; it just sees branches that compare index against length, and if it can prove the branch is never taken (e.g., length known at compile time), it may remove the check anyway—an effect you sometimes see even in Debug mode.
+
+ReleaseSmall adds `-Os` to the optimization flags, which often inlines less aggressively and uses size-conscious sequences.
+
+**Assertions:** `std.debug.assert(ok)` expands to:
+- In Debug/ReleaseSafe: `if (!ok) @panic("assertion failure")`
+- In ReleaseFast/ReleaseSmall: a no-op, unless the `debug_assert` global is set (via `-Ddebug_assert=true`), which forces assertion checks in all modes.
+
+The compiler constant `builtin.mode` is available at comptime, so you can conditionally include debug-only code without runtime overhead:
+
+```zig
+if (builtin.mode == .Debug) {
+    validate_internals();
+}
+```
+
+This code is completely eliminated in non-Debug builds.
+
+**Sanitizers:** The Zig compiler can link with `-fsanitize` options for AddressSanitizer, ThreadSanitizer, and UndefinedBehaviorSanitizer, but these are separate from the built-in safety checks. They are used in any mode, typically Debug, for deeper checks like use-after-free and data races.
+
+---
+
+### 3. Why This Design?
+
+Zig’s build modes and safety philosophy stem from a core observation: *most bugs that corrupt state in production are simple—array out-of-bounds, null pointer dereferences, integer overflow—and they are trivially detectable at the cost of a single branch.* Yet languages like C and C++ disable those checks in optimized builds because they fear the performance cost, and provide no granular control. Rust enables overflow checks in debug but disables them in release by default, relying on the optimizer to eliminate most checks. Zig, instead, gives you explicit, scoped control and keeps the checks on in the recommended release configuration.
+
+**Why not just rely on the optimizer to remove safety checks?** Because the optimizer can’t see across module boundaries or through memory aliasing. In a large codebase, the compiler cannot prove that an index derived from a network packet is always within bounds. Zig’s approach acknowledges that you, the engineer, know when a certain loop is performance-critical and have already proven its invariants. You can then surgically disable checks with `@setRuntimeSafety(false)` rather than hoping the optimizer will bail you out.
+
+**Why four modes and not just debug/release?** Because “release” means different things in different domains. A cloud service operator may want ReleaseSafe (maximum safety with near-maximum speed). A game engine may choose ReleaseFast for the inner rendering loop. An embedded developer may need ReleaseSmall to fit in 16 KiB of flash. Zig forces you to make that choice explicit at build time rather than relying on a single `-O2` flag that does something different on each compiler.
+
+The pattern `std.debug.assert` being a no-op in ReleaseFast is a deliberate productivity choice: you don’t litter your code with `#ifdef NDEBUG`; you write assertions liberally and trust that they will disappear when you ask for full speed. The escape hatch (`debug_assert`) gives you the ability to enforce invariants even in release, but the default is “safe by default, fast by explicit opt-in.”
+
+---
+
+### 4. Competing Approaches
+
+**C and C++:** The classic `-O0 -g` vs `-O2 -DNDEBUG` split. NDEBUG disables `assert()` macros, but does nothing for bounds checks (there are none in the language). AddressSanitizer and UBSan can be added, but they are separate compiler flags, not part of the build mode taxonomy. The programmer must manually sprinkle `if (i < len)` everywhere, and often forgets. Zig’s unified modes and selective safety give you the same control without the ritual.
+
+**Rust:** Debug and Release profiles. Overflow checks are on in debug, off in release by default. Users can enable them in release with `overflow-checks = true` in Cargo.toml, but this is project-wide. Bounds checking always occurs in safe Rust (the optimizer can elide some, but you can’t turn it off without `unsafe`). The `unsafe` keyword gives you a similar “trust me” region as `@setRuntimeSafety(false)`, but Rust’s borrow checker still applies. Rust’s `debug_assert!` mirrors Zig’s default `std.debug.assert`. The key difference: Zig makes safety checks a first-class language-level toggle, not tied to `unsafe` semantics, giving finer granularity without changing the type system.
+
+**Go:** Compiles with bounds checks always on; there is no way to turn them off except via compiler escape hatches (like `-gcflags=-B`). Go’s philosophy is simplicity: you don’t choose the performance/safety trade-off. Zig gives you the choice because in systems programming, that choice matters.
+
+**Other languages (Python, Java):** They throw exceptions on out-of-bounds access. The cost is always paid. Zig’s panic is similar, but you can avoid paying it.
+
+**Zig’s unique contribution:** A build mode continuum where the presence of checks is orthogonal to optimization level. ReleaseSafe is not a “debug release” hack; it’s a first-class mode that says “I want the optimizer, but I refuse to sacrifice safety for speed.”
+
+---
+
+### 5. Common Mistakes
+
+**Assuming safety checks are free.** They aren’t, but they are cheap. The mistake is turning them off globally without measuring, or forgetting that ReleaseFast silently eliminates them. A developer might test only in Debug, then ship ReleaseFast and suddenly have buffer overruns that don’t crash but corrupt data. Always run your test suite in ReleaseSafe to catch bugs that survive Debug, and only switch to ReleaseFast after careful profiling.
+
+**`@setRuntimeSafety(false)` in too broad a scope.** Placing it at the top of a file disables checks for all functions within, including ones you didn’t intend. The scope is the containing block; use it only around the specific hot loop.
+
+**Confusing `std.debug.print` with logging.** `std.debug.print` writes to stderr and is not stripped even in ReleaseFast; it’s just a function call. That’s fine, but if you want compile-time elimination of verbose logs, use `std.log` with an appropriate level (see Section 7). Leaving `std.debug.print` in a ReleaseFast binary can hurt performance due to I/O and formatting cost.
+
+**Misconfiguring the build system.** Forgetting to pass `-Doptimize=ReleaseSafe` when building for production, or using `b.standardOptimizeOption(.{})` but never setting the default. Always specify a sensible default in `build.zig` via `.default_value = .ReleaseSafe`.
+
+**Debugging optimized binaries without debug info.** Zig emits debug info by default in Debug and ReleaseSafe. In ReleaseFast and ReleaseSmall, you must explicitly request it with `-g` or by setting `exe.emit_debug_info = true` in `build.zig`. Without it, variable inspection is miserable.
+
+**Reliance on `unreachable`.** Code like `var x: u32 = undefined; if (condition) x = 42; return x;` assumes `condition` is true; if it’s false, `undefined` propagates. In ReleaseFast, this is UB. Always assign a safe default or use `@panic` for truly unreachable paths.
+
+---
+
+### 6. Performance Considerations
+
+The overhead of runtime safety checks varies by workload. A typical bounds check costs a single compare and a conditional branch. On modern CPUs, correctly predicted branches are nearly free; mispredictions cost 10–20 cycles. In tight numeric loops, overflow checks on every addition can prevent autovectorization or increase instruction count. The decision to disable them must be data-driven.
+
+For example, a dense matrix multiplication loop might see a 5–15% speedup with `@setRuntimeSafety(false)`, because the compiler can then use vector instructions without spilling flags. A string parsing loop rarely benefits because the bounds checks are often subsumed by slice length checks the optimizer can eliminate.
+
+**Measurement approach:** Wrap a hot function with `std.time.Timer` and run it in ReleaseSafe and again with `@setRuntimeSafety(false)`. Only remove checks if the difference justifies the risk.
+
+`std.log` with logging levels that are elided at compile time costs zero. `std.debug.print` always executes; use it sparingly.
+
+---
+
+### 7. Best Practices
+
+1. **Default to ReleaseSafe for production**, unless you have a measured and documented reason to use ReleaseFast.
+2. **Keep `Debug` for development**, where the richer debug info and slow rebuilds are acceptable.
+3. **Use `ReleaseSmall` only when size matters** (e.g., WASM payloads, microcontrollers); be aware that safety checks are off.
+4. **Guard `@setRuntimeSafety(false)` behind a comptime check** so that debug builds still have checks:
+
+```zig
+fn critical_loop() void {
+    if (builtin.mode == .Debug) {
+        // keep checks; already slow anyway
+    } else {
+        @setRuntimeSafety(false);
+    }
+    // ...
+}
+```
+
+5. **Prefer `std.log` for diagnostics.** It integrates scopes, levels, and compile-time filtering. Define a custom log scope:
+
+```zig
+const std = @import("std");
+const log = std.log.scoped(.my_module);
+
+pub fn init() void {
+    log.info("initializing", .{});
+    log.debug("detailed state: {}", .{state}); // elided unless debug level is set
+}
+```
+
+Compile with `-Dlog-level=info` to suppress `debug` messages entirely; they become no-ops.
+
+6. **Assert early, assert often.** Use `std.debug.assert` for invariants that should hold in development and safe release. If you need them in ReleaseFast, set `debug_assert` globally, or define your own `hard_assert` that always panics.
+
+7. **Always generate debug info for ReleaseSafe binaries.** It makes profiling and post-mortem debugging feasible with negligible size increase. In `build.zig`:
+
+```zig
+exe.emit_debug_info = .{ .dwarf = .{} };
+```
+
+8. **Run your test suite in at least Debug and ReleaseSafe.** Zig’s `zig test` defaults to Debug, but you can run `zig build test -Doptimize=ReleaseSafe` to catch safety-check-dependent test logic.
+
+9. **When inspecting crashes in production**, configure the panic handler to emit structured logs (e.g., JSON with stack trace) instead of raw text.
+
+---
+
+### 8. Examples
+
+#### 8.1 Bounds check that saves you in Debug, bites you in ReleaseFast
+
+```zig
+const std = @import("std");
+
+pub fn main() void {
+    var buf: [4]u8 = undefined;
+    for (0..10) |i| {
+        buf[i] = @intCast(i); // will panic in Debug/ReleaseSafe, silent UB in ReleaseFast
+    }
+}
+```
+
+Compile and run:
+
+```
+$ zig build-exe unsafe_bounds.zig
+$ ./unsafe_bounds
+index 4 out of bounds for array of size 4
+
+$ zig build-exe unsafe_bounds.zig -O ReleaseFast
+$ ./unsafe_bounds
+# no output; writes past the array, corrupting the stack
+```
+
+To fix it, always bound-check manually if you must use ReleaseFast, or stay in ReleaseSafe.
+
+#### 8.2 Per-scope safety toggle with measured impact
+
+```zig
+const std = @import("std");
+
+fn sum_safe(slice: []const u32) u64 {
+    var total: u64 = 0;
+    for (slice) |x| total += x;
+    return total;
+}
+
+fn sum_fast(slice: []const u32) u64 {
+    @setRuntimeSafety(false);
+    var total: u64 = 0;
+    for (slice) |x| total += x;
+    return total;
+}
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const slice = try allocator.alloc(u32, 10_000_000);
+    defer allocator.free(slice);
+    @memset(slice, 1);
+
+    var timer = try std.time.Timer.start();
+    _ = sum_safe(slice);
+    const safe_ns = timer.read();
+
+    timer.reset();
+    _ = sum_fast(slice);
+    const fast_ns = timer.read();
+
+    std.debug.print("safe: {d} ns, fast: {d} ns\n", .{ safe_ns, fast_ns });
+}
+```
+
+Compile in ReleaseSafe to see the overhead; the difference is often a few percent.
+
+#### 8.3 Structured logging with compile-time filtering
+
+```zig
+const std = @import("std");
+const log = std.log.scoped(.database);
+
+pub fn main() void {
+    log.info("server starting on port {}", .{8080});   // always prints
+    log.debug("parsed config: {}", .{@as(u8, 42)});    // elided unless -Dlog-level=debug
+}
+```
+
+Compile with default (info level) and then with debug:
+
+```
+$ zig build-exe log_example.zig
+$ ./log_example
+info: server starting on port 8080
+
+$ zig build-exe log_example.zig -Dlog-level=debug
+$ ./log_example
+info: server starting on port 8080
+debug: parsed config: 42
+```
+
+#### 8.4 Debugging with GDB
+
+Assume we have a simple program `crash.zig`:
+
+```zig
+pub fn main() void {
+    const slice: []const u8 = &.{ 1, 2, 3 };
+    _ = slice[5]; // out of bounds
+}
+```
+
+Compile with debug info:
+
+```
+$ zig build-exe crash.zig -femit-bin=crash -O Debug
+$ gdb ./crash
+(gdb) run
+Program received signal SIGABRT
+(gdb) bt
+#0  ... in panic ...
+#1  ... in main ...
+(gdb) frame 1
+(gdb) list
+```
+
+The stack trace will show the exact line. For ReleaseSafe, ensure debug info is emitted (`.emit_debug_info = .{ .dwarf = .{} }` in build.zig) to get meaningful variable inspection.
+
+---
+
+### 9. Summary & Exercises
+
+Zig’s build modes give you a clear contract for safety versus performance. Debug and ReleaseSafe keep you safe; ReleaseFast and ReleaseSmall give you raw speed and small binaries. Runtime safety checks are ordinary code branches that you can toggle with `@setRuntimeSafety`. Logging via `std.log` integrates compile-time filtering, and `std.debug.assert` lets you express invariants that vanish when you need raw speed—unless you choose otherwise.
+
+**Now, prove your mastery:**
+
+1. **Measure the real cost.** Write a function that performs many array accesses (e.g., a matrix transpose) and a function that does heavy integer arithmetic (e.g., a naive Fibonacci). Profile each in ReleaseSafe and ReleaseFast. Report the difference. Then, apply `@setRuntimeSafety(false)` only around the critical loops and measure again. Is the gain worth the loss of safety in that region? Use `std.time.Timer` and document your numbers.
+
+2. **Assertion survival.** Implement a ring buffer with `push` and `pop`. Use `std.debug.assert` to check that `push` never overwrites a full buffer and that `pop` never empties an empty one. Compile your module as a library and use it in a test that runs in ReleaseSmall. By default, those assertions will be removed. Override `debug_assert` to keep them. Then, write a test that triggers an assertion failure and verify it crashes even in ReleaseSmall.
+
+3. **Custom logging backend.** Create a logging scope that writes to a file. Use `std.log` and register a custom log function via `std.log.setLogFn`. Ensure that `debug` messages are completely compiled out in ReleaseFast. Write a program that exercises different log levels, then compile with `-Dlog-level=err` and confirm that only error-level messages appear. Bonus: format the log as JSON with a timestamp.

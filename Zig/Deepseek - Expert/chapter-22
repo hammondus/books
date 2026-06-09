@@ -1,0 +1,443 @@
+## Chapter 22: Efficient Algorithms & Cache Locality
+
+Modern CPUs are fast—blindingly fast at executing instructions—but they spend much of their time waiting for data to arrive from memory. The distance between a register and main memory is measured in hundreds of cycles. Bridging this gap requires careful attention to how data is laid out and accessed. Zig gives you the tools to take full control over data layout, both at the struct level and across collections. This chapter explores the container types in the standard library that turn "cache-friendly" from an aspiration into a deliberate, verifiable property of your code.
+
+### 1. Basic Usage
+
+The standard library ships with several containers that optimize for memory locality without hiding the underlying mechanics. The three we’ll focus on are:
+
+- **`MultiArrayList`** – a Structure of Arrays (SoA) container that stores each field of a struct in a separate contiguous array.
+- **`BoundedArray`** – a fixed-capacity, stack- (or inline-) allocated array that avoids heap allocations entirely.
+- **`StaticBitSet`** – a bitset backed by an integer or integer array, providing fast membership tests and set operations with minimal footprint.
+
+Let’s start with the simplest usage patterns.
+
+#### `MultiArrayList`
+
+Imagine you have a type representing an entity in a simulation:
+
+```zig
+const Entity = struct {
+    position: [3]f32,
+    velocity: [3]f32,
+    health: u32,
+    alive: bool,
+};
+```
+
+A typical `ArrayList(Entity)` would store an array of these structs contiguously (Array of Structures, AoS). `MultiArrayList(Entity)` instead stores four separate arrays: one for all `position`, one for all `velocity`, etc. To create one:
+
+```zig
+const std = @import("std");
+const MultiArrayList = std.MultiArrayList;
+const Entity = ...;
+
+var list: MultiArrayList(Entity) = .{};
+defer list.deinit(allocator);
+try list.ensureTotalCapacity(allocator, 1000);
+```
+
+Adding an element requires providing each field separately:
+
+```zig
+try list.append(allocator, .{
+    .position = .{ 0, 0, 0 },
+    .velocity = .{ 1, 0, 0 },
+    .health = 100,
+    .alive = true,
+});
+```
+
+Alternatively, you can append an entire struct value with `appendAssumeCapacity` (after ensuring capacity) or `append` that accepts a struct. The `append` method takes an `Allocator` and a value of type `Entity` and extracts fields automatically.
+
+To read, you can get a slice for a specific field:
+
+```zig
+const positions: []const [3]f32 = list.items(.position);
+const velocities: []const [3]f32 = list.items(.velocity);
+// iterate only over positions
+for (positions) |pos| {
+    // use pos
+}
+```
+
+You can also get a single item by index as a struct:
+
+```zig
+const entity = list.get(0);
+// entity.position, entity.velocity, etc.
+```
+
+`MultiArrayList` manages capacity similarly to `ArrayList`, but because each field’s array is separately allocated, `ensureTotalCapacity` allocates one contiguous block that holds all field arrays. That block can then be sliced appropriately. This design gives you SoA storage with a convenient struct-like interface.
+
+#### `BoundedArray`
+
+`BoundedArray(T, capacity)` is an array with a fixed maximum number of elements stored directly inside the struct. It never allocates from the heap. Use it when you know the upper bound at compile time.
+
+```zig
+const BoundedArray = std.BoundedArray;
+
+var buf: BoundedArray(u8, 256) = .{};
+try buf.append('H');
+try buf.append('i');
+const slice: []const u8 = buf.constSlice();
+```
+
+`append` returns an error if the buffer is full. You can also `appendSlice` and many other slice-like operations. Its layout is simply:
+
+- a fixed-length array `buffer: [capacity]T`,
+- a length field `len: usize`.
+
+Because it’s entirely on the stack (or inline in an outer struct), there are no allocator parameters, no `defer` to free, and no pointer indirection.
+
+#### `StaticBitSet`
+
+`StaticBitSet(N)` uses a set of integers to represent a set of flags or indices up to `N`. It’s ideal for dense enum sets, tracking allocated IDs, or any situation where you need to test membership and perform union/intersection.
+
+```zig
+const BitSet = std.StaticBitSet(256);
+
+var set = BitSet.initEmpty();
+set.set(42);
+if (set.isSet(42)) {
+    // do something
+}
+set.unset(42);
+const other = BitSet.initFull();
+const intersection = set.intersectWith(other);
+```
+
+`StaticBitSet` is implemented as a `std.bit_set.IntegerBitSet` for small sizes (<= `@bitSizeOf(usize)`) and an array of integers for larger ones. All operations compile to efficient bitwise instructions.
+
+These three containers are the backbone of cache-conscious Zig code. But to use them effectively, you need to understand what the compiler and hardware do with them.
+
+### 2. Under the Hood
+
+#### Memory Layout of `MultiArrayList`
+
+`MultiArrayList` takes a struct type `S` and, at compile time, decomposes it into its fields. It allocates a single block of memory, then partitions that block into `N` sub-arrays, one per field, with appropriate alignment. The layout resembles:
+
+```
+| field0[0] | field0[1] | ... | field1[0] | field1[1] | ... | field2[0] | ...
+```
+
+This is achieved via comptime logic. The `capacity` field tracks the total number of elements. The backing store is a byte slice `bytes: []align(@alignOf(S)) u8`. Access to a field slice relies on pointer arithmetic:
+
+```zig
+fn items(self: *const Self, comptime field: Field) []FieldType(field) {
+    const offset = comptime fieldOffset(field, self.fields);
+    const ptr = @ptrCast([*]FieldType(field), @alignCast(alignment, self.bytes.ptr + offset));
+    return ptr[0..self.capacity];
+}
+```
+
+The `get(i)` method reconstructs a struct pointer by assembling a pointer-to-struct from the individual field pointers. It essentially builds a temporary struct using comptime reflection, giving you the illusion of AoS while the data lives in SoA form. Because Zig has no hidden overhead, accessing `get(i)` when you only need one field is wasteful; prefer `items(.field)` for bulk operations.
+
+#### `BoundedArray`: Inline Storage, No Indirection
+
+`BoundedArray` is a simple struct containing a `[capacity]T` array and a `len: usize`. The compiler places it directly on the stack or in the enclosing struct. There is no allocation, no pointer chasing. A loop over its elements has extremely predictable access patterns, which the CPU prefetcher can handle effortlessly.
+
+#### `StaticBitSet` and Integer Backing
+
+For sizes up to `@bitSizeOf(usize)`, `StaticBitSet` is just an integer of that width. `set`/`unset` become bitwise OR/AND with a mask, `isSet` is a bitwise AND and compare. For larger sizes, it’s an array of such integers. All operations are inlined and compile to a handful of instructions. No dynamic dispatch, no hidden function calls.
+
+The comptime engine selects the implementation at compile time based on `N`. If `N` is small, you pay for a single register; if large, you pay for a bit array. The decision is entirely under your control because you write `StaticBitSet(N)`.
+
+#### Comptime Reflection and Code Generation
+
+All three containers leverage comptime heavily. `MultiArrayList` uses `@typeInfo(S).Struct.fields` to generate per-field accessors, offsets, and alignment logic. This is the same metaprogramming we explored in Chapter 8, but applied directly to data layout. The result is a zero-cost abstraction: there is no vtable, no dynamic dispatch, no extra memory overhead beyond the fields themselves and a length.
+
+### 3. Why This Design?
+
+Zig’s choice of providing `MultiArrayList`, `BoundedArray`, and `StaticBitSet` in the standard library—instead of relying on language-level array-of-structs optimizations or JIT reordering—follows the language’s core philosophy: **Explicit is Better Than Implicit** and **No Hidden Control Flow**.
+
+- **Layout transparency**: You see the memory layout in your code. `items(.velocity)` makes it obvious you’re iterating over a contiguous slice of velocities. There is no compiler pass silently rearranging your struct fields to improve cache behavior—you decide.
+- **Comptime over runtime magic**: These containers are built with comptime reflection; they are not built-in compiler features. You could build your own variant that, say, interleaves fields differently or uses a column-major layout. Zig gives you the tools to craft the exact data structure you need, not a one-size-fits-all solution.
+- **No hidden allocations**: `BoundedArray` explicitly prohibits allocation. `MultiArrayList` requires an allocator for its backing buffer, but you pass it exactly as you would for an `ArrayList`. There’s no surprise heap traffic.
+- **Predictable performance**: Because the operations are simple and visible, you can reason about the generated machine code. `StaticBitSet` inlines to bitwise ops—no function call if you don't want one.
+
+In contrast, some languages hide SoA conversions behind compiler optimizations or library template magic that can make it difficult to predict memory access patterns. Zig forces you to be intentional, which results in code that is easier to tune and debug.
+
+### 4. Competing Approaches
+
+#### C
+
+In C, achieving SoA requires manual bookkeeping: declare separate arrays for each field and manage them in parallel. This is verbose, error-prone, and lacks type safety. For example:
+
+```c
+typedef struct {
+    float *position_x, *position_y, *position_z;
+    float *velocity_x, *velocity_y, *velocity_z;
+    uint32_t *health;
+    bool *alive;
+    size_t len, cap;
+} EntitySoA;
+```
+
+Every access demands pointer arithmetic and trust that all arrays have the same length. Zig’s `MultiArrayList` provides the same performance with a type-safe, unified interface, reducing bugs.
+
+#### C++
+
+C++ templates and the STL offer `std::vector` and libraries like `boost::multi_array` that can simulate SoA, but they lack the simplicity of comptime field reflection. Implementing a generic `MultiArrayList<T>` in C++ would require either macros, external code generation, or intricate template metaprogramming with `std::tuple` and index sequences. The result is often complex and compile-time heavy. Zig’s comptime allows expressing the logic in normal Zig code, which is far more readable.
+
+For bitsets, `std::bitset<N>` is similar to `StaticBitSet`, but C++’s version requires the size to be a compile-time constant; Zig’s is identical in that regard. However, Zig’s `StaticBitSet` can be used directly with enums via `@intFromEnum`, fitting naturally into Zig’s explicit casting style.
+
+#### Rust
+
+Rust’s standard library lacks a built-in multi-array or SoA container. The community provides crates like `soa_derive` that generate SoA structs via procedural macros. These macros generate code that is analogous to Zig’s comptime-generated container, but they hide the generation behind an opaque attribute, which can feel like magic. Rust’s `Vec<T>` stores an AoS layout. Bitsets are provided by crates like `bitvec`. Zig’s approach is more integrated and guarantees zero-cost abstraction without proc macros—just comptime.
+
+#### Go
+
+Go’s slices of structs are always AoS. There is no mechanism for SoA without writing separate slices manually. Go encourages simplicity and garbage collection, so manual cache tuning is often less of a priority. Go’s built-in `map` can be used for bitsets but with hash table overhead. Zig’s containers reflect its systems-programming focus: you control memory layout precisely, down to the bit.
+
+### 5. Common Mistakes
+
+#### Treating `MultiArrayList` Like `ArrayList`
+
+Developers used to `ArrayList(T)` often try to use `MultiArrayList` as a drop-in replacement, accessing elements via `get(i)` inside tight loops:
+
+```zig
+for (0..list.len) |i| {
+    const e = list.get(i);
+    // use e.velocity, e.position, etc.
+}
+```
+
+This reconstructs every field of the struct even if you only need one, defeating the purpose of SoA. The `get` method is there for convenience when you need a full struct, but it is not cache-optimal for bulk processing. Use `items(.field)` slices for hot paths.
+
+#### Indexing Errors with Field Slices
+
+`list.items(.position)` returns a slice indexed identically to the original element order, but you must keep track of the length correctly. It’s easy to mismatch: e.g., if you remove an element via `swapRemove`, all field slices shift accordingly. There is no per-field length; it’s a single `capacity`/`len`. Thus, you can’t have “holes” in one field’s array. If you need to delete elements while iterating another field, the indices remain consistent. This is both a feature and a pitfall; be aware that the entire set of fields is always the same size.
+
+#### Overloading Field Count
+
+`MultiArrayList` works for any struct, but it’s most beneficial when you access a subset of fields in a given loop. If your struct has a dozen fields and you often need all of them, AoS might be better because it loads a full cache line of all fields together. Using `MultiArrayList` would then touch many separate memory regions, causing more cache misses. The rule: use SoA when you have hot loops that iterate over a few fields and skip others. Measure.
+
+#### Ignoring Alignment in `BoundedArray`
+
+`BoundedArray` uses a fixed array, which may have alignment different from the natural alignment of `T` if you place it inside a packed struct. Zig's safety checks catch most misalignment, but if you're casting pointers manually, you could violate alignment. Stick to the standard API; it’s safe.
+
+#### `StaticBitSet` Size Limitations
+
+A `StaticBitSet(N)` with `N > @bitSizeOf(usize)` stores an array of integers. The number of integers is computed at comptime, and the size is fixed. There is no dynamic resizing. If you need a dynamically sized bitset, you’ll have to use `DynamicBitSet` (which allocates). The mistake is using `StaticBitSet` where the maximum size isn't known until runtime.
+
+### 6. Performance Considerations
+
+#### Cache Lines and Locality
+
+A typical cache line is 64 bytes. When you iterate over an AoS array of `Entity` (size ~36 bytes each), each access brings in all fields—position, velocity, health, alive—even if you only touch `velocity`. The cache is polluted with unused data. With SoA, iterating over `items(.velocity)` streams through contiguous `[3]f32` (12 bytes) values. A single cache line holds ~5 velocities instead of ~1.7 full entities. This can dramatically reduce cache misses and improve throughput, especially in large simulations.
+
+Benchmarks (which you should always run on your target hardware) often show speedups of 2× or more for field-selective loops on large datasets.
+
+#### Prefetching and Streaming
+
+Modern CPUs have hardware prefetchers that recognize sequential access patterns. `MultiArrayList`'s field slices present exactly such patterns. The prefetcher can anticipate future accesses and fetch cache lines ahead of time. When using AoS with a struct that has mixed-sized fields, the access stride may confuse the prefetcher. SoA’s uniform stride per field helps the prefetcher stay in lockstep.
+
+#### `BoundedArray`: Zero-Allocation Speed
+
+Because `BoundedArray` doesn’t allocate, there’s no malloc/free overhead, no cache miss to access heap metadata. The entire container fits in the stack frame or enclosing struct, making it ideal for small, short-lived collections. For example, parsing a network packet with a known maximum size: allocate a `BoundedArray(u8, 1500)` on the stack, fill it, and process it without a single heap allocation. The cost of the allocation is effectively zero, and access patterns are as good as a normal array.
+
+#### `StaticBitSet` vs. `std.AutoHashMap` for Sets
+
+For enum sets or dense integer keys, `StaticBitSet` often outperforms hash-based sets. A hash table incurs hashing, collision resolution, and pointer chasing. A bitset uses one bit per element, fits entirely in L1 cache for moderate sizes, and set operations like union are trivial bitwise operations. When the key domain is small and dense, bitsets are the clear winner.
+
+#### Profiling with `perf` and Zig Build Flags
+
+To validate your cache optimizations, use hardware performance counters. On Linux:
+
+```bash
+perf stat -e cache-references,cache-misses ./my_program
+```
+
+Zig’s build system makes it easy to inject profiling instrumentation. For example, you can add `-fno-omit-frame-pointer` for better call stacks, or `-g` for debug symbols:
+
+```bash
+zig build-exe -O ReleaseFast -fno-omit-frame-pointer src/main.zig
+```
+
+Use `perf record` and `perf report` to pinpoint cache-miss hotspots. The standard library’s containers are designed to produce simple, predictable assembly, making it straightforward to correlate profile results with source code.
+
+### 7. Best Practices
+
+- **Use `MultiArrayList` when you have many objects and most hot loops touch only a subset of fields.** Classic examples: particle systems (position & velocity, but not color), entity-component systems (process health, not appearance). Always benchmark both AoS and SoA for your specific access patterns.
+- **Avoid `get(i)` in performance-critical loops.** Pre-extract a field slice with `items(.field)` outside the loop and iterate over that slice. This ensures contiguous access.
+- **Prefer `BoundedArray` for small, bounded collections.** Use it when the maximum size is known at compile time and is relatively small (a few hundred elements). It eliminates allocator overhead and improves locality by keeping data in the same cache line as the container struct.
+- **Use `StaticBitSet` for sets of flags, small IDs, or enum values.** Its simplicity and minimal memory footprint make it ideal for tracking used slots, implementing bloom filters (with multi-hash), or keeping track of dirty flags in a cache system.
+- **In tests, use `std.testing.allocator` to catch memory leaks when using `MultiArrayList` with dynamic allocators.**
+- **When using `MultiArrayList`, align its capacity growth with `ensureTotalCapacity` to avoid reallocation of the entire multi-field buffer.** Reallocation moves all field arrays, but thanks to the single contiguous allocation, it’s just one `realloc`.
+- **Consider packing fields in `MultiArrayList` to minimize padding.** Zig’s default struct layout adds padding; you can use `packed struct` inside `MultiArrayList` if you truly want to eliminate padding between fields, but be aware of alignment penalties. Often it’s better to keep natural alignment for SIMD performance.
+
+### 8. Examples
+
+#### Example 1: Particle System with SoA vs. AoS
+
+This example compares iteration over 1 million particles, updating only position based on velocity. We’ll measure roughly (simulate measurement) to illustrate the concept.
+
+```zig
+const std = @import("std");
+const MultiArrayList = std.MultiArrayList;
+const ArrayList = std.ArrayList;
+const time = std.time;
+const testing = std.testing;
+
+const Particle = struct {
+    position: [3]f64,
+    velocity: [3]f64,
+    mass: f64,
+    charge: f64,
+};
+
+fn updateAoS(particles: []Particle, dt: f64) void {
+    for (particles) |*p| {
+        p.position[0] += p.velocity[0] * dt;
+        p.position[1] += p.velocity[1] * dt;
+        p.position[2] += p.velocity[2] * dt;
+    }
+}
+
+fn updateSoA(list: *MultiArrayList(Particle), dt: f64) void {
+    const pos = list.items(.position);
+    const vel = list.items(.velocity);
+    for (pos, vel) |*p, v| {
+        p[0] += v[0] * dt;
+        p[1] += v[1] * dt;
+        p[2] += v[2] * dt;
+    }
+}
+
+test "compare AoS vs SoA cache behavior" {
+    const allocator = testing.allocator;
+    const n = 1_000_000;
+    const dt = 0.016;
+
+    // AoS version
+    var aos_list = ArrayList(Particle).init(allocator);
+    defer aos_list.deinit();
+    try aos_list.ensureTotalCapacity(n);
+    for (0..n) |_| {
+        aos_list.appendAssumeCapacity(.{
+            .position = .{ 0, 0, 0 },
+            .velocity = .{ 1, 0, 0 },
+            .mass = 1,
+            .charge = 0,
+        });
+    }
+
+    // SoA version
+    var soa_list = MultiArrayList(Particle){};
+    defer soa_list.deinit(allocator);
+    try soa_list.ensureTotalCapacity(allocator, n);
+    for (0..n) |_| {
+        soa_list.appendAssumeCapacity(.{
+            .position = .{ 0, 0, 0 },
+            .velocity = .{ 1, 0, 0 },
+            .mass = 1,
+            .charge = 0,
+        });
+    }
+
+    // Warm up cache (not measured)
+    var timer = try time.Timer.start();
+    updateAoS(aos_list.items, dt);
+    const aos_time = timer.lap();
+    timer.reset();
+    updateSoA(&soa_list, dt);
+    const soa_time = timer.lap();
+
+    // In a real test, assert soa_time < aos_time for large n
+    _ = aos_time;
+    _ = soa_time;
+    // std.debug.print("AoS: {}ns, SoA: {}ns\n", .{ aos_time, soa_time });
+}
+```
+
+The SoA version accesses only `position` and `velocity` slices, which are contiguous and small per element, leading to better cache utilization. The AoS version loads the entire 40-byte struct for each iteration, including `mass` and `charge` that are not used.
+
+#### Example 2: Fixed-Size Packet Parser with `BoundedArray`
+
+Parse a network packet header of exactly 20 bytes without allocation:
+
+```zig
+const std = @import("std");
+const BoundedArray = std.BoundedArray;
+
+const Header = packed struct {
+    version: u4,
+    ihl: u4,
+    dscp: u6,
+    ecn: u2,
+    total_length: u16,
+};
+
+fn parseHeader(bytes: []const u8) !Header {
+    if (bytes.len < 20) return error.InvalidHeader;
+    var buf: BoundedArray(u8, 20) = .{};
+    try buf.appendSlice(bytes[0..20]);
+    const slice = buf.constSlice();
+    return @bitCast(slice[0..@sizeOf(Header)].*);
+}
+
+test "parse header from bounded array" {
+    const raw = [_]u8{0x45, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    const header = try parseHeader(&raw);
+    try std.testing.expectEqual(@as(u4, 4), header.version);
+    try std.testing.expectEqual(@as(u4, 5), header.ihl);
+}
+```
+
+No allocator needed; the entire packet copy lives on the stack. This is trivially inlineable and exceptionally fast.
+
+#### Example 3: `StaticBitSet` for Capability Flags
+
+```zig
+const std = @import("std");
+const StaticBitSet = std.StaticBitSet;
+
+const Capability = enum(u5) {
+    read,
+    write,
+    execute,
+    delete,
+    admin,
+    _,
+};
+
+fn hasCapability(set: StaticBitSet(32), cap: Capability) bool {
+    return set.isSet(@intFromEnum(cap));
+}
+
+test "capability check with bitset" {
+    var caps = StaticBitSet(32).initEmpty();
+    caps.set(@intFromEnum(Capability.read));
+    caps.set(@intFromEnum(Capability.write));
+
+    try std.testing.expect(hasCapability(caps, .read));
+    try std.testing.expect(!hasCapability(caps, .execute));
+}
+```
+
+The set of capabilities fits in a single 32-bit integer, so all operations compile to bitwise instructions. There’s no loop, no branch misprediction.
+
+### 9. Summary & Exercises
+
+Efficient algorithms on modern hardware require data structures that play nicely with cache hierarchies. Zig gives you explicit control:
+
+- **`MultiArrayList`** applies the Structure-of-Arrays transformation via comptime, keeping field slices contiguous and cache-friendly when you process a subset of fields.
+- **`BoundedArray`** provides heap-less, fixed-capacity storage, ideal for small, bounded data where allocation overhead is unacceptable.
+- **`StaticBitSet`** offers extremely compact and fast set operations for small, dense domains, using bare integer or array-of-integers backends.
+
+Always verify your cache optimizations with hardware performance counters. Use `perf` and Zig’s build flags to confirm your assumptions.
+
+#### Exercises
+
+1. **Build a Particle Simulation Benchmark**
+   Implement a system with at least 1 million particles, each having position, velocity, acceleration, mass, and color. Benchmark frame update time:
+   - Version A: `ArrayList(Particle)` updating only position and velocity.
+   - Version B: `MultiArrayList(Particle)` accessing only `.position` and `.velocity` slices.
+   Measure cache misses with `perf stat -e cache-misses`. Compare and explain results.
+
+2. **Stack-Allocated Ring Buffer with `BoundedArray`**
+   Implement a generic ring buffer (circular queue) that uses a `BoundedArray` for storage. It should support `push` and `pop` without any heap allocation. Ensure it works for any type `T` and a compile-time fixed capacity. Provide a test that demonstrates wrapping behavior.
+
+3. **Optimizing a Flag-Heavy State Machine**
+   You have a state machine with 64 boolean flags per state. Using `StaticBitSet(64)`, implement functions that transition between states by toggling flags. Then, implement the same logic with an `AutoHashMap(Flag, bool)`. Benchmark both for transition throughput and memory footprint. Explain why the bitset outperforms the hash map.

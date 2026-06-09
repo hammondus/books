@@ -1,0 +1,383 @@
+# Chapter 15: Stack vs. Heap Memory
+
+---
+
+Memory in Zig is not an abstract resource hidden behind a runtime; it is a physical, finite set of address ranges with distinct performance characteristics. The seasoned engineer knows that *where* data lives—stack or heap—determines latency, lifetime, fragmentation, and correctness guarantees. Zig gives you the tools to enforce the placement of every byte, but it does not make the decision for you. This chapter dissects the stack/heap duality, shows how Zig’s allocator interface lets you treat the stack as a heap when needed, and explores patterns for writing functions that never touch the heap.
+
+---
+
+## 1. Basic Usage
+
+### Stack Allocation
+
+Local variables declared with `var` or `const` inside a function live on the stack by default. Zig does not perform escape analysis that silently promotes stack allocations to the heap; if you return a pointer to a stack variable, you get a dangling pointer. The compiler may warn or error depending on the situation, but the rule is absolute: the stack frame dies when the function returns.
+
+```zig
+const std = @import("std");
+
+fn stackDemo() void {
+    const x: u32 = 42;             // stack
+    var buf: [256]u8 = undefined;  // stack
+    _ = x;
+    _ = buf;
+}
+```
+
+You can pass stack-allocated buffers to functions that expect slices. As long as the callee does not retain a reference beyond its own stack frame, this is safe and allocation-free.
+
+```zig
+fn process(comptime N: usize, input: [N]u8) void {
+    // Operate entirely on the stack-allocated array.
+    var local: [N]u8 = input;
+    local[0] += 1;
+    // ...
+}
+```
+
+### Heap Allocation via Allocator
+
+Heap memory is obtained explicitly by calling methods on an `std.mem.Allocator`: `alloc`, `allocAdvanced`, `create`, `realloc`, `free`. There is no `new` operator, no implicit boxing. The allocation is always visible at the call site.
+
+```zig
+pub fn heapDemo(allocator: std.mem.Allocator) !void {
+    const slice = try allocator.alloc(u8, 1024);
+    defer allocator.free(slice);
+    // use slice
+}
+```
+
+### FixedBufferAllocator: Stack-Backed Heap
+
+`std.heap.FixedBufferAllocator` wraps a stack-allocated byte array and exposes the `Allocator` interface. This lets you use heap-oriented APIs (e.g., `std.ArrayList`) without a single call to `malloc`. The "heap" is a region carved out of your stack frame. Once the FixedBufferAllocator goes out of scope, all memory it gave out is invalid—just like the stack.
+
+```zig
+const std = @import("std");
+
+test "FixedBufferAllocator on stack" {
+    var buffer: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buffer);
+    const allocator = fba.allocator();
+
+    var list = std.ArrayList(u8).init(allocator);
+    defer list.deinit(); // This does not free memory; it just resets the backing store.
+
+    try list.appendSlice("hello");
+    // No heap allocation occurred; everything lives in `buffer`.
+}
+```
+
+### Avoiding Allocation Entirely
+
+You can write functions that take pre-allocated output buffers from the caller. This is the "whoever allocates, passes it in" pattern. It works for any data structure that can be parameterized over a byte slice.
+
+```zig
+fn renderMessage(out: []u8, name: []const u8) ![]const u8 {
+    return try std.fmt.bufPrint(out, "Hello, {s}!", .{name});
+}
+```
+
+The caller decides where `out` lives—stack, static, or heap—and the function imposes no allocation.
+
+---
+
+## 2. Under the Hood
+
+### Stack: A Fixed-Size Frame Per Invocation
+
+When a Zig function is called, the compiler allocates a stack frame whose size is known at compile time (for direct calls; for indirect calls via function pointers, the ABI ensures frames are compatible). Zig targets LLVM or the self-hosted backends, both of which lower function prologues to adjusting the stack pointer (`rsp` on x86_64, `sp` on ARM). All local variables with compile-time-known size live at fixed offsets from the frame pointer or stack pointer. Zig's stack grows downward on most architectures. There is no guard page insertion by the compiler; stack overflow is undefined behavior. You can set the stack size via linker flags or by spawning threads with `std.Thread.SpawnConfig` where you can specify `stack_size`.
+
+Arrays and structs allocated on the stack are embedded directly into the frame. A `[1024]u8` simply reserves 1024 bytes of stack space. There is no pointer indirection unless you take the address of the variable. The compiler may optimize temporaries into registers, but semantically the data is stack-resident.
+
+Because the stack frame layout is deterministic and known at compile time, addressing stack variables uses base+offset, which is often a single `mov` instruction or folded into a memory operand. There is no runtime bookkeeping, no free list, no cache pressure from metadata.
+
+### Heap: Indirect, Dynamic, Book-kept
+
+A heap allocation in Zig goes through the `Allocator` interface. That interface is a struct containing a function pointer and an opaque context pointer (`*anyopaque`). The function pointers are typically `allocFn`, `resizeFn`, `freeFn`. At runtime, calling `allocator.alloc(T, n)` does:
+
+1. Compute the byte count (`n * @sizeOf(T)`).
+2. Call the underlying implementation, which may be `std.heap.page_allocator` (directly uses `mmap`/`VirtualAlloc`), `GeneralPurposeAllocator` (maintains buckets and freelists), `c_allocator` (wraps `malloc`/`free`), or a custom arena.
+3. Return a `[]T` and possibly an error.
+
+The returned slice points to a region of virtual memory that the OS or the allocator has reserved. The allocator internally tracks which regions are free, typically via intrusive metadata (size prefixed before the allocation, freelists embedded in free chunks, or out-of-band page maps). This metadata imposes overhead in space (often 8–16 bytes per allocation) and time (searching freelists, splitting/coalescing).
+
+### `FixedBufferAllocator` Internals
+
+A `FixedBufferAllocator` does not call the OS. It stores a pointer to the underlying buffer, an index marking the current allocation frontier, and a boolean indicating whether to fall back to a backing allocator (the default is no fallback). When `alloc` is called, it bumps the index by the requested size (plus alignment padding) and returns a slice from that offset. `free` is a no-op (or, in some versions, resets the index if the pointer is the last allocated). This is essentially a bump-pointer allocator operating on a fixed memory region. Because the buffer is a stack-allocated array, the entire "heap" lives in the caller's stack frame, making it illegal to use after the function returns.
+
+The performance is extremely high: an allocation is a few integer additions and a bounds check. Deallocation is negligible. Fragmentation? None—until you can't satisfy a request due to out-of-order frees. It is ideal for temporary allocations that follow a stack discipline.
+
+---
+
+## 3. Why This Design?
+
+Zig forces you to confront the stack/heap distinction because it refuses to hide allocation. In languages with garbage collection, all objects are heap-allocated (or escape-analyzed) and the runtime manages stack references transparently. In C++, RAII with constructors/destructors can allocate on the heap inside a constructor without the caller being syntactically aware. Zig believes that *allocation is a side effect that must be visible and intentional*.
+
+Why not provide a built-in `ArrayList` that allocates internally via a global allocator? Because that would hide control flow (allocations can fail), hide memory lifetime (who frees the list? when?), and prevent you from using the list in a `no_std` environment or with a custom allocator. By requiring an `Allocator` parameter, Zig makes the storage policy explicit and testable.
+
+The stack is the default. Zig's syntax and standard library encourage stack allocation whenever possible. The compiler does not try to move things to the heap for you, so you never encounter surprises where a "local variable" causes an OOM because the runtime decided to box it. This gives the programmer absolute control and aligns with systems programming needs: you know exactly what will fit in L1 cache and what will trigger a page fault.
+
+---
+
+## 4. Competing Approaches
+
+### C
+
+C has automatic (stack) and dynamic (`malloc`/`free`) storage. It too allows stack-allocated arrays via VLAs (variable-length arrays) that Zig does not support because VLAs are error-prone and not required; Zig prefers explicit `alloca`-style via `FixedBufferAllocator` or compile-time known sizes. C does not have an allocator interface; you call `malloc` directly, making it difficult to swap allocation strategies. Zig's `Allocator` vtable is a direct improvement, enabling arena, stack, and page-backed allocators to be used uniformly without changing code.
+
+### Rust
+
+Rust defaults to stack allocation for values that implement `Copy` or are moved. Boxed values (`Box<T>`, `Vec<T>`) heap-allocate implicitly. The `Box` type is a smart pointer that allocates internally, but the allocation call is still explicit (you write `Box::new(...)`). Rust's ownership system ensures that when a `Box` goes out of scope, its destructor runs and frees the heap memory. Zig lacks destructors, so you must explicitly call `defer allocator.free(...)` or rely on an arena's bulk deallocation. This is a deliberate trade-off: Zig avoids hidden control flow at drop points, but places the burden of pairing alloc/free on the programmer. Rust's `Vec` allocates, but you don't pass an allocator; there is a global allocator set via `#[global_allocator]`. Zig's explicitness allows arena-local vectors without changing the type, which Rust requires custom allocator APIs or nightly features.
+
+### Go
+
+Go has a stack that can grow and shrink (split stacks), and the compiler performs escape analysis to decide whether a value goes to the heap. You do not explicitly choose. This is convenient but opaque; performance-critical code often resorts to `sync.Pool` or pre-allocated slices to control allocation, losing the simplicity. Zig says: "You are the escape analyzer."
+
+### C++
+
+C++ provides `std::vector`, `std::string`, and smart pointers that allocate from the free store. RAII ties heap lifetime to scope. Move semantics and `unique_ptr` mitigate leaks. C++ also allows placement `new` to construct objects in a provided buffer, similar to Zig's `FixedBufferAllocator`. However, C++'s standard library is heavily reliant on global `operator new`, and custom allocators are notoriously complex (allocator-aware containers). Zig’s approach—passing an allocator as an explicit parameter—sidesteps the allocator propagation problem entirely. Every function that may allocate documents it in the signature.
+
+---
+
+## 5. Common Mistakes
+
+### 1. Returning a Pointer to a Stack Variable
+
+A classic error in any systems language. Zig's compiler (via LLVM) often warns about returning the address of a local, but it is not a hard error in all cases. Example:
+
+```zig
+fn broken() *const u32 {
+    const val: u32 = 42;
+    return &val;
+}
+```
+
+This compiles with a warning; runtime access is undefined behavior. To avoid it, never return slices or pointers that derive from local variables unless the caller passed in the backing storage.
+
+### 2. Using `FixedBufferAllocator` Beyond Its Lifetime
+
+```zig
+fn handler() ![]u8 {
+    var buf: [256]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const ally = fba.allocator();
+    return try ally.alloc(u8, 128);
+}
+```
+
+The returned slice references `buf` on the stack, which is invalid after return. This is exactly like returning a pointer to a local. The `FixedBufferAllocator` does not magically extend the lifetime; it merely provides the `Allocator` interface.
+
+### 3. Confusing `defer` Cleanup with `FixedBufferAllocator`
+
+When you use a `FixedBufferAllocator` with a container like `ArrayList`, calling `defer list.deinit()` is necessary to run the destructor-like logic (e.g., freeing any heap memory if the list had spilled to a backing allocator). But with a pure `FixedBufferAllocator`, `deinit` just resets the internal state; the memory is still valid until the function returns. If you want to reuse the buffer in a loop, you should call `fba.reset()` rather than relying on `deinit` of individual containers.
+
+### 4. Over-Allocating on the Stack
+
+Large stack allocations (megabytes) risk stack overflow, which is undefined behavior and often silent until a guard page is hit. Use `GeneralPurposeAllocator` or `page_allocator` for large buffers. A safe rule: stack-allocated arrays larger than a few kilobytes should be scrutinized. Zig does not have a built-in split stack like Go; a recursive function with a 64 KB stack frame can overflow quickly.
+
+### 5. Misusing `@sizeOf` for Allocation Size
+
+When calling `allocator.alloc(T, n)`, the size is `n * @sizeOf(T)`. A common mistake is to pass a byte length instead of element count, leading to huge allocations. Use `allocAdvanced` with a specific alignment and size when you need byte-level control, but be explicit about types.
+
+---
+
+## 6. Performance Considerations
+
+### Stack Allocation: Zero-Cost Abstraction
+
+Allocating on the stack involves nothing more than moving the stack pointer. On x86_64, `sub rsp, 0x1000` allocates 4096 bytes in one instruction. No branches, no locks, no cache misses (except potentially for the stack cache lines that will be touched). Access patterns exhibit excellent spatial and temporal locality because the stack frame is contiguous and frequently accessed. The CPU’s return stack buffer predicts function returns, keeping the pipeline full.
+
+However, very large stack frames (> page size) may cause the OS to fault in guard pages, leading to a minor page fault. This is a one-time cost, but repeated large-stack calls in recursion can accumulate.
+
+### Heap Allocation: Latency and Fragmentation
+
+A heap allocation typically involves a library call that traverses a data structure to find a free block. `malloc` in glibc uses per-thread arenas and freelists; it’s fast on average but suffers from lock contention in multithreaded programs (though modern allocators reduce this). `GeneralPurposeAllocator` in Zig uses thread-local caches and bucketed sizes, providing amortized O(1) performance with low contention. However, worst-case allocation can involve `sbrk`/`mmap`, which enters the kernel and possibly zeroes memory. The performance is unpredictable compared to stack allocation.
+
+Deallocation can be even more costly: `free` might merge adjacent free blocks and update freelists. With `ArenaAllocator`, deallocation is deferred to the entire arena destruction, so individual `free` calls are no-ops, drastically improving throughput at the cost of peak memory usage.
+
+### `FixedBufferAllocator`: The Sweet Spot
+
+The bump-pointer approach of `FixedBufferAllocator` is almost as fast as raw stack allocation. It is a thread-local, bounded, non-moving allocator with allocation costing a few instructions. It shines in scenarios where you need many small allocations with a known lifetime (e.g., processing an HTTP request). The downside is that you cannot free individual items out of order; if you need fine-grained deallocation, you’ll need a more sophisticated allocator (or store free lists manually). But for many patterns—parsing, building temporary data structures, string formatting—it eliminates the overhead of the general-purpose heap entirely.
+
+### Cache Locality
+
+Data allocated on the stack is tightly packed with other local variables, leading to high cache density. Heap allocations scatter data across memory unless you use a slab or arena that places related allocations contiguously. A `FixedBufferAllocator` creates a contiguous region of related objects, which is cache-friendly. Conversely, a `page_allocator` may return far-apart pages, causing TLB pressure and cache misses.
+
+### Avoiding the Allocator Vtable Overhead
+
+Calling `allocator.alloc()` involves an indirect call. In hot loops, this overhead can be significant. Zig encourages using `allocator.allocAdvanced` and typed allocation functions that often inline. You can also pass a comptime-known allocator type and use `@fieldParentPtr` tricks to monomorphize, but typically the vtable indirection is acceptable. If you are writing a function that should be alloc-free, don't take an allocator at all; require a pre-allocated buffer or a `*FixedBufferAllocator` directly.
+
+---
+
+## 7. Best Practices
+
+### 1. Pass Allocators Explicitly and Sparingly
+
+Functions that allocate should accept an `Allocator` parameter as the first or last argument. Follow the standard library’s convention: often the allocator is the first parameter (e.g., `std.ArrayList.init(allocator)`). If a function can be implemented without allocation, write the alloc-free version and provide a convenience wrapper that allocates. For example, `std.fmt.allocPrint` allocates, but `std.fmt.bufPrint` writes into a caller-provided buffer.
+
+### 2. Use `FixedBufferAllocator` for Scoped, Temporary Workloads
+
+When you know a function’s memory requirements are bounded and short-lived, embed a `FixedBufferAllocator`. This avoids global heap contention and guarantees no leaks. The pattern:
+
+```zig
+fn processRequest(arena_buf: []u8, input: []const u8) !Result {
+    var fba = std.heap.FixedBufferAllocator.init(arena_buf);
+    const ally = fba.allocator();
+    // ... allocate freely ...
+    // no free() calls needed; everything is invalid after return.
+}
+```
+
+`arena_buf` can be supplied by the caller (stack or heap). This makes the function testable and embeddable in no-std environments.
+
+### 3. Embrace the "Buffer Sink" Pattern
+
+Functions that need to produce variable-length output should take a `writer` or a mutable slice `[]u8` and return a slice of the used portion. This lets the caller decide where the buffer lives. The standard library’s `std.fmt.bufPrint`, `std.io.Writer.writeAll`, and many `format` methods follow this. It eliminates allocations, simplifies error handling (no out-of-memory errors, just `error.NoSpaceLeft`), and is trivially portable.
+
+### 4. Stack-Allocate Structs Containing Heap References Carefully
+
+A struct on the stack may hold a slice that points to heap memory. When the struct goes out of scope, the heap memory is not freed automatically. Use `defer` to clean up, or ensure the struct's lifetime is tied to the same arena. For example, `std.ArrayList` owns a heap buffer; always call `deinit()`.
+
+### 5. Use `errdefer` for Heap Allocations in Error Paths
+
+If you allocate multiple resources, use `errdefer` to free already-allocated ones on failure. This is not stack-specific but crucial when mixing stack and heap lifetimes. For instance:
+
+```zig
+fn init(ally: Allocator) !Foo {
+    const a = try ally.alloc(u8, 100);
+    errdefer ally.free(a);
+    const b = try ally.alloc(u8, 200);
+    return Foo{ .a = a, .b = b };
+}
+```
+
+Because `errdefer` only runs on error, the success path does not prematurely free.
+
+### 6. Use `@compileLog` to Verify Allocations at Comptime
+
+You can use comptime reflection to assert that a function never calls an allocator, if you control the implementation. This is advanced, but it demonstrates the philosophy: you can enforce allocation policies at compile time.
+
+### 7. Prefer `MultiArrayList` and Struct-of-Arrays Over Arrays of Structs on the Heap
+
+When performance matters, organizing data for cache efficiency often means storing fields in separate arrays. `std.MultiArrayList` gives you that layout while managing a single heap allocation (or it can use your allocator). This is a heap allocation pattern, but it's worth noting alongside stack considerations: the same locality concerns apply.
+
+---
+
+## 8. Examples
+
+### Example 1: HTTP Request Parser Using Only the Stack
+
+This example parses a fixed-size header buffer without any heap allocation. It uses `std.fmt.bufPrint` and `std.mem.split` to extract fields.
+
+```zig
+const std = @import("std");
+
+fn parseContentLength(buf: [*]const u8, len: usize) !u32 {
+    // Search in-place
+    const header = "Content-Length: ";
+    const start = std.mem.indexOf(u8, buf[0..len], header) orelse return error.MissingHeader;
+    const val_start = start + header.len;
+    const val_end = std.mem.indexOfScalar(u8, buf[val_start..len], '\r') orelse len;
+    const val = buf[val_start .. val_start + val_end];
+    return std.fmt.parseInt(u32, val, 10);
+}
+
+pub fn main() !void {
+    const request = "GET / HTTP/1.1\r\nContent-Length: 42\r\n\r\n";
+    // All stack-allocated, no heap.
+    var buf: [128]u8 = undefined;
+    @memcpy(buf[0..request.len], request);
+    const len = request.len;
+
+    const cl = try parseContentLength(&buf, len);
+    std.debug.print("Content-Length: {}\n", .{cl});
+}
+```
+
+All data is on the stack. No allocator parameter needed.
+
+### Example 2: Stack-Backed `std.ArrayList` for Building a Response
+
+Here we construct a dynamic string using `ArrayList`, but backed entirely by a FixedBufferAllocator on the stack. This eliminates heap allocations while providing the convenience of dynamic resizing up to the buffer limit.
+
+```zig
+const std = @import("std");
+
+fn buildResponse(arena_buf: []u8, name: []const u8) ![]const u8 {
+    var fba = std.heap.FixedBufferAllocator.init(arena_buf);
+    const ally = fba.allocator();
+
+    var list = std.ArrayList(u8).init(ally);
+    // defer list.deinit(); not necessary in pure FBA but good for hygiene.
+    errdefer list.deinit();
+
+    try list.appendSlice("Hello, ");
+    try list.appendSlice(name);
+    try list.appendSlice("!");
+
+    return list.toOwnedSlice(); // Returns a slice into the arena.
+}
+
+test "stack-backed ArrayList" {
+    var buf: [256]u8 = undefined;
+    const greeting = try buildResponse(&buf, "World");
+    try std.testing.expectEqualStrings("Hello, World!", greeting);
+    // buf is still valid; greeting points inside buf.
+}
+```
+
+### Example 3: Alloc-Free Function with Caller-Provided Output Buffer
+
+A typical pattern for parsers or serializers that want to be embeddable in any context (freestanding, WASM, OS kernel). The function never touches the heap.
+
+```zig
+fn intToAsciiHex(val: u32, out: []u8) ![]const u8 {
+    const hex_chars = "0123456789ABCDEF";
+    var idx: usize = out.len;
+    var v = val;
+    if (val == 0) {
+        out[0] = '0';
+        return out[0..1];
+    }
+    while (v != 0) : (v >>= 4) {
+        idx -= 1;
+        if (idx == 0) return error.NoSpaceLeft;
+        out[idx] = hex_chars[v & 0xF];
+    }
+    return out[idx..];
+}
+
+test "intToAsciiHex" {
+    var buf: [8]u8 = undefined;
+    const result = try intToAsciiHex(0x1A3F, &buf);
+    try std.testing.expectEqualStrings("1A3F", result);
+}
+```
+
+The function doesn’t even accept an allocator—it works on raw stack memory.
+
+---
+
+## 9. Summary & Exercises
+
+### Summary
+
+- Zig puts **stack allocation** front and center. Local variables, arrays, and structs are stack-resident by default.
+- Heap allocation is **explicit** and **visible** through the `Allocator` interface. No hidden boxing.
+- `FixedBufferAllocator` allows **heap-like APIs** (e.g., `ArrayList`) to operate entirely on the stack, providing dynamic sizing with the safety and speed of stack memory.
+- Writing **alloc-free functions** that take pre-allocated buffers is idiomatic Zig; it guarantees no memory failures, simplifies testing, and is essential for constrained environments.
+- Understanding the compiler’s stack frame allocation and the cost model of heap allocation (vtable indirection, freelist traversal, fragmentation) is crucial for systems-level performance tuning.
+
+### Exercises
+
+1. **Build a zero-alloc command parser.**
+   Write a function `parseCommand(input: []const u8, tokens: []Token, out: *Command) !void` that fills a `Command` struct (command name and arguments) by tokenizing the input directly into a caller-supplied `tokens` buffer. The function must not allocate, not use an allocator, and handle missing tokens gracefully. Use `std.mem.tokenizeAny` and manual copying. Test edge cases like empty input, single-word commands, and trailing whitespace.
+
+2. **Implement a stack-based memory pool for fixed-size objects.**
+   Design a `StackPool(T, capacity)` that stores `capacity` objects of type `T` in a stack-allocated array (using `[capacity]T`). Expose `acquire() ?*T` (returning a pointer to an unused slot) and `release(*T)` that marks the slot free. The pool must work without any heap allocation. Implement it so that `acquire` and `release` are O(1) using a free-list within the unused slots themselves. Write tests that exhaust the pool and verify that released slots are reused. This is a common pattern in embedded systems.
+
+3. **Profile stack vs. heap allocation of many small objects.**
+   Write a benchmark that creates 10,000 small structs (e.g., `struct { id: u32, value: f64 }`) and performs a simple computation on them. Implement three variants:
+   - a) Allocate them all on the heap using `GeneralPurposeAllocator`.
+   - b) Allocate them on the stack as a large fixed array.
+   - c) Use a `FixedBufferAllocator` with `alloc` in a loop.
+   Measure and compare the wall-clock time and CPU instructions (using `perf stat` or Zig’s `std.time.Timer`). Explain the differences: instruction count, cache misses, and allocation overhead. What happens if you increase the struct size to 4096 bytes? Discuss the implications for real-time systems where jitter from `malloc` is unacceptable.

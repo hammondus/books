@@ -1,0 +1,624 @@
+# Chapter 23: Comptime for Performance
+
+The heart of Zig’s performance story isn’t just about generating fast machine code—it’s about **doing less at runtime**. Comptime gives you the ability to precompute, pre-validate, and specialize your program’s logic so that the hot path contains only what’s absolutely necessary. This chapter explores how to transform compile-time execution from a convenience feature into a performance weapon.
+
+## 1. Basic Usage
+
+At its simplest, using `comptime` for performance means moving computation from runtime to compile time. Here are three fundamental patterns:
+
+### Precomputed Lookup Tables
+
+```zig
+const std = @import("std");
+
+// Generate a sine lookup table at compile time
+fn buildSineTable(comptime size: usize) [size]f32 {
+    var table: [size]f32 = undefined;
+    const step = 2.0 * std.math.pi / @as(f32, size);
+    for (0..size) |i| {
+        const angle = @as(f32, i) * step;
+        table[i] = @sin(angle);
+    }
+    return table;
+}
+
+pub fn main() void {
+    comptime var table = buildSineTable(256);
+    // table is now a compile-time constant array
+    // The entire computation happens at compile time
+    std.debug.print("sin(π/2) ≈ {d}\n", .{table[64]});
+}
+```
+
+### Unrolled Loops with `inline`
+
+```zig
+fn dotProduct(comptime N: comptime_int, a: [N]f32, b: [N]f32) f32 {
+    var sum: f32 = 0.0;
+    inline for (0..N) |i| {
+        sum += a[i] * b[i];
+    }
+    return sum;
+}
+
+// Generates N fully-unrolled multiplies and adds
+const result = dotProduct(4, [_]f32{1, 2, 3, 4}, [_]f32{5, 6, 7, 8});
+```
+
+### Compile-Time Validation
+
+```zig
+const Config = struct {
+    buffer_size: usize,
+    max_connections: u16,
+
+    pub fn validate(comptime self: @This()) void {
+        if (self.buffer_size < 512) {
+            @compileError("buffer_size must be at least 512 bytes");
+        }
+        if (self.max_connections > 10000) {
+            @compileError("max_connections exceeds system limit");
+        }
+    }
+};
+
+pub fn main() void {
+    const config: Config = .{
+        .buffer_size = 1024,
+        .max_connections = 2000,
+    };
+    config.validate(); // Compile-time validation, zero runtime cost
+}
+```
+
+## 2. Under the Hood
+
+Understanding comptime’s performance benefits requires knowing how the compiler actually executes Zig code at compile time.
+
+### The Comptime Interpreter
+
+Zig’s self-hosted compiler (from 0.11 onward) uses a **bytecode interpreter** for comptime execution. When the compiler encounters a `comptime` expression or comptime-known value:
+
+1. The **ZIR (Zig Intermediate Representation)** is lowered to a simpler bytecode format
+2. A specialized interpreter executes this bytecode, tracking values as either *comptime-known* or *runtime-known*
+3. All memory allocations during comptime use a special allocator that can produce compile-time constants
+4. The interpreter supports the full Zig language except for a few runtime-only constructs (e.g., calling external C functions)
+
+### Constant Propagation and Folding
+
+The compiler aggressively propagates comptime values. Consider:
+
+```zig
+const X = 10;
+const Y = 20;
+var z = X + Y;  // z becomes comptime-known as 30
+```
+
+The addition happens at compile time even without an explicit `comptime` keyword because both operands are comptime-known. This is **constant folding**, the simplest form of comptime optimization.
+
+### Memory Representation of Comptime Data
+
+Comptime-known values are stored in the compiler’s **constant pool**—a region of the binary that becomes read-only data (`.rodata` section on ELF targets). When a comptime-generated array like `buildSineTable(256)` is referenced, the compiler:
+
+1. Computes the entire array during ZIR interpretation
+2. Serializes the resulting bytes into the constant pool
+3. Emits references to that memory location wherever the array is used
+
+There’s **zero runtime initialization cost**—the data is already in your binary, ready to be memory-mapped or loaded as part of the program’s static data.
+
+### Inline Loop Expansion
+
+The `inline for` and `inline while` constructs work by **unrolling at the AST level**. The compiler conceptually:
+
+1. Duplicates the loop body for each iteration
+2. Replaces loop variable references with the comptime-known index
+3. Applies further constant folding to each unrolled copy
+
+This happens before most optimizations, allowing LLVM (or the self-hosted backend) to see a straight-line sequence of operations and apply aggressive instruction-level optimizations.
+
+## 3. Why This Design?
+
+Zig’s approach to comptime for performance deliberately avoids creating a separate “macro” or “template” language. The reasons are both philosophical and practical.
+
+### No New Language to Learn
+
+C++ `constexpr` functions look like C++ but have severe restrictions (no dynamic allocation until C++14, no `goto`, no `reinterpret_cast` until later versions). Rust’s `const fn` is similarly constrained. Zig’s comptime **is just Zig**—you can use any language feature, including allocation, loops, recursion, and even `@call`. This means the performance patterns you learn work the same way in both domains.
+
+### Single Evaluation Model
+
+In C++, `constexpr` and templates are separate metaprogramming systems with different syntaxes and rules. Zig unifies everything: if a value is comptime-known, functions called with it can be executed at compile time. There’s no separate “template instantiation” mechanism—just `comptime` parameters and the normal function call semantics.
+
+### Runtime/Comptime Parity
+
+Because comptime execution uses the same semantics as runtime, you can **test comptime code at runtime**. This is invaluable for performance-critical metaprogramming:
+
+```zig
+fn generateLookupTable(comptime size: usize) [size]u32 {
+    var table: [size]u32 = undefined;
+    for (0..size) |i| {
+        table[i] = i * i;
+    }
+    return table;
+}
+
+test "lookup table generation" {
+    // Same function works at test time
+    const table = generateLookupTable(10);
+    try std.testing.expectEqual(table[3], 9);
+}
+```
+
+This eliminates the “macro debugging hell” common in C and C++.
+
+### Predictable Performance Model
+
+Unlike C++ templates that can generate massive code bloat through implicit instantiation, Zig’s comptime requires explicit opt-in. The `inline` keyword makes loop unrolling visible. The cost of comptime computation is paid exactly where you request it, and the compiler provides tools (`-ftime-report` in the self-hosted backend) to measure it.
+
+## 4. Competing Approaches
+
+### C Preprocessor Macros
+
+```c
+#define SQUARE(x) ((x) * (x))
+#define GENERATE_TABLE(size) \
+    static const int table[size] = { \
+        [0 ... size-1] = something \
+    }
+```
+
+**Problems for performance**: Macros are textual substitution, leading to double-evaluation bugs, lack of type safety, and impossible debugging. They cannot perform complex computations—just token replacement. For precomputed tables, C developers resort to external code generation scripts (e.g., a Python script that emits C source).
+
+### C++ `constexpr` and Templates
+
+```cpp
+template<int N>
+constexpr std::array<float, N> buildTable() {
+    std::array<float, N> table{};
+    for (int i = 0; i < N; ++i)
+        table[i] = std::sin(2.0 * M_PI * i / N);
+    return table;
+}
+```
+
+**Trade-offs**: C++17/20 `constexpr` now supports loops and allocation (with restrictions). However, `constexpr` functions cannot contain `goto`, `try`/`catch`, `asm`, or `static` variables. Template metaprogramming is a separate, Turing-complete but syntactically painful system. Compile times explode due to repeated instantiation. Zig’s unified model avoids these distinctions.
+
+### Rust `const fn` and Procedural Macros
+
+```rust
+const fn build_table<const N: usize>() -> [f32; N] {
+    let mut table = [0.0; N];
+    let mut i = 0;
+    while i < N {
+        table[i] = (2.0 * std::f32::consts::PI * i as f32 / N as f32).sin();
+        i += 1;
+    }
+    table
+}
+```
+
+**Rust’s approach**: `const fn` is growing but remains limited (no `for` loops with ranges until recent versions, no trait methods in const contexts). For complex metaprogramming, Rust requires procedural macros (separate crates, different syntax, runtime execution in the compiler). Zig’s comptime is more powerful and integrated.
+
+### Go Code Generation
+
+```go
+//go:generate ./scripts/generate_table.go
+```
+
+**Go’s philosophy**: Use external tools and `go generate` to produce `.go` files. This forces separate build steps, breaks IDE integration, and introduces a foreign language (often Go itself, but could be anything) into the build. Zig’s comptime keeps everything in Zig, with no extra tooling.
+
+### Why Zig Wins for Performance
+
+Zig’s comptime gives you **type-safe, debuggable, testable** compile-time computation without leaving the language. The performance benefits come without build-system complexity or learning a second metaprogramming paradigm.
+
+## 5. Common Mistakes
+
+### Mistake 1: Accidental Runtime Execution
+
+```zig
+fn badLookup(x: usize) u32 {
+    var table = generateLookupTable(256); // Oops! No comptime
+    return table[x];
+}
+```
+
+Without `comptime` or a compile-time-known argument, `generateLookupTable` runs **every time `badLookup` is called**, recomputing the entire table. The fix:
+
+```zig
+fn goodLookup(x: usize) u32 {
+    comptime var table = generateLookupTable(256);
+    return table[x];
+}
+```
+
+Or better:
+
+```zig
+const TABLE = generateLookupTable(256);
+fn goodLookup(x: usize) u32 {
+    return TABLE[x];
+}
+```
+
+### Mistake 2: Compile-Time Explosion
+
+```zig
+// Don't do this for N > 1000
+inline for (0..N) |i| {
+    for (0..M) |j| {
+        runtime_array[i][j] = comptime_generated[i][j];
+    }
+}
+```
+
+`inline for` unrolls completely. An `inline for` inside another loop (even a runtime loop) creates massive code bloat. Use `inline` only when the iteration count is **small and known at compile time** (e.g., unrolling a 3x3 matrix multiply).
+
+### Mistake 3: Relying on Side Effects
+
+```zig
+var counter: usize = 0;
+comptime {
+    counter += 1; // This counter is a comptime variable!
+}
+```
+
+At comptime, variables are isolated from the runtime state. The `counter` above exists only during compilation. If you need to pass information from comptime to runtime, return it explicitly.
+
+### Mistake 4: Not Using `comptime` on Function Parameters
+
+```zig
+// Suboptimal: N is runtime even if caller knows it
+fn genericMatrixMul(comptime T: type, N: usize, a: [N][N]T, b: [N][N]T) [N][N]T { ... }
+```
+
+If `N` is known at compile time at the call site, mark it `comptime`:
+
+```zig
+fn betterMatrixMul(comptime T: type, comptime N: usize, a: [N][N]T, b: [N][N]T) [N][N]T
+```
+
+This enables loop unrolling and constant propagation inside the function.
+
+### Mistake 5: `comptime`-Heavy Code That Never Optimizes Hot Paths
+
+```zig
+// Wastes compile time for no runtime benefit
+const huge_config = generateHugeConfigFile(); // 1MB of JSON parsed at comptime
+```
+
+If the generated data is large but accessed sparsely, you may increase binary size without improving performance. Always measure.
+
+## 6. Performance Considerations
+
+### Compile Time vs. Runtime Time
+
+The fundamental trade-off: **compilation seconds vs. runtime nanoseconds**. A comptime-generated 256‑entry sine table saves 256 `sin()` calls at startup (maybe 10 microseconds). That’s negligible. But a comptime‑unrolled 8x8 matrix multiply can eliminate loop overhead in a hot inner loop, saving cycles.
+
+**When to optimize with comptime**:
+- The computation is **constant across all program runs**.
+- The result is **small enough** not to bloat the binary (e.g., kilobytes, not megabytes).
+- The runtime computation would be **measurably expensive** (floating-point transcendentals, complex data structure construction).
+- The unrolled loop eliminates **branch mispredictions** or enables **SIMD vectorization**.
+
+**When to avoid comptime**:
+- The data is large (e.g., 1MB lookup table) and rarely accessed—prefer runtime construction or memory-mapped files.
+- The computation depends on configuration that changes per deployment (use a build script or config file).
+- Compile time becomes prohibitive (benchmark with `-ftime-report`).
+
+### Binary Size Impact
+
+Every comptime-generated value stored in the constant pool increases binary size. For lookup tables, this is intentional. For accidental `comptime` arrays, it’s waste. Use `std.mem.len` and `@sizeOf` to estimate impact:
+
+```zig
+const table = buildSineTable(4096);
+std.debug.print("Binary size contribution: {} bytes\n", .{@sizeOf(@TypeOf(table))});
+```
+
+### Measuring Comptime Execution
+
+Zig’s self-hosted compiler (used by default from 0.12+) supports time reporting:
+
+```bash
+zig build-exe -ftime-report main.zig
+```
+
+Look for lines like:
+```
+Comptime execution:  0.123s
+  - function evals:  0.089s
+  - type resolution: 0.034s
+```
+
+If comptime exceeds 10% of total compilation, consider optimizing.
+
+### When the Backend Takes Over
+
+Remember that LLVM (or the self-hosted backend) does its own constant folding and loop unrolling. Sometimes a `for` loop with comptime-known bounds will be unrolled automatically. Use `inline` only when:
+- You need to guarantee unrolling (e.g., to avoid branch predictor training).
+- The loop body contains operations that benefit from per-iteration specialization.
+- You’re generating code like Duff’s device that requires specific instruction ordering.
+
+Otherwise, let the optimizer do its job. **Measure before inlining**.
+
+### Comptime Allocation Overhead
+
+During comptime, allocations (via allocators like `std.heap.page_allocator`) are **real allocations in the compiler process**. A function that allocates 1GB at comptime will crash the compiler. Keep comptime allocations modest—typically less than 100MB total.
+
+## 7. Best Practices
+
+### Prefer `const` for Comptime-Known Values
+
+```zig
+const BUF_SIZE = 4096;  // Implicitly comptime-known
+const TABLE = generateTable(256); // Computed at compile time
+```
+
+Use `comptime var` only when you need to mutate a comptime value.
+
+### Use Comptime Parameters for Generic Performance
+
+```zig
+fn matrixMultiply(comptime T: type, comptime N: usize,
+                  a: [N][N]T, b: [N][N]T) [N][N]T {
+    var result: [N][N]T = undefined;
+    inline for (0..N) |i| {
+        inline for (0..N) |j| {
+            var sum: T = 0;
+            inline for (0..N) |k| {
+                sum += a[i][k] * b[k][j];
+            }
+            result[i][j] = sum;
+        }
+    }
+    return result;
+}
+```
+
+This generates fully unrolled, type-specialized code for each `(T, N)` instantiation.
+
+### Separate Generation from Access
+
+```zig
+const LookupTable = struct {
+    data: [256]f32,
+
+    pub fn init(comptime self: @This()) @This() {
+        // Comptime initialization logic
+    }
+
+    pub fn get(self: @This(), x: usize) f32 {
+        // Runtime access
+        return self.data[x];
+    }
+};
+```
+
+This pattern keeps the hot path (access) free of comptime overhead while still allowing offline precomputation.
+
+### Validate at Comptime, Not Runtime
+
+```zig
+pub fn runServer(comptime config: Config) !void {
+    config.validate(); // Compile-time check
+    // ... runtime code that can assume config is valid
+}
+```
+
+If configuration is known at compile time (e.g., from `build.zig`), validate it then. This eliminates error-handling branches and `if` checks in the hot path.
+
+### Use Comptime to Generate Tests
+
+```zig
+fn testAllSizes(comptime T: type, comptime max_size: usize) void {
+    inline for (1..max_size+1) |size| {
+        test "vector addition size " ++ std.fmt.comptimePrint("{d}", .{size}) {
+            const a = [_]T{1} ** size;
+            const b = [_]T{2} ** size;
+            const result = vectorAdd(a, b);
+            try std.testing.expect(result[0] == 3);
+        }
+    }
+}
+```
+
+This generates a separate test for each size, catching edge cases at compile time.
+
+## 8. Examples
+
+### Example 1: Compile-Time CRC32 Table
+
+```zig
+const std = @import("std");
+
+fn buildCrc32Table() [256]u32 {
+    var table: [256]u32 = undefined;
+    const polynomial: u32 = 0xEDB88320;
+
+    for (0..256) |i| {
+        var crc: u32 = @intCast(i);
+        for (0..8) |_| {
+            crc = if (crc & 1 == 1) (crc >> 1) ^ polynomial else crc >> 1;
+        }
+        table[i] = crc;
+    }
+    return table;
+}
+
+const CRC32_TABLE = buildCrc32Table();
+
+fn crc32(data: []const u8) u32 {
+    var crc: u32 = 0xFFFFFFFF;
+    for (data) |byte| {
+        const idx = @as(usize, @intCast((crc ^ byte) & 0xFF));
+        crc = (crc >> 8) ^ CRC32_TABLE[idx];
+    }
+    return ~crc;
+}
+
+pub fn main() !void {
+    const data = "Hello, World!";
+    const hash = crc32(data);
+    std.debug.print("CRC32: {x}\n", .{hash});
+}
+```
+
+**Build and run**:
+```bash
+zig build-exe crc32.zig
+./crc32
+```
+
+The CRC32 table is computed at compile time, avoiding 256×8 bit operations at runtime.
+
+### Example 2: Compile-Time Finite State Machine
+
+```zig
+const std = @import("std");
+
+const State = enum { Idle, Reading, Writing, Closing };
+
+const Event = enum {
+    StartRead,
+    StartWrite,
+    DataReady,
+    Error,
+    Close,
+};
+
+fn buildTransitionTable() [@typeInfo(State).Enum.fields.len][@typeInfo(Event).Enum.fields.len]State {
+    const state_count = @typeInfo(State).Enum.fields.len;
+    const event_count = @typeInfo(Event).Enum.fields.len;
+    var table: [state_count][event_count]State = undefined;
+
+    // Initialize all transitions to a default (e.g., stay in same state)
+    for (0..state_count) |s| {
+        for (0..event_count) |e| {
+            table[s][e] = @as(State, @enumFromInt(s));
+        }
+    }
+
+    // Define specific transitions
+    table[@intFromEnum(State.Idle)][@intFromEnum(Event.StartRead)] = State.Reading;
+    table[@intFromEnum(State.Idle)][@intFromEnum(Event.StartWrite)] = State.Writing;
+    table[@intFromEnum(State.Reading)][@intFromEnum(Event.DataReady)] = State.Reading;
+    table[@intFromEnum(State.Reading)][@intFromEnum(Event.Error)] = State.Closing;
+    table[@intFromEnum(State.Writing)][@intFromEnum(Event.Close)] = State.Closing;
+    table[@intFromEnum(State.Closing)][@intFromEnum(Event.Close)] = State.Idle;
+
+    return table;
+}
+
+const TRANSITION_TABLE = buildTransitionTable();
+
+fn nextState(current: State, event: Event) State {
+    return TRANSITION_TABLE[@intFromEnum(current)][@intFromEnum(event)];
+}
+
+pub fn main() void {
+    var state = State.Idle;
+    state = nextState(state, Event.StartRead);
+    state = nextState(state, Event.DataReady);
+    state = nextState(state, Event.Error);
+    state = nextState(state, Event.Close);
+
+    std.debug.print("Final state: {s}\n", .{@tagName(state)});
+}
+```
+
+This generates a complete transition matrix at compile time, eliminating any conditional logic in `nextState`.
+
+### Example 3: Compile-Time Constrained Generic Container
+
+```zig
+const std = @import("std");
+
+pub fn BoundedArray(comptime T: type, comptime max_size: usize) type {
+    if (max_size == 0) @compileError("max_size must be positive");
+    if (max_size > 1024) @compileError("max_size exceeds 1024 (performance limit)");
+
+    return struct {
+        const Self = @This();
+        data: [max_size]T = undefined,
+        len: usize = 0,
+
+        pub fn push(self: *Self, value: T) !void {
+            if (self.len >= max_size) return error.OutOfBounds;
+            self.data[self.len] = value;
+            self.len += 1;
+        }
+
+        pub fn get(self: *const Self, index: usize) !T {
+            if (index >= self.len) return error.OutOfBounds;
+            return self.data[index];
+        }
+
+        pub fn slice(self: *const Self) []const T {
+            return self.data[0..self.len];
+        }
+    };
+}
+
+pub fn main() !void {
+    var buf = BoundedArray(u32, 10){};
+    try buf.push(42);
+    try buf.push(100);
+
+    std.debug.print("Values: {any}\n", .{buf.slice()});
+}
+```
+
+The comptime constraints (`max_size` bounds checking, type validation) happen at compile time, producing a specialized type with no runtime overhead for those checks.
+
+## 9. Summary & Exercises
+
+Comptime for performance is about **shifting work left**—into the compiler, into the binary’s static data, and away from the hot path. The key insights:
+
+- **Precompute** any value that’s independent of runtime inputs.
+- **Unroll** small loops with `inline` to eliminate branch overhead.
+- **Validate** configuration and constraints at compile time to remove error checks.
+- **Generate** specialized code for type-size combinations you actually use.
+
+But with great power comes great responsibility. Each `inline` loop, each comptime-generated megabyte, and each deep recursion in comptime increases compilation time and binary size. Always measure the runtime benefit against the compile-time cost.
+
+### Exercises
+
+**Exercise 1: Prime Sieve at Compile Time**
+
+Write a comptime function `sieve(comptime N: usize)` that returns a `[N]bool` array where `true` indicates a prime number. The function should compute the sieve of Eratosthenes entirely at compile time. Then write a runtime function `printPrimes(comptime N: usize)` that uses the comptime-generated sieve to print all primes up to N. Benchmark the difference between a runtime sieve and your comptime version for `N = 100000`.
+
+**Expected output structure**:
+```zig
+const std = @import("std");
+
+fn Sieve(comptime N: usize) type {
+    // Return a struct with a const is_prime array
+}
+
+pub fn main() void {
+    const primes = Sieve(1000);
+    // Print primes using primes.is_prime
+}
+```
+
+**Exercise 2: Compile-Time printf Validator**
+
+Implement a `comptime_printf(comptime format: []const u8, args: anytype)` function that:
+- Validates at compile time that the number and types of arguments match the format specifiers (`{}`, `{d}`, `{s}`, `{x}`).
+- Generates a runtime-optimized formatting function that doesn’t re-parse the format string.
+- Returns a `[]u8` allocated with a provided allocator.
+
+**Constraints**: Use comptime type reflection (`@typeInfo(@TypeOf(args))`) to iterate through tuple fields. Produce `@compileError` messages that point to the exact mismatch (e.g., `"Expected integer for specifier {d} at position 2, got string"`).
+
+**Exercise 3: Lock-Free Ring Buffer Generator**
+
+Create a comptime function `RingBuffer(comptime T: type, comptime size: usize)` that generates a lock-free SPSC (single-producer, single-consumer) ring buffer type. The generated code should:
+
+- Use `size` as a power-of-two for efficient modulo via bitmask.
+- Statically assert that `size` is a power of two at compile time.
+- Use comptime-generated `@atomicLoad` and `@atomicStore` operations.
+- Provide `write` and `read` functions that inline the necessary index arithmetic.
+
+**Performance requirement**: The generated buffer should have no branches in the fast path (only `& (size-1)` masking and atomic operations). Compare the performance of your generated buffer against a runtime-parameterized version using `std.time.Timer`.
+
+---
+
+*In the next chapter, we’ll explore how Zig’s memory model and threading primitives enable explicit, high-performance concurrency—without the hidden overhead of green threads or async runtimes.*

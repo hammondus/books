@@ -1,0 +1,366 @@
+## Chapter 4. Variables, Constants, and Types
+
+### 1. Basic Usage
+
+Zig’s variable declarations are explicit, unambiguous, and free of hidden control flow. Every binding is either mutable (`var`) or immutable (`const`). The type can be written explicitly or inferred with `:` + a value.
+
+```zig
+const std = @import("std");
+
+pub fn main() !void {
+    // Explicitly typed, immutable binding
+    const port: u16 = 8080;
+
+    // Type inference – comptime-known value determines type
+    const max_connections = 1024;   // comptime_int (see "Under the Hood")
+
+    // Mutable binding
+    var active_connections: u32 = 0;
+    active_connections += 1;
+
+    // `const` does NOT mean "value is immutable" – it means "binding is immutable"
+    const slice = &[_]u8{ 1, 2, 3 };
+    slice[0] = 42;  // ✅ the *data* can be mutated; only the pointer is const
+
+    // Zero-sized types have no runtime representation
+    const void_instance: void = {};
+
+    // Undefined initialization (explicit, not automatic)
+    var temperature: i32 = undefined;
+    temperature = 25;  // must be set before use in safe modes
+
+    // Comptime-known constants are evaluated at compile time
+    const ARRAY_SIZE = 256;
+    var buffer: [ARRAY_SIZE]u8 = undefined;
+
+    // `comptime` keyword forces compile-time evaluation
+    comptime const secret = 42;
+}
+```
+
+**Key syntax rules:**
+- `const` for immutable *bindings*, not immutable data.
+- Type after colon: `name: type = value`.
+- Inference uses `: value` – the colon signals that the type is derived from the value.
+- `undefined` is explicit; there is no default zero initialization for locals.
+- `comptime_int` and `comptime_float` are arbitrary-precision types that vanish after compilation.
+
+---
+
+### 2. Under the Hood
+
+#### Memory Representation and Type System
+
+Zig’s type system is **fully determined at compile time**. Every type has a known size (`@sizeOf(T)`), alignment (`@alignOf(T)`), and layout.
+
+```zig
+const TypeInfo = @typeInfo(u32);
+// .Int = .{ .bits = 32, .signedness = .unsigned }
+```
+
+**`comptime_int` and friends**: When you write `const x = 1024;`, Zig does not immediately pick `i32` or `u16`. Instead, `x` is a `comptime_int` – an abstract integer that can hold any value known at compile time. Only when `x` is used in a runtime context (e.g., passed to a function expecting `u32`) does Zig coerce it to a concrete type. This avoids unnecessary overflow and arbitrary width decisions.
+
+**Zero-sized types** (`void`, structs with no fields, arrays of length 0) occupy zero bits. The compiler optimizes them away entirely – they do not affect stack layout or argument passing.
+
+**`undefined` vs. `unreachable`**: `undefined` is a legal value for any type. Reading it in `Debug` and `ReleaseSafe` modes triggers safety checks (usually a panic). In `ReleaseFast`/`ReleaseSmall`, reading `undefined` is unchecked – it may produce arbitrary bit patterns. The compiler uses `undefined` to enable optimizations: writing `var x: u8 = undefined;` tells the compiler “I will set this before use; do not zero-initialize.”
+
+**Binding vs. mutability**: Zig distinguishes between the *binding* (`const` vs. `var`) and the *pointee* (if the type is a pointer). `const ptr: *u8 = ...` means the pointer variable cannot be reassigned, but `ptr.*` can be mutated. This is exactly opposite of C’s `const int *` (pointer to const) vs. `int * const` (const pointer). Zig uses the same keyword for both purposes – the rule is: `const` applies to the *immediate* thing being declared.
+
+```zig
+const a: *u8 = ...;   // a is immutable pointer to mutable u8
+var b: *const u8 = ...; // b is mutable pointer to immutable u8
+```
+
+**Stack allocation**: All local variables are stack-allocated by default (unless their address escapes to the heap via an allocator). Zig does not have “automatic storage duration” surprises – the compiler never secretly moves a variable to the heap.
+
+---
+
+### 3. Why This Design?
+
+**Explicit mutability reduces cognitive load**: In C, `const` is optional and often omitted. In Go, every variable is mutable unless you use a pointer trick. Zig forces you to choose: `var` or `const`. A reviewer can see at a glance which bindings change.
+
+**No default initialization eliminates hidden writes**: C++ default-initializes fundamental types to indeterminate values (which is undefined behavior to read). Rust initializes everything, even if you overwrite it immediately. Zig says: if you write `var x: u32;` (without `= undefined` or a value), it is a compile error. The only way to get uninitialized memory is explicit `= undefined`. This prevents the class of bugs where you accidentally read a default-zero value that was never meant to be zero.
+
+**`comptime_int` preserves precision**: In most languages, `const x = 1024 * 1024 * 1024;` would overflow a 32-bit int at runtime if you later use it in a 32-bit context. Zig stores the exact value as a `comptime_int` and only checks overflow when you force a concrete type (e.g., `@as(u32, x)` or passing to a `u32` parameter). This eliminates subtle truncation bugs.
+
+**No implicit casting**: Zig never coerces `u16` to `u32` without an explicit cast (`@as` or `@intCast`). This is deliberate: widening conversions are safe but they obscure the programmer’s intent. In systems code, you often need to know exactly when and where integer sizes change.
+
+**`const` pointer semantics**: Zig’s rule (`const` applies to binding, not pointee by default) matches how most programmers think: “I want a variable that holds a pointer, but I don’t want to change which pointer it is.” To get a pointer-to-const, you write `*const T` – the `const` is part of the type, not the binding. This orthogonality eliminates the confusion of C’s spiral rule.
+
+---
+
+### 4. Competing Approaches
+
+| Language | Mutability Default | Zero Init? | Implicit Casting? | Const Semantics |
+|----------|--------------------|------------|-------------------|------------------|
+| **Zig** | `var` (explicit) | No – explicit `undefined` | No (except `comptime_int`→concrete) | `const` binds variable; `*const T` for pointer-to-const |
+| **C** | Implicit `int` (mutable) | No (indeterminate = UB) | Yes (implicit promotions) | `const int *` vs `int * const` – different |
+| **Rust** | `let` (immutable default) `let mut` | No – `MaybeUninit` | No (explicit `as` or `into`) | `let` rebinds; `&T` immutable ref, `&mut T` mutable |
+| **Go** | `:=` mutable (except string) | Yes (zero value) | Limited (numeric conversions explicit) | `const` doesn’t exist for locals (only `const` for constants) |
+| **Python** | Always mutable (rebinding) | `None` (but it’s a value) | Dynamic typing – implicit | No concept |
+
+**C**: The biggest source of bugs is implicit integer promotion and default `int`. Zig’s `comptime_int` and explicit casting solve this. C also has no `undefined` literal – you use uninitialized variables at your own peril.
+
+**Rust**: Rust’s immutable-by-default is philosophically different: it encourages functional style and prevents data races. Zig chooses explicitness over safety-by-default – Zig trusts the programmer to use `var` when needed. Both languages avoid implicit casts, but Rust’s numeric conversions require `as` or `From` traits, similar to Zig’s `@intCast`.
+
+**Go**: Go’s zero values are convenient but dangerous: an uninitialized mutex or pointer is usable (often leading to nil panics). Zig’s `undefined` makes the uninitialized state explicit and forces you to either initialize or accept the risk. Go also lacks local `const` for variables – everything is mutable unless it’s a `const` (compile-time) constant.
+
+**C++**: Inherits C’s problems plus adds complex initialization rules (default constructors, zero-initialization for static storage). Zig’s rule is trivial: you either provide a value, write `undefined`, or the compiler rejects it.
+
+---
+
+### 5. Common Mistakes
+
+**Mistake 1: Confusing `const` binding with immutable data**
+```zig
+const buf: [4]u8 = .{ 1, 2, 3, 4 };
+buf[0] = 99;  // ✅ Compiles – modifies the array data
+```
+The binding `buf` cannot be reassigned to a different array, but the array elements are mutable. To make elements immutable, you need `const` elements in the type: `const buf: [4]const u8 = ...` (but array elements cannot be individually `const`; instead use a slice: `const slice: []const u8 = &buf`).
+
+**Mistake 2: Forgetting that `undefined` bypasses safety checks in ReleaseFast**
+```zig
+var x: u8 = undefined;
+if (x == 0) { ... }  // In Debug: crashes with safety panic. In ReleaseFast: may spuriously succeed.
+```
+Always initialize before reading in performance-critical code, or use `std.debug.assert` to verify.
+
+**Mistake 3: Using `comptime_int` where runtime value is needed**
+```zig
+fn readByte() u8 { return 42; }
+const y = readByte();  // Error: cannot store runtime value in const with comptime type
+```
+`const y = readByte();` fails because `readByte()` returns a runtime `u8`. Fix: use type annotation or let inference pick runtime type: `const y: u8 = readByte();` or `var y = readByte();`. Zig does not implicitly demote `comptime_int` to a runtime type.
+
+**Mistake 4: Assuming `var` gives you uninitialized memory**
+```zig
+var counter: u32;  // Compile error: variable must be initialized or set to undefined
+```
+Many beginners expect `var counter: u32;` to be zero or indeterminate. Zig rejects it outright – forcing you to write `= undefined` if you truly want uninitialized.
+
+**Mistake 5: Overusing `undefined` for performance**
+```zig
+var large_buf: [1024*1024]u8 = undefined;  // Fine, but you must set every byte before reading
+```
+In embedded contexts, `undefined` is useful to avoid clearing memory. However, forgetting to initialize a single byte leads to garbage. Prefer `std.mem.zeroes` or `@memset` for safety unless benchmarks prove initialization is a bottleneck.
+
+---
+
+### 6. Performance Considerations
+
+**Cost of `undefined`**: Using `undefined` does not generate any code – it’s purely a compiler hint. The variable occupies stack space, but no store instruction is emitted to initialize it. This can save cycles in tight loops where you immediately overwrite the variable.
+
+**`comptime_int` has zero runtime cost**: All operations on `comptime_int` happen during compilation. The final binary contains only the coerced concrete values.
+
+**Type size and alignment**: Choosing the smallest type that fits (`u8` vs `u64`) reduces memory bandwidth and cache pressure. Zig’s lack of implicit casting forces you to think about this:
+```zig
+var index: usize = 0;
+while (index < len) : (index += 1) { ... }  // `usize` is correct for indexing
+```
+Using `usize` (pointer-width integer) avoids sign-extension and overflow checks on many architectures.
+
+**Alignment matters**: The compiler respects `@alignOf(T)` when laying out structs and stack variables. Unaligned access is either slower (x86) or traps (ARM). Zig provides `@alignCast` to override when you know alignment is larger, but misaligned `undefined` variables can cause subtle performance degradation.
+
+**Zero-sized types**: Zero-sized types (including empty structs and `void`) are completely elided from stack frames and argument lists. You can pass a `void` value in a function call – the calling convention may pass it in a register or ignore it entirely.
+
+**Initialization vs. assignment**: Zig does not have constructors. A declaration `var x: T = value;` is a *copy* of `value` into `x`’s stack slot. For large structs, this is a `memcpy`. To avoid the copy, use pointers or rely on the compiler’s optimizations (which are good but not guaranteed). Manual `@memcpy` can be more predictable.
+
+**Example benchmark impact**: On x86_64, initializing a `[64]u8` array with `undefined` vs `std.mem.zeroes`:
+- `undefined`: zero assembly stores – the array contains whatever was on the stack.
+- `zeroes`: emits 8 `mov` instructions (64 bytes) or a `rep stosq` in Debug mode.
+For latency-critical code, avoiding zero initialization yields measurable gains. For security, zeroing may be required (Zig does not automatically zero for you – you must decide).
+
+---
+
+### 7. Best Practices
+
+**Always prefer `const` unless mutation is required**:
+```zig
+const allocator = std.heap.page_allocator;  // ✅ immutable binding
+var counter: u32 = 0;                       // ✅ only when necessary
+```
+
+**Use explicit types at API boundaries**:
+```zig
+pub const MAX_PATH = 260;           // ✅ comptime_int – fine for public constants
+pub fn setPort(port: u16) void {    // ✅ explicit type in signature
+    // ...
+}
+```
+Inside a function, inference is encouraged: `const buf = try allocator.alloc(u8, size);`
+
+**Name compile-time constants in SCREAMING_SNAKE_CASE**:
+```zig
+const DEFAULT_BUFFER_SIZE = 4096;
+const PI: f64 = 3.141592653589793;
+```
+This convention distinguishes them from runtime variables.
+
+**Use `undefined` only when you will immediately overwrite**:
+```zig
+var temp: [256]u8 = undefined;
+const n = try file.read(&temp);
+const valid_data = temp[0..n];  // Only n bytes are initialized
+```
+
+**Never use `undefined` for sentinel values**:
+```zig
+const SENTINEL: u8 = undefined;  // ❌ Reading this is unsafe
+const SENTINEL: u8 = 0xff;       // ✅
+```
+
+**Leverage `comptime` for type-safe constants**:
+```zig
+const TABLE_SIZE = 1024;
+const Entry = struct { key: u32, value: u32 };
+var table: [TABLE_SIZE]Entry = undefined;  // TABLE_SIZE known at compile time
+```
+
+**Prefer `usize` for lengths and indices** unless you have a specific reason to use a smaller type (e.g., network protocol field).
+
+**Initialize with defaults using a helper** when you cannot use `undefined`:
+```zig
+fn initCounter() u32 { return 0; }
+var c = initCounter();  // Clear intent, no hidden zeroing overhead (inlined)
+```
+
+**Use `@as` for explicit coercion** rather than relying on comptime inference when the coercion is non-obvious:
+```zig
+const x: u64 = 0xffff_ffff_ffff_ffff;
+const y = @as(u32, @truncate(x));  // Clear that truncation occurs
+```
+
+---
+
+### 8. Examples
+
+#### Example 1: Type inference and `comptime_int` in action
+
+```zig
+const std = @import("std");
+
+pub fn main() !void {
+    // These are all comptime_int
+    const a = 42;
+    const b = 0xdeadbeef;
+    const c = 1 << 60;
+
+    // Coercion to concrete type – note explicit cast
+    const a_u8: u8 = @intCast(a);      // OK, 42 fits
+    const b_u32: u32 = @intCast(b);    // 0xdeadbeef fits in u32
+    // const bad: u16 = @intCast(c);   // Would panic at compile time (out of range)
+
+    // Runtime values require explicit type
+    const random = try std.crypto.random.int(u64);
+    const random_u32 = @as(u32, @intCast(random & 0xffff_ffff));
+
+    std.debug.print("a_u8={}, b_u32=0x{X}, random_u32=0x{X}\n", .{ a_u8, b_u32, random_u32 });
+}
+```
+
+#### Example 2: Mutable pointer vs. immutable binding
+
+```zig
+const std = @import("std");
+
+pub fn main() !void {
+    var value: u32 = 100;
+    const ptr = &value;      // ptr is *u32 (immutable binding to mutable pointer)
+    ptr.* += 1;              // ✅ modifies value
+
+    // ptr = &other;         // ❌ cannot reassign ptr (const binding)
+
+    var other: u32 = 200;
+    var mut_ptr = &other;    // mut_ptr is *u32 (mutable binding)
+    mut_ptr.* += 1;          // ✅ modifies other
+    mut_ptr = &value;        // ✅ reassign to point to value
+    mut_ptr.* += 10;         // now value becomes 111 (100+1+10)
+
+    // Pointer-to-const example
+    const ro_ptr: *const u32 = &value;
+    // ro_ptr.* = 999;       // ❌ cannot modify through *const T
+    const deref = ro_ptr.*;  // ✅ read-only
+
+    std.debug.print("value={}, other={}\n", .{ value, other });
+}
+```
+
+#### Example 3: `undefined` with safety check
+
+```zig
+const std = @import("std");
+
+pub fn main() !void {
+    var x: u8 = undefined;
+
+    // In Debug or ReleaseSafe, this triggers a panic:
+    // "attempt to use undefined value"
+    // std.debug.print("x={}\n", .{x});
+
+    // Proper usage: overwrite before read
+    x = 42;
+    std.debug.print("x={}\n", .{x}); // OK
+
+    // Partial initialization of array
+    var buf: [10]u8 = undefined;
+    for (&buf, 0..) |*b, i| {
+        if (i < 5) b.* = @intCast(i);
+        // indices 5-9 remain undefined
+    }
+    // Reading buf[5] later would be unsafe – design must track initialized length
+}
+```
+
+#### Example 4: Zero-sized type elision
+
+```zig
+const std = @import("std");
+
+const Empty = struct {};
+
+pub fn main() !void {
+    const e1: Empty = .{};
+    const e2: Empty = .{};
+
+    std.debug.print("size of Empty: {}\n", .{@sizeOf(Empty)});  // prints 0
+    std.debug.print("address of e1: 0x{X}\n", .{@intFromPtr(&e1)});
+    std.debug.print("address of e2: 0x{X}\n", .{@intFromPtr(&e2)});
+    // The addresses may be identical (or stack pointer unchanged) because both occupy no space.
+
+    // Array of zero-sized types also has zero size
+    var arr: [100]Empty = undefined;
+    std.debug.print("size of [100]Empty: {}\n", .{@sizeOf([100]Empty)}); // 0
+}
+```
+
+---
+
+### 9. Summary & Exercises
+
+**Summary:**
+- Zig distinguishes `var` (mutable binding) from `const` (immutable binding). `const` does *not* mean immutable data.
+- Types are explicit after a colon; inference uses `: value`. `comptime_int` preserves arbitrary precision until coercion.
+- `undefined` must be written explicitly – there is no default initialization for local variables.
+- No implicit casting between integer types; use `@as`, `@intCast`, or `@truncate`.
+- Zero-sized types have no runtime footprint and are optimized away.
+- The compiler never inserts hidden initializers, destructors, or copies.
+
+**Key insights for the seasoned engineer:**
+- Zig’s variable semantics eliminate the “uninitialized variable is UB” category of bugs while preserving performance (no forced zeroing).
+- The `comptime_int` abstraction solves the “what type is this literal?” problem that plagues C and C++.
+- `const` applies to binding, not pointee – this orthogonal design is simpler than C’s two meanings of `const`.
+
+**Exercises:**
+
+1. **Write a function that safely copies a slice of `u8` into a fixed-size buffer, using `undefined` for the buffer and tracking the initialized length.**
+   Signature: `fn copyToBuffer(dest: []u8, src: []const u8) ![]u8`
+   Return a slice covering exactly the copied bytes. The function should never read uninitialized memory. Test with `std.testing`.
+
+2. **Implement a compile-time checked constant that represents the maximum value of a `u24` (24-bit unsigned integer).**
+   Use `comptime_int` and `@as` to assert that the value fits in `u32`, `u64`, etc. Then create a runtime `u24` type using a packed struct (hint: `packed struct { value: u24 }`). Demonstrate that the constant can be stored in the `u24` field without overflow.
+
+3. **Build a small benchmark (using `std.time.Timer`) that compares zero-initializing a 4KB array with `std.mem.zeroes` vs. leaving it as `undefined` and filling it with random data using `std.crypto.random`.**
+   Measure the difference in initialization cost. Write conclusions about when `undefined` is actually beneficial in a production codebase.
+
+4. **(Advanced) Create a generic `Initialized(T, size)` type that wraps an array of `T` and a separate `usize` length, ensuring that reads only occur on indices < length.**
+   Use a struct with `data: [size]T = undefined` and `len: usize = 0`. Implement an `append` method that copies a value into the next slot and increments `len`. Provide a `get(i: usize) T` that does a bounds check against `len`, not `size`. This mimics a linear allocator pattern.

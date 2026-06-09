@@ -1,0 +1,511 @@
+# Chapter 12: Enums and Tagged Unions
+
+Zig’s type system provides two powerful, zero-cost tools for modeling finite sets of possibilities: **enums** for simple labels, and **tagged unions** (`union(enum)`) for discriminated data variants. Together they replace a surprising amount of object‑oriented machinery—polymorphism, RTTI, nullable references, and error codes—with a model that is statically checked, explicit, and allocator‑free. This chapter shows you how to define them, understand their runtime representation, and use them as the backbone of idiomatic Zig control flow.
+
+---
+
+## 1. Basic Usage
+
+### Plain Enums
+
+A plain enum is a set of named constants backed by an integer type. The backing type defaults to the smallest unsigned integer that can hold all the values, but you can specify it explicitly:
+
+```zig
+const Status = enum(u8) {
+    pending = 0,
+    active = 1,
+    completed = 2,
+    failed = 3,
+};
+
+// Implicit ordering:
+const Color = enum {
+    red,    // 0
+    green,  // 1
+    blue,   // 2
+};
+```
+
+Convert between the enum and its integer tag with `@intFromEnum` and `@enumFromInt`:
+
+```zig
+const s: Status = .active;
+const raw: u8 = @intFromEnum(s);              // 1
+const recovered: Status = @enumFromInt(2);    // .completed
+```
+
+Enums may be marked `_` to discard a value, useful for reserved slots:
+
+```zig
+const Register = enum(u4) {
+    zero = 0,
+    ra = 1,
+    sp = 2,
+    _,
+    t0 = 8,
+    t1 = 9,
+};
+```
+
+At comptime, you can inspect an enum’s fields with `@typeInfo`:
+
+```zig
+const std = @import("std");
+const fields = @typeInfo(Status).Enum.fields;
+// fields[0].name == "pending", fields[0].value == 0
+```
+
+### Tagged Unions (`union(enum)`)
+
+A tagged union attaches a *payload* to each variant. The type of the discriminant is an automatically‑generated enum that mirrors the union’s field names:
+
+```zig
+const Payload = union(enum) {
+    int: i64,
+    float: f64,
+    text: []const u8,
+    none: void,
+};
+
+var p: Payload = .{ .int = 42 };
+p = .{ .text = "hello" };
+```
+
+Access the active variant through `switch` with *captures*:
+
+```zig
+switch (p) {
+    .int => |val| std.debug.print("int = {d}\n", .{val}),
+    .float => |val| std.debug.print("float = {d}\n", .{val}),
+    .text => |val| std.debug.print("text = {s}\n", .{val}),
+    .none => std.debug.print("nothing\n", .{}),
+}
+```
+
+Zig requires the switch to be exhaustive; omitting a variant is a compile error. An `else` prong acts as a catch‑all. If you are certain only a subset can occur, you can still use `else => unreachable`, but the idiomatic preference is to let the compiler enforce completeness.
+
+You can query the active tag without entering a full switch using `std.meta.activeTag`:
+
+```zig
+const std = @import("std");
+if (std.meta.activeTag(p) == .text) {
+    // safe to access p.text directly if you really know it's active;
+    // but the compiler won't enforce it here—you're on your own.
+}
+```
+
+Captures work with `if` as well, for two‑way matching:
+
+```zig
+if (p == .int) {
+    // No capture, just a tag check.
+}
+if (p) |val| {
+    // Compile error: can't infer which variant to capture.
+    // Must use a specific capture: if (p == .int) { const val = p.int; }
+}
+```
+
+The correct idiom for a single‑variant capture with `if` is to use a temporary binding via `switch` or a helper, but Zig 0.13+ supports `if (p) |*payload|` only on error unions and optionals. For tagged unions, `switch` remains the primary tool.
+
+---
+
+## 2. Under the Hood
+
+### Plain Enum Representation
+
+At runtime a plain enum is just its backing integer. `@sizeOf(Color)` returns `@sizeOf(u2)` (or `u1` for two variants), because the compiler automatically picks the smallest unsigned integer that can represent the highest field value. When you specify an explicit backing type like `enum(u8)`, the size and alignment match that type exactly. Non‑exhaustive enums (those with a trailing `_`) still respect the backing type’s range, but the compiler may use a larger integer if the values demand it—there’s no hidden discriminant size inflation.
+
+`@intFromEnum` and `@enumFromInt` compile to zero‑cost bitcasts when the in‑memory representation matches; otherwise they perform the trivial integer truncation/extension.
+
+### Tagged Union Memory Layout
+
+A tagged union has two parts:
+
+1. **Discriminant (tag)**: a generated enum of type `std.meta.Tag(T)`. By default, this is the smallest unsigned integer that can index all union fields.
+2. **Payload**: a C‑style `union` of all possible payload types, with size and alignment equal to the maximum of any field.
+
+The compiler lays them out sequentially:
+
+```
++-------------------+-----------------------------+
+| discriminant (uN) | padding ... | payload union |
++-------------------+-----------------------------+
+```
+
+The exact offset of the payload is determined by the alignment of the largest payload field. The tag may be placed *after* the payload in some `extern` or `packed` scenarios to match C ABIs, but by default it comes first. Zig guarantees that taking a pointer to a payload field is valid only when that field is active. Accessing an inactive field is **illegal behavior** (caught in safe builds).
+
+You can inspect layout explicitly:
+
+```zig
+const std = @import("std");
+const P = union(enum) {
+    a: u8,
+    b: u32,
+    c: void,
+};
+
+comptime {
+    _ = @sizeOf(P);  // 8 (discriminant + padding + 4 bytes payload)
+    _ = @alignOf(P); // 4
+}
+```
+
+The tag is typically a `u2` (since three fields), so the total size becomes `4 + 4 = 8` because the payload union must be aligned to 4, forcing 2 bytes of padding after the tag. Changing the discriminant’s type with `union(enum(u32))` would enlarge it.
+
+The compiler’s internal representation in LLVM or the self‑hosted backend uses a struct containing an integer tag and an overlapping set of storage. The `switch` with captures lowers to a branch on the tag, followed by a load from the union reinterpreted as the appropriate type—no boxing, no heap allocation, no vtable pointer.
+
+### Comptime Reflection
+
+`@typeInfo(T)` for a tagged union returns `TypeInfo.Union` containing `tag_type` and `fields`:
+
+```zig
+const info = @typeInfo(Payload).Union;
+// info.tag_type == @TypeOf(Payload.Tag)  (an enum)
+for (info.fields) |f| {
+    // f.name, f.type, f.alignment
+}
+```
+
+You can generate `switch` arms, serialization code, or visitors entirely at compile time using this metadata—the basis for comptime polymorphism.
+
+---
+
+## 3. Why This Design?
+
+Zig’s tagged unions embody three of the language’s core pillars:
+
+- **No hidden control flow**: Accessing a variant’s payload requires a `switch` or an explicit `if` check; there is no implicit downcast, no vtable dispatch, no virtual method call. The control path is visible and local.
+- **Explicit is better than implicit**: Allocating memory, raising an error, or performing a side effect when you “just assign a union field” never happens. The payload lives inline; copying a tagged union is a `memcpy` of the struct. No destructors run.
+- **Comptime over runtime magic**: Exhaustiveness checks happen at compile time. Type‑driven code generation via `@typeInfo` replaces the need for runtime type IDs or reflection.
+
+By contrast, object‑oriented polymorphism hides allocation (often via `new`), vtable indirection, and destructor chaining. Tagged unions keep data and behavior separate: you write plain functions that `switch` on the variant. This separation makes the data‑flow explicit and trivially auditable.
+
+Zig’s error handling model itself is a tagged union (the error union `!T` is `union(enum) { ok: T, err: anyerror }`), demonstrating that the language eats its own dog food. The same principles of exhaustive checking apply.
+
+---
+
+## 4. Competing Approaches
+
+### C
+
+C provides `enum` (a weak alias for `int`) and `union` (untagged). To build a discriminated union, a programmer must manually combine them and switch on the tag. Nothing prevents writing to the wrong union member:
+
+```c
+enum Tag { INT, FLOAT };
+struct Value {
+    enum Tag tag;
+    union {
+        int i;
+        float f;
+    } data;
+};
+// Accidentally read data.f when tag == INT → UB
+```
+
+Zig’s exhaustive switch and language‑level `union(enum)` eliminate this entire class of bugs at compile time.
+
+### C++
+
+`std::variant` is the standard tagged union. It uses templates and `std::visit` for access:
+
+```cpp
+std::variant<int, float, std::string> v = 3.14f;
+std::visit([](auto&& arg) { std::cout << arg; }, v);
+```
+
+The visitor is a hidden control‑flow mechanism—the library dispatches based on the index. Exceptions may be thrown on invalid access. Memory is stack‑allocated (no heap), but the implementation can be heavy at compile time due to template recursion. C++ also offers OOP hierarchies with virtual functions, which entangle data and code, require heap allocation, and bring RTTI overhead. Zig’s approach keeps the tag and data local, and the dispatch is a plain `switch`—no templates, no exceptions, no hidden vtable lookups.
+
+### Rust
+
+Rust’s `enum` with data is structurally similar:
+
+```rust
+enum Payload {
+    Int(i64),
+    Float(f64),
+    Text(String),
+    None,
+}
+let p = Payload::Int(42);
+match p {
+    Payload::Int(val) => println!("int {}", val),
+    // exhaustive match required.
+}
+```
+
+Rust’s enums are stack‑allocated and pattern matching is exhaustive. The key difference is that Rust’s ownership and borrowing model interacts with variants—moving or borrowing a payload can be subtle when the enum is behind a reference. Zig has no borrow checker; you simply take a pointer to the payload after the `switch` capture, with all the manual responsibility that entails. This grants maximum control at the cost of safety. Rust’s `Option` and `Result` are also enums, whereas Zig uses nullable pointers and error unions as separate primitives, which can result in less nesting in some patterns.
+
+### Go
+
+Go has no sum types. The common workaround is an `interface{}` with a type switch:
+
+```go
+var v interface{} = 42
+switch val := v.(type) {
+case int:
+    fmt.Println("int", val)
+case string:
+    fmt.Println("string", val)
+}
+```
+
+This boxes every value on the heap (for non‑pointer types) and requires runtime type reflection. There is no exhaustiveness check—forgetting a case silently falls through. Zig’s tagged unions are a compile‑time concept with zero allocation overhead.
+
+### Python
+
+Python relies on `isinstance` and ad‑hoc unions or the `typing.Union` hint. There is no runtime enforcement. Zig’s static checks prevent an entire category of “attribute not found” errors before the program ever runs.
+
+---
+
+## 5. Common Mistakes
+
+1. **Forgetting exhaustiveness** – The compiler catches this, but a developer coming from Go or C might try to add `else => {}` and silently ignore variants. Prefer listing every variant explicitly; the compiler is your safety net.
+
+2. **Misusing `if` for payload capture** – `if (u) |val| { ... }` works on optionals and error unions, not on tagged unions. Attempting it yields a compile error. Use `switch` or check the tag with `std.meta.activeTag` before manually accessing the field.
+
+3. **Assuming payload fields are optional** – `u.int` is not a nullable pointer; if `.int` is not the active variant, reading `u.int` is illegal behavior. The safe build instruments this with an explicit panic, but ReleaseFast will silently read garbage. Always switch.
+
+4. **Confusing `union` and `union(enum)`** – A bare `union` is an untagged C‑style union: you must track the type yourself. Unless you are interfacing with C or doing low‑level bit reinterpretation, always prefer `union(enum)`.
+
+5. **Large payloads and copying** – Tagged unions are copied by value. If a variant holds a large array, passing the union by value can be costly. Use a pointer for that variant, or pass a `*const Union` to functions.
+
+6. **`catch unreachable` inside a payload initialization** – For example, `.{ .result = try doSomething() }` propagates the error. If you wrap the whole thing in a function returning an error union, it’s fine. But attempting to store an error union payload directly in a union field might be done incorrectly. Keep payloads as concrete types, not error unions (or use the error union itself as a payload).
+
+7. **Exhaustiveness with `else => unreachable`** – When you add a new variant later, the `else` hides the missing case. Use `else` only when truly enumerating an open set (e.g., integer ranges). For closed sets, write every prong.
+
+---
+
+## 6. Performance Considerations
+
+### Memory Density and Copies
+
+Tagged unions are value types. `@sizeOf` is `discriminant_size + max(payload_sizes) + alignment_padding`. This is extremely cache‑friendly: a slice of tagged unions is contiguous memory with no pointer indirection.
+
+Compare to a typical OOP hierarchy where each object is separately heap‑allocated and contains a vtable pointer. The tagged union version can be laid out as an array of structs, enabling the hardware prefetcher to do its job.
+
+### Jump Table Generation
+
+The compiler lowers an exhaustive `switch` on a tagged union to a jump table when the number of cases and the density of the tag values make it profitable. For small enums, it emits a series of comparisons. The cost is identical to a hand‑written `switch` on an integer.
+
+With `union(enum)`, the tag is always a dense range starting at 0, so jump tables are the norm. This is often faster than a virtual method dispatch, which requires an indirect call through a vtable pointer—unpredictable and pipeline‑stalling.
+
+### No Allocation, No Deallocation
+
+Constructing a tagged union never hits the allocator. This makes them ideal for performance‑critical paths like protocol parsing, AST nodes in a compiler, or state machines inside a tight loop. The entire lifetime is either on the stack or embedded in another struct; destruction is a simple scope exit with no code.
+
+### Payload Size and Pointer Indirection
+
+If a variant contains a heap‑allocated resource (e.g., `std.ArrayList`), the union itself only holds the pointer (fat or thin), not the backing buffer. The resource must still be freed manually (via `defer`/`errdefer`). Zig won’t do it for you—there is no `Drop`. A common pattern is to wrap the allocation in a separate struct and provide a `deinit` method; you call that method from the switch before deactivating the variant.
+
+### `comptime` Tag Operations
+
+`@tagName`, `std.meta.activeTag`, and `@intFromEnum` on tagged unions are completely evaluated at compile time when the value is comptime‑known. Even when runtime, `activeTag` is a simple bitmask extraction from the discriminant field—no function call overhead.
+
+---
+
+## 7. Best Practices
+
+- **Model closed‑set state with `union(enum)`**. Network protocol states, AST nodes, message types, command enums—any domain with a finite number of cases with attached data should be a tagged union.
+- **Use `switch` as the primary deconstruction mechanism**. It documents all cases and lets the compiler verify you’ve handled each one.
+- **Keep payload types lean**. If a variant needs a large buffer or complex resource, store a pointer (or a `std.ArrayList` as a field) rather than a huge inline array. This avoids massive copy costs when moving the union.
+- **Name the discriminant explicitly when needed**. `const Tag = std.meta.Tag(MyUnion);` gives you an enum you can pass around for tagging decisions without constructing a full union.
+- **Leverage comptime reflection for serialization**. A single function using `@typeInfo` can turn any tagged union into JSON or binary without per‑type boilerplate.
+- **Prefer exhaustiveness**. If you have a function that should only ever receive a subset of variants, consider creating a separate, narrower union type instead of using `else => unreachable`. This encodes the invariant in the type system.
+- **Use `std.meta.fieldNames` and `std.meta.FieldEnum`** for metaprogramming user‑facing strings (e.g., command‑line option names).
+- **When interfacing with C**, use `extern union` with an explicit tag field to match the C layout, then wrap it in a safe Zig API that enforces the discriminant via a `union(enum)` translation layer.
+
+---
+
+## 8. Examples
+
+All examples are self‑contained and compilable with `zig build-exe <file>` or `zig test <file>`.
+
+### Example 1: JSON Value Type
+
+```zig
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+
+const JsonValue = union(enum) {
+    null: void,
+    bool: bool,
+    number: f64,
+    string: []const u8,
+    array: std.ArrayList(JsonValue),
+    object: std.StringHashMap(JsonValue),
+
+    pub fn deinit(self: *JsonValue, allocator: Allocator) void {
+        switch (self.*) {
+            .array => |*arr| {
+                for (arr.items) |*item| item.deinit(allocator);
+                arr.deinit();
+            },
+            .object => |*obj| {
+                var it = obj.iterator();
+                while (it.next()) |entry| {
+                    allocator.free(entry.key_ptr.*);
+                    entry.value_ptr.deinit(allocator);
+                }
+                obj.deinit();
+            },
+            else => {}, // scalar types own no heap memory
+        }
+        self.* = .null;
+    }
+};
+
+test "JSON value lifecycle" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var obj = std.StringHashMap(JsonValue).init(allocator);
+    defer obj.deinit();
+
+    // Build a simple object: {"pi": 3.14}
+    try obj.put("pi", .{ .number = 3.14 });
+
+    var val: JsonValue = .{ .object = obj };
+    defer val.deinit(allocator);
+
+    try testing.expect(val == .object);
+}
+```
+
+### Example 2: State Machine for TCP Connection
+
+```zig
+const std = @import("std");
+const net = std.net;
+const Allocator = std.mem.Allocator;
+
+const ConnectionState = union(enum) {
+    idle,
+    connecting: net.Stream, // not yet established
+    connected: net.Stream,
+    error: []const u8,
+};
+
+const Connection = struct {
+    state: ConnectionState,
+    allocator: Allocator,
+
+    pub fn init(allocator: Allocator) Connection {
+        return .{ .state = .idle, .allocator = allocator };
+    }
+
+    pub fn connect(self: *Connection, address: []const u8) !void {
+        self.state = .{
+            .connecting = try net.tcpConnectToHost(self.allocator, address, 80),
+        };
+    }
+
+    pub fn advance(self: *Connection) !void {
+        switch (self.state) {
+            .connecting => |stream| {
+                // assume handshake succeeds; transition to connected
+                self.state = .{ .connected = stream };
+            },
+            .connected => {
+                // keep alive or something
+            },
+            .error => |msg| {
+                std.debug.print("error: {s}\n", .{msg});
+                self.state = .idle;
+            },
+            .idle => {},
+        }
+    }
+
+    pub fn deinit(self: *Connection) void {
+        switch (self.state) {
+            .connecting => |s| s.close(),
+            .connected => |s| s.close(),
+            else => {},
+        }
+    }
+};
+```
+
+### Example 3: Expression Evaluator with Recursive Switch
+
+```zig
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+
+pub const Expr = union(enum) {
+    number: f64,
+    add: struct { left: *Expr, right: *Expr },
+    mul: struct { left: *Expr, right: *Expr },
+};
+
+pub fn evaluate(expr: *const Expr) f64 {
+    return switch (expr.*) {
+        .number => |n| n,
+        .add => |op| evaluate(op.left) + evaluate(op.right),
+        .mul => |op| evaluate(op.left) * evaluate(op.right),
+    };
+}
+
+pub fn deinit(expr: *Expr, allocator: Allocator) void {
+    switch (expr.*) {
+        .add => |*op| {
+            deinit(op.left, allocator);
+            deinit(op.right, allocator);
+            allocator.destroy(op.left);
+            allocator.destroy(op.right);
+        },
+        .mul => |*op| {
+            deinit(op.left, allocator);
+            deinit(op.right, allocator);
+            allocator.destroy(op.left);
+            allocator.destroy(op.right);
+        },
+        .number => {},
+    }
+    // no self-destruction; caller owns the root allocation
+}
+
+test "evaluate simple expression" {
+    const allocator = std.testing.allocator;
+
+    const left = try allocator.create(Expr);
+    left.* = .{ .number = 2.0 };
+    const right = try allocator.create(Expr);
+    right.* = .{ .number = 3.0 };
+    const sum = try allocator.create(Expr);
+    sum.* = .{ .add = .{ .left = left, .right = right } };
+
+    defer {
+        deinit(sum, allocator);
+        allocator.destroy(sum);
+    }
+
+    const result = evaluate(sum);
+    try std.testing.expectEqual(5.0, result);
+}
+```
+
+---
+
+## 9. Summary & Exercises
+
+**Summary:**
+
+- Zig’s enums are integer‑backed named constants with compile‑time reflection.
+- `union(enum)` creates a tagged union: a discriminant plus a payload that is one of several types.
+- Exhaustive `switch` ensures every variant is handled; no hidden dispatch or allocation.
+- Memory layout is a compact struct, ideal for cache‑local data‑oriented design.
+- Comptime metadata enables automatic serialization, visitors, and IDL generation without macros.
+- Zig replaces OOP polymorphism with explicit `switch`‑based control flow, keeping data and behavior separate and auditable.
+
+**Exercises:**
+
+1. **Implement a generic `Result` type**
+   Define `pub fn Result(comptime Ok: type, comptime Err: type) type` that returns a tagged union with `ok: Ok` and `err: Err`. Write a `unwrap` method that either returns the value or calls a user‑provided error handler. Show that the size and alignment are correct for any pair of types.
+
+2. **Write a `ConfigValue` tagged union**
+   Create a tagged union representing configuration values: `int(i64)`, `float(f64)`, `bool`, `string([]const u8)`, and `array(std.ArrayList(ConfigValue))`. Write a recursive `deinit` method and a function `format` that prints the value to a writer, demonstrating a nested visitor pattern without recursion blow‑up.
+
+3. **AST pretty‑printer via comptime**
+   Using the expression type from Example 3, write a function `dump` that generates a human‑readable string representation of the AST entirely at compile time, without modifying the original struct. Use `@typeInfo` to walk the fields and emit parentheses for binary operations. The output for `add(number(2), mul(number(3), number(4)))` should be `"(2 + (3 * 4))"`. This exercise fuses tagged unions with advanced comptime reflection.

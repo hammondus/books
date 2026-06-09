@@ -1,0 +1,359 @@
+# Chapter 13: Strings and Unicode
+
+Zig holds a stark view of what a string is: a sequence of bytes. There is no dedicated `string` type, no implicit encoding enforcement, and no hidden allocation behind `+` concatenation. Instead, Zig surfaces the raw data as a slice of `u8` with an optional sentinel null terminator. This chapter dissects how Zig models strings, how to work safely with UTF-8 text, and how to bridge the gap to the C world where null-terminated `char*` reigns.
+
+---
+
+## 1. Basic Usage
+
+A string literal in Zig is a comptime-known, null-terminated array of bytes. Its type is `*const [N:0]u8` — a pointer to a constant array of length `N` with a sentinel zero at the end. This coerces freely to a slice with sentinel:
+
+```zig
+const hello: [:0]const u8 = "Hello, Zig!";
+```
+
+The slice `hello` consists of a pointer to the first byte and a length (12 in this case). The sentinel zero at index 12 is not included in the length, but the type system guarantees it exists.
+
+**Slices without sentinels** are plain `[]const u8`. They are used when null termination isn’t required or when you build a string from parts that you know won’t be passed to C functions that expect a `char*`:
+
+```zig
+const part1: []const u8 = "Hello";
+const part2: []const u8 = ", World";
+// concatenate into a new buffer
+```
+
+You create dynamic strings using `std.ArrayList(u8)` and produce a `[:0]const u8` with `toOwnedSliceSentinel(0)`. Formatting into a newly allocated string is done with `std.fmt.allocPrint`:
+
+```zig
+const allocator = std.heap.page_allocator;
+const name = "Zig";
+const greeting = try std.fmt.allocPrint(allocator, "Hello, {s}!", .{name});
+defer allocator.free(greeting);
+// greeting is a [:0]const u8
+```
+
+When you need to write into a stack buffer, use `std.fmt.bufPrint`:
+
+```zig
+var buf: [64]u8 = undefined;
+const msg = try std.fmt.bufPrint(&buf, "Value: {d}", .{42});
+// msg is a []const u8 slice pointing into buf, null-terminated only if the
+// format string and arguments fit with room for the sentinel? Actually bufPrint
+// returns a slice of the written portion of the buffer. The buffer itself is
+// not guaranteed to have a null after the slice unless you explicitly write it,
+// but bufPrint does NOT add a null terminator. If you need a sentinel, you must
+// write it yourself or use bufPrintZ from std.fmt (which writes a null).
+const msg_z = try std.fmt.bufPrintZ(&buf, "Value: {d}", .{42});
+// msg_z is [:0]const u8
+```
+
+**Unicode support** is opt‑in. The `std.unicode` module provides functions to decode UTF-8 byte sequences into codepoints (`u21`) and to validate strings. For example, iterate over Unicode codepoints:
+
+```zig
+const text = "Zig 🦎";
+var codepoints = std.unicode.Utf8View.initUnchecked(text);
+var iter = codepoints.iterator();
+while (iter.nextCodepoint()) |cp| {
+    // cp is u21
+}
+```
+
+You can also validate an entire string:
+
+```zig
+if (!std.unicode.utf8ValidateSlice(text)) {
+    // handle invalid UTF-8
+}
+```
+
+Zig strings are explicitly not required to be valid UTF-8. You treat them as UTF-8 only when you choose to.
+
+---
+
+## 2. Under the Hood
+
+Zig’s string literal “Hello” has type `*const [5:0]u8`. At the compiler level, the literal is embedded in the binary as a comptime array of 6 bytes: `[5]u8{'H','e','l','l','o'}` plus a zero byte. The sentinel `:0` in the type is metadata the compiler uses to enforce that the last element beyond the length is zero. When you coerce `*const [5:0]u8` to `[:0]const u8`, you get a fat pointer: a `struct { ptr: [*:0]const u8, len: usize }`. The `[*:0]const u8` is a many‑pointer with a sentinel, which guarantees that `ptr[len] == 0` without the length including the zero.
+
+The sentinel is not magical. Under the hood, any `[:0]T` is a slice where the type system knows that `slice.ptr` points to an array with an extra element of value `0` at position `slice.len`. That sentinel is used whenever you pass the slice to a function expecting a `[*:0]const u8`, such as C’s `puts`. The compiler does not insert a null terminator dynamically; it simply trusts the type.
+
+For non-sentinel slices `[]const u8`, the underlying pointer is a `[*]const u8`, no such guarantee exists. If you need to convert a `[]const u8` to `[:0]const u8`, you must copy the data into a buffer and append a zero byte, then slice the buffer appropriately. The standard library helper `std.mem.span` when given a zero‑terminated pointer can recover the length by scanning for the null, but it returns a slice without a sentinel. To get a `[:0]`, you must construct it manually.
+
+**UTF‑8 decoding** in `std.unicode` works by reading bytes. A `Utf8View` wraps a `[]const u8` and provides an iterator. The iterator decodes each multi‑byte sequence on the fly using bit‑masking and shift operations — no look‑up tables unless you count the branch‑free logic. The module also offers `Utf8Iterator` with methods `nextCodepoint` and `nextCodepointSlice` that return the corresponding byte length. This is all implemented in comptime‑compatible Zig, so you can validate UTF‑8 at compile time.
+
+**Memory representation** of a `[:0]const u8` passed to a C function: Zig stores the slice’s pointer and length in registers or on the stack when calling an extern function that expects a C `const char*`. The C function only receives the pointer; the length is invisible to C. This is exactly the same as a C string. Zig simply gives you the length for safety when you stay within Zig.
+
+When you build a dynamic string with `std.ArrayList(u8)`, the underlying buffer is an allocated `[]u8`. Calling `toOwnedSliceSentinel(0)` resizes the allocation (or overallocates) to include a zero byte after the current items, sets it, and returns a `[:0]u8`. The allocator then yields ownership to you.
+
+---
+
+## 3. Why This Design?
+
+Zig’s approach to strings flows directly from its three core pillars: **no hidden control flow**, **explicit over implicit**, and **comptime over runtime magic**.
+
+1. **No hidden allocation:** A `+` operator that concatenates strings would be a hidden allocation and a potential failure. Zig forbids operator overloading entirely, so there is no `+` for slices. String building is an explicit, fallible operation: you choose an allocator, you handle errors, you format or append. This eliminates the surprise of an OOM crash inside what looks like an innocent expression.
+
+2. **No hidden UTF‑8 enforcement:** Many languages validate UTF‑8 on creation, incurring a runtime cost even when you just need a byte buffer. Zig views strings as just bytes until you decide to interpret them as text. This allows you to handle binary protocols, legacy encodings, or invalid UTF‑8 without fighting the language. The `[:0]const u8` is perfect for C interop; it’s exactly what `const char*` expects, but with a length known to Zig.
+
+3. **Separation of policy and mechanism:** A string class (like C++’s `std::string` or Rust’s `String`) bakes in allocation strategy, growth factor, small-string optimisation, and encoding. In Zig, these concerns are disaggregated. You might use an arena allocator for a request‑scoped string, a fixed buffer for a log line, or a general‑purpose allocator for a long‑lived string. The byte‑slice type is universal; the strategy is in your hands.
+
+4. **Comptime power:** String literals exist at compile time, so you can validate them, parse them, or generate code from them without any runtime overhead. For example, you can comptime‑check that a format string matches its arguments, or embed a file’s contents as a `[:0]const u8` using `@embedFile`.
+
+5. **C interop supremacy:** C remains the universal system interface. By making `[:0]const u8` trivially convertible to `[*:0]const u8`, Zig eliminates the need for wrapper functions that allocate and copy just to pass a string to a C API. You can use the same memory representation and send slices directly (as pointers), while still keeping the length for Zig‑side safety.
+
+In contrast, a built‑in `String` type with internal state would hide the null terminator, making FFI more cumbersome, or would force a particular memory layout. Zig’s choice keeps the abstraction paper‑thin.
+
+---
+
+## 4. Competing Approaches
+
+- **C:** The null‑terminated `char*` with no length. No ownership semantics. It’s the fastest possible representation, but the root cause of buffer overflows. Zig augments this with the length stored alongside the pointer, providing bounds checking in safe modes. Zig’s `[:0]const u8` is the C string with a seatbelt.
+
+- **Rust:** `&str` is a validated UTF‑8 slice, guaranteeing that string data is always valid Unicode. `String` is an owned, heap‑allocated, UTF‑8 string. Rust’s approach enforces correctness but adds runtime validation on creation and conversion, and allocates when you need to own a string. Zig’s `[]const u8` imposes no encoding contract, so you avoid the validation overhead when you don’t need it. Zig also lacks an owned string type — ownership is conveyed by who frees the buffer, not by a wrapper type.
+
+- **Go:** The `string` type is immutable and stores the bytes plus a length, but no sentinel. Go strings are always considered UTF‑8, though nothing prevents invalid sequences. Go’s GC manages the underlying memory, so allocation is implicit. Zig’s explicit allocators make the memory ownership visible in the code.
+
+- **C++:** `std::string` is mutable, growable, and can be null‑terminated (since C++11 `c_str()` guarantees a null terminator). It manages memory via an internal allocator. Zig’s model is more transparent: a slice is a view, an `ArrayList(u8)` is a mutable buffer, and you can turn it into a `[:0]u8` when needed. No virtual dispatch, no small‑string optimisation magic to reason about.
+
+- **Python:** Strings are immutable, full‑Unicode objects (with internal representations that may be compact ASCII or wide character arrays). High‑level and convenient, but far removed from system memory. Zig gives you exactly the bytes, leaving all high‑level text processing to libraries.
+
+The common thread: Zig sacrifices convenience for control and zero‑cost interop. You never wonder “Did this concatenation allocate?” because concatenation is a function call with an explicit allocator parameter.
+
+---
+
+## 5. Common Mistakes
+
+1. **Forgetting the null terminator when calling C.** Passing a `[]const u8` to a function expecting `[*:0]const u8` is a compile error. The fix is to ensure the slice is `[:0]const u8`. However, if you manually create a `[:0]` from a buffer, you must place the zero yourself. Mistake:
+
+   ```zig
+   var buf: [64]u8 = undefined;
+   @memcpy(buf[0..5], "hello"); // no null added
+   const c_str: [*:0]const u8 = @ptrCast(&buf); // undefined behavior!
+   ```
+   Correct:
+   ```zig
+   @memcpy(buf[0..6], "hello\x00"); // include null
+   // or use bufPrintZ
+   ```
+
+2. **Assuming all bytes are valid UTF‑8.** When iterating with `Utf8View`, you must either validate the slice first or handle invalid sequences. The `Utf8View.initUnchecked` skips validation; use `Utf8View.init` which returns an error if the slice is invalid.
+
+3. **Slicing in the middle of a multi‑byte character.** A `[start..end]` operation on a `[]const u8` can split a codepoint. If you then treat the slice as a valid string, you’ll get a garbled last character. Always align slice boundaries to codepoint boundaries when splitting text.
+
+4. **Using `.len` as character count.** `some_string.len` is the byte count, not the number of Unicode codepoints. A single emoji can be 4 bytes or more. Use `std.unicode.utf8CountCodepoints` to count codepoints.
+
+5. **Confusing `std.mem.span` with sentinel preservation.** `std.mem.span(ptr)` accepts a `[*:0]const u8` and returns a `[]const u8` (no sentinel). If you later need to pass it back to C, you must keep the original pointer or reconstruct the sentinel guarantee.
+
+6. **Off‑by‑one with allocation size for sentinel.** When you call `allocPrint` it produces a `[:0]const u8`, and the allocated buffer is exactly `len + 1` bytes. If you free it with `allocator.free`, the length is correct because the slice’s `len` still excludes the zero. But if you manually allocate, you need `len + 1` for the buffer.
+
+7. **Over‑reliance on `catch unreachable` with string formatting.** `bufPrint` can fail if the buffer is too small. A common anti‑pattern is `bufPrint(...) catch unreachable`. Instead, handle the error or use a larger buffer, because in production a long string will panic.
+
+8. **Creating a `[:0]const u8` from a stack buffer and escaping its lifetime.** The sentinel slice points into the stack; returning it from a function is a use‑after‑stack mistake. Use the allocator for any string that outlives the function.
+
+---
+
+## 6. Performance Considerations
+
+Zig’s string design encourages minimal overhead:
+
+- **Slices are views:** Passing a `[]const u8` to a function involves copying two words (pointer + length), exactly like a C++ `std::string_view` or a Rust `&str`. No allocation, no reference counting.
+
+- **The sentinel costs one extra byte** in storage when you allocate, and one extra write to set the zero. In practice, the cost is negligible. If you don’t need it, stick to `[]const u8` and save that byte.
+
+- **String building with `ArrayList(u8)`** amortises allocation cost via geometric growth. When you call `toOwnedSliceSentinel(0)`, the array’s capacity is often slightly larger than the final length. The allocator may need to reallocate to shrink and add the sentinel, or it can overallocate upfront. The standard library implementation uses `allocator.resize` to attempt an in‑place shrink, which often avoids a copy.
+
+- **Stack‑based formatting** with `bufPrint` eliminates dynamic allocation entirely. The compiler can inline the formatting logic and the buffer is just a local array. This is the fastest way to build small strings (e.g., log messages, error descriptions). `bufPrintZ` additionally writes a null terminator at the end, which costs one extra store.
+
+- **UTF‑8 validation and decoding** in `std.unicode` is branch‑heavy for each byte, but modern CPUs handle it well. The code is written with comptime‑friendly logic, not hand‑tuned SIMD. For throughput‑critical parsing, you may want to roll your own vectorised UTF‑8 validation (the standard library is a correct baseline). However, for most systems, the overhead of iterating a few hundred codepoints is dwarfed by I/O.
+
+- **String interning** (storing only one copy of each distinct string) greatly reduces memory when you have many repeated strings. A common approach: keep an `std.StringHashMap([]const u8)` in an arena. When you intern a string, you check if it exists; if not, you allocate a copy in the arena (with a null terminator if needed) and store it. Lookup becomes a hash‑table probe instead of string comparison, speeding up equality checks. The cost is the hash computation and arena memory that lives as long as the interner.
+
+- **Comparing strings:** Use `std.mem.eql(u8, a, b)` for byte‑by‑byte comparison. The length check early‑outs for mismatched sizes. No implicit normalisation (e.g., Unicode NFC) happens — you pay only for exactly what you request.
+
+- **Zero‑copy slicing:** Splitting a string with `std.mem.tokenize` or `std.mem.split` returns slices pointing into the original buffer, creating no new allocations. This is ideal for parsing protocols where the input buffer is long‑lived.
+
+In benchmarks, Zig string operations often match or beat equivalent C code because the length is always available, enabling `memcpy` with known sizes and avoiding `strlen` calls. Zig’s standard library aggressively uses length‑based operations.
+
+---
+
+## 7. Best Practices
+
+1. **Use `[:0]const u8` for C‑facing interfaces, `[]const u8` internally.** Internal functions rarely need a sentinel. The sentinel type serves as documentation: “This string will be passed to C.”
+
+2. **Choose the right string builder.**
+   - For a fixed maximum size (e.g., a URL, a path), use `std.BoundedArray(u8, MAX_LEN)` and write into it. You can get a `[:0]const u8` by calling `const slice = bounded.constSlice();` and adding a zero manually if needed, or use `bounded.buffer` with `bufPrintZ`.
+   - For unbounded dynamic building, use `std.ArrayList(u8)`. When done, call `try list.toOwnedSliceSentinel(0)` to get a `[:0]const u8`.
+   - For one‑shot formatted string, use `std.fmt.allocPrint(ally, ...)`.
+
+3. **Format into stack buffers when possible.** It’s safe and fast. Always check the error — use `try` and let the caller handle `error.NoSpaceLeft`.
+
+4. **Validate UTF‑8 at boundaries.** When you receive untrusted data, call `std.unicode.utf8ValidateSlice(payload)` before processing it as text. This prevents garbled output downstream and catches bugs early.
+
+5. **Decouple text processing from byte storage.** Write functions that accept `[]const u8` and treat it as opaque bytes when you don’t need to interpret the content. Use `std.ascii` functions (`toLower`, `eqlIgnoreCase`) for ASCII‑only operations, which are safe on any bytes. Only bring in `std.unicode` when you genuinely need codepoint‑level operations.
+
+6. **Never assume `len` equals character count.** If you need to truncate a string to a certain number of characters, use `std.unicode.utf8CountCodepoints` and then find the byte index that corresponds to that many codepoints with `std.unicode.utf8ByteIndex`.
+
+7. **When interning, store null‑terminated strings.** If the interning pool must serve C APIs, ensure the interned string is `[:0]const u8`. The arena can allocate `len + 1` bytes, copy the string, and set the last byte to zero. This avoids a copy at each use site.
+
+8. **Leverage `@embedFile` for static inclusion.** Instead of reading a file at runtime, embed it as a `[:0]const u8` with `const data = @embedFile("config.json");`. The compiler will load the file contents, null‑terminate, and expose it as a comptime slice. No I/O, no allocation.
+
+9. **Use `std.mem.zeroInit` for sentinel arrays.** When declaring a fixed buffer for strings, you can define it as `var buf: [64:0]u8 = std.mem.zeroInit([64:0]u8, .{});` to start with a null‑filled array.
+
+10. **Follow std lib conventions.** The standard library often uses `const s: []const u8` for general slices and `const z: [:0]const u8` for sentinel ones. Mimic this for readability.
+
+---
+
+## 8. Examples
+
+### Example 1: Stack‑Allocated String Concatenation with Separator
+
+Build a comma‑separated list from an array of strings, using only a stack buffer.
+
+```zig
+const std = @import("std");
+
+fn joinStrings(
+    parts: []const []const u8,
+    sep: []const u8,
+    buf: []u8,
+) ![]const u8 {
+    var stream = std.io.fixedBufferStream(buf);
+    const writer = stream.writer();
+    for (parts, 0..) |part, i| {
+        if (i > 0) {
+            _ = try writer.write(sep);
+        }
+        _ = try writer.write(part);
+    }
+    return stream.getWritten();
+}
+
+test "join strings on stack" {
+    const words = &[_][]const u8{ "Hello", "World", "Zig" };
+    var buf: [64]u8 = undefined;
+    const result = try joinStrings(words, ", ", &buf);
+    try std.testing.expectEqualStrings("Hello, World, Zig", result);
+}
+```
+
+The function returns a `[]const u8` slice into `buf`. No dynamic allocation. Note that the buffer is not null‑terminated unless you ensure a zero byte after the written portion.
+
+### Example 2: UTF‑8 Codepoint Iterator and Validation
+
+Count the number of Unicode codepoints in a string, rejecting invalid UTF‑8.
+
+```zig
+const std = @import("std");
+
+fn countCodepoints(text: []const u8) !usize {
+    var view = try std.unicode.Utf8View.init(text);
+    var iter = view.iterator();
+    var count: usize = 0;
+    while (iter.nextCodepoint()) |_| {
+        count += 1;
+    }
+    return count;
+}
+
+test "count codepoints" {
+    const s = "Zig 🦎";
+    const n = try countCodepoints(s);
+    // 'Zig ' + lizard emoji -> 4 letters + 1 space + 1 emoji = 6?
+    // Actually "Zig " is 4 chars (Z,i,g,space) and the emoji is 1 codepoint.
+    try std.testing.expectEqual(@as(usize, 5), n);
+}
+```
+
+### Example 3: Simple String Interner with C‑compatible Null Terminator
+
+A basic interner that stores strings in an arena and allows lookup by value. It returns `[:0]const u8` ready for C.
+
+```zig
+const std = @import("std");
+
+const Interner = struct {
+    arena: std.heap.ArenaAllocator,
+    map: std.StringHashMap([:0]const u8),
+
+    pub fn init(backing_allocator: std.mem.Allocator) Interner {
+        return .{
+            .arena = std.heap.ArenaAllocator.init(backing_allocator),
+            .map = std.StringHashMap([:0]const u8).init(backing_allocator),
+        };
+    }
+
+    pub fn deinit(self: *Interner) void {
+        // arena deinit frees all strings
+        self.arena.deinit();
+        self.map.deinit();
+    }
+
+    pub fn intern(self: *Interner, s: []const u8) ![:0]const u8 {
+        const gop = try self.map.getOrPut(s);
+        if (gop.found_existing) return gop.value_ptr.*;
+
+        // allocate in arena with extra byte for null
+        const alloc = self.arena.allocator();
+        const new_str = try alloc.alloc(u8, s.len + 1);
+        @memcpy(new_str[0..s.len], s);
+        new_str[s.len] = 0; // sentinel
+
+        const result: [:0]const u8 = new_str[0..s.len :0];
+        gop.value_ptr.* = result;
+        return result;
+    }
+};
+
+test "intern strings" {
+    var interner = Interner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    const a = try interner.intern("hello");
+    const b = try interner.intern("hello");
+    const c = try interner.intern("world");
+
+    try std.testing.expectEqual(a.ptr, b.ptr); // same pointer
+    try std.testing.expect(a.ptr != c.ptr);
+    try std.testing.expectEqualStrings("hello", a);
+    // a is [:0]const u8, so it can be passed to C:
+    // std.c.puts(a.ptr);
+}
+```
+
+### Example 4: Using `bufPrintZ` to Format a Message with Null Terminator
+
+```zig
+const std = @import("std");
+
+fn formatError(code: u16, buf: []u8) ![:0]const u8 {
+    return std.fmt.bufPrintZ(buf, "Error {d}: {s}", .{
+        code,
+        if (code == 404) "Not Found" else "Unknown",
+    });
+}
+
+test "bufPrintZ null termination" {
+    var buf: [128]u8 = undefined;
+    const msg = try formatError(404, &buf);
+    try std.testing.expect(msg.len == 18); // "Error 404: Not Found"
+    try std.testing.expect(msg[msg.len] == 0); // sentinel present
+}
+```
+
+---
+
+## 9. Summary & Exercises
+
+Zig’s approach to strings strips away the abstractions that other languages build around text. You are given the bytes, the length, and an optional sentinel null — tools that map directly onto hardware and C ABI requirements. This raw representation forces you to decide where allocation happens, how encoding is handled, and when to add a null terminator. In return, you gain zero‑overhead interop, explicit control, and the freedom to treat strings as byte buffers or Unicode text as needed.
+
+- **`[:0]const u8`** is the C‑compatible string with a length; **`[]const u8`** is any byte slice.
+- **Dynamic strings** are built with an allocator and `ArrayList(u8)` or `allocPrint`.
+- **UTF‑8** is an opt‑in interpretation; the `std.unicode` module gives you validation, codepoint iteration, and counting.
+- **Comptime** enables embedding files, validating format strings, and building static string tables.
+
+### Exercises
+
+1. **Stack‑bounded CSV line builder.** Write a function `fn formatCsvLine(columns: []const []const u8, buf: []u8) ![:0]const u8` that joins the columns with commas and null‑terminates the result using only `buf`. If the buffer is too small, return `error.NoSpaceLeft`. Ensure the output is safe to pass to `std.c.puts`.
+
+2. **Case‑insensitive ASCII comparator that handles UTF‑8 safely.** Implement `fn eqlIgnoreCaseUtf8Safe(a: []const u8, b: []const u8) bool` that compares two strings byte‑by‑byte using `std.ascii.toLower` for ASCII bytes, but for non‑ASCII bytes (value ≥ 128) compares them exactly (no case mapping). The function must not assume the strings are valid UTF‑8 and must not panic on invalid sequences. Why is this approach safe?
+
+3. **String interning pool with statistics.** Extend the `Interner` example to track the total number of bytes saved by interning (i.e., the number of duplicate strings avoided). Add a method `fn savings(self: *Interner) usize`. Then, stress‑test your interner with a comptime‑generated list of many overlapping strings and verify the savings. How does the arena allocation pattern interact with fragmentation? (Hint: arenas are monotonic, so fragmentation is minimal.)

@@ -1,0 +1,575 @@
+## Chapter 11: Structs
+
+Structs are Zig’s primary composite data type. They group zero or more fields of potentially different types into a single value. Unlike classes in C++ or Java, Zig structs have no inheritance, no virtual methods, no constructors, no destructors, and no implicit control flow. A struct is a blueprint for a memory layout, and that’s nearly all it is.
+
+This chapter explores how to define and use structs, how Zig lays them out in memory, and how to leverage `packed struct` and `extern struct` for ABI control. We’ll also cover composition as the idiomatic substitute for inheritance, self-referential patterns, and the role of opaque types.
+
+---
+
+### 11.1 Basic Usage
+
+**Defining and instantiating structs**
+
+A struct definition introduces a new type. Fields are named and typed, with no default values unless you provide them explicitly at instantiation.
+
+```zig
+const Point = struct {
+    x: f64,
+    y: f64,
+};
+
+// Instantiation using .{ }
+const p = Point{ .x = 1.0, .y = 2.0 };
+```
+
+Fields appear in the order you declare them, but you can initialize them in any order using field names. Unmentioned fields become `undefined` — there are no default field values.
+
+```zig
+const Config = struct {
+    timeout_ms: u32,
+    retries: u8,
+    log_level: LogLevel,
+};
+
+// Only 'timeout_ms' provided; 'retries' and 'log_level' are undefined.
+const cfg = Config{ .timeout_ms = 5000 };
+```
+
+**Methods are ordinary functions**
+
+Zig does not have “method syntax” in the C++/Rust sense. Instead, you define functions that take the struct as their first parameter, conventionally named `self`. These functions live in the struct’s namespace:
+
+```zig
+const Vec3 = struct {
+    x: f32, y: f32, z: f32,
+
+    // This is a function inside the struct's namespace.
+    // It is NOT a method with special dispatch; it's just scoped.
+    pub fn length(self: Vec3) f32 {
+        return @sqrt(self.x * self.x + self.y * self.y + self.z * self.z);
+    }
+
+    pub fn scale(self: Vec3, factor: f32) Vec3 {
+        return Vec3{
+            .x = self.x * factor,
+            .y = self.y * factor,
+            .z = self.z * factor,
+        };
+    }
+};
+
+const v = Vec3{ .x = 1.0, .y = 2.0, .z = 2.0 };
+const len = v.length(); // Calls Vec3.length(v)
+const v2 = v.scale(2.0);
+```
+
+The function `length` is not magically bound to each instance; it’s a regular function that you can also call as `Vec3.length(v)`. This explicitness aligns with Zig’s philosophy: no hidden `this` pointer, no dynamic dispatch unless you explicitly use a vtable.
+
+**Anonymous structs and struct literals**
+
+Zig supports anonymous struct types where the type is inferred from the literal:
+
+```zig
+const rect = .{
+    .width = 1920,
+    .height = 1080,
+};
+// The type of 'rect' is an anonymous struct: struct{width: comptime_int, height: comptime_int}
+```
+
+You can also use anonymous structs as “ad-hoc tuples”:
+
+```zig
+const pair = .{ 42, "answer" };
+// Type is struct{comptime_int, *const [6:0]u8}
+```
+
+**Default initialisation via `init` functions**
+
+Because structs have no constructors, the idiomatic way to create initialised instances is a public `init` function that returns the struct. This also handles allocation when necessary:
+
+```zig
+const Buffer = struct {
+    data: []u8,
+    len: usize,
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator, capacity: usize) !Buffer {
+        const data = try allocator.alloc(u8, capacity);
+        return Buffer{
+            .data = data,
+            .len = 0,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Buffer) void {
+        self.allocator.free(self.data);
+        self.* = undefined; // Optional: poison the value.
+    }
+};
+```
+
+---
+
+### 11.2 Under the Hood
+
+**Memory layout and alignment**
+
+By default, Zig does **not** guarantee a specific memory layout for structs beyond the order of fields. The compiler may insert padding between fields or at the end to satisfy alignment requirements of the target architecture. This is identical to C’s default struct layout and gives the optimizer freedom to rearrange padding (but not fields) for better cache behaviour.
+
+You can query size, alignment, and field offsets with builtins:
+
+```zig
+const S = struct { a: u8, b: u32, c: u8 };
+std.debug.print("size: {}, align: {}\n", .{ @sizeOf(S), @alignOf(S) });
+// On x86_64, typical output: size: 12, align: 4
+// (Padding: a at offset 0, 3 bytes padding, b at offset 4, c at offset 8, 3 bytes trailing padding)
+
+std.debug.print("offset of b: {}\n", .{ @offsetOf(S, "b") }); // 4
+```
+
+**Packed struct – precise bit layout**
+
+`packed struct` forces Zig to lay out fields with **no padding** and allows fields smaller than one byte (e.g., `u3`). The entire struct becomes a single integer whose bits are defined by the field order.
+
+```zig
+const Flags = packed struct {
+    enabled: bool,   // 1 bit
+    mode: u2,        // 2 bits
+    reserved: u5,    // 5 bits -> total 8 bits = 1 byte
+};
+
+const f = Flags{ .enabled = true, .mode = 2, .reserved = 0 };
+std.debug.print("size: {}\n", .{@sizeOf(Flags)}); // 1
+```
+
+Behind the scenes, Zig treats a `packed struct` as an integer with `@bitSizeOf` bits. Field access involves bit shifts and masks, which are efficient but not as fast as byte-aligned access. The layout is **fully defined** and stable across compilers and targets (endianness still applies – see below).
+
+**Endianness and packed structs**
+
+Because a `packed struct` is interpreted as an integer, its in-memory representation depends on the target’s endianness. For portable binary protocols, you must manually convert to/from a known endianness using `@byteSwap` or `std.mem.readInt`/`writeInt`.
+
+**Extern struct – C-compatible layout**
+
+`extern struct` guarantees the same layout as the C compiler on the target platform. It respects the platform’s ABI for structs, including alignment and padding rules. Use this type when passing structs to or from C code.
+
+```zig
+const ExternPoint = extern struct {
+    x: c_int,
+    y: c_int,
+};
+// Layout matches C's 'struct { int x; int y; }' for the target.
+```
+
+**Value semantics and parameter passing**
+
+Structs are value types. Assigning a struct to a new variable or passing it to a function makes a **shallow copy** of all fields (including padding bytes). There are no implicit heap allocations.
+
+```zig
+const A = struct { x: u32 };
+var a = A{ .x = 42 };
+var b = a; // b is a copy
+b.x = 99;
+std.debug.print("{}\n", .{a.x}); // Still 42
+```
+
+If you need to modify the original, pass a pointer: `fn modify(self: *A) void`.
+
+**Comptime structs**
+
+Structs can contain `comptime` fields, which are evaluated at compile time and may be used for type-level programming. The compiler can also fully evaluate a struct instance at compile time if all its fields are comptime-known.
+
+---
+
+### 11.3 Why This Design?
+
+**No constructors = no hidden allocations or side effects**
+
+Constructors in C++ and Rust are special functions with implicit control flow. They can allocate memory, open files, or throw exceptions – all without being visible at the call site. Zig forces you to call an ordinary `init` function that returns the struct explicitly. This follows the **no hidden control flow** pillar: initialisation is just code you write and call.
+
+**No inheritance, no destructors, no vtables**
+
+Zig rejects object-oriented inheritance for several reasons:
+
+1. **Data layout fragmentation** – Base classes introduce vtables and indirect dispatch.
+2. **Hidden behaviour** – Destructors run automatically when a value goes out of scope, potentially freeing memory or closing handles without an explicit `defer`.
+3. **Cognitive overhead** – Inheritance hierarchies require understanding virtual overrides, base constructors, and slicing.
+
+Instead, Zig relies on **composition** (embedding a struct as a field) and **tagged unions** (Chapter 12) for polymorphism. This is explicit: to call a “method” of an embedded field, you write `obj.field.method()`.
+
+**Explicit field initialisation prevents uninitialised reads**
+
+Many languages auto‑initialise fields to zero/null. Zig chooses the opposite: fields not provided in the struct literal become `undefined`. This forces you to think about whether a field needs a proper value before use. Combined with runtime safety checks (in `Debug` and `ReleaseSafe` modes), reading an `undefined` field triggers a panic instead of propagating garbage. This catches bugs early.
+
+**No implicit `this` / `self`**
+
+A function that takes a struct as its first parameter is not magically bound to the struct. There is no special `self` keyword unless you define a parameter called `self`. This eliminates confusion about whether a function is polymorphic or not. It also makes it obvious that the function does not own the struct (if the parameter is `*const Self`) or may modify it (if `*Self`).
+
+**`packed` and `extern` are deliberate opt‑ins**
+
+Most code should use normal structs. By forcing you to write `packed` or `extern` explicitly, Zig ensures that bit‑level layout control and C ABI compatibility are **visible** in the source. This avoids surprises when moving code between platforms or when performance expectations change.
+
+---
+
+### 11.4 Competing Approaches
+
+**C structs**
+
+C structs have identical runtime semantics: no methods, pass‑by‑copy, and a similar layout model. However, C lacks namespacing (functions must be prefixed), has no built‑in safety for `undefined` fields, and requires manual handling of alignment via compiler extensions. Zig’s `extern struct` is exactly a C struct, but with the added benefit of compile‑time checks and namespaced functions.
+
+**C++ structs/classes**
+
+C++ structs are actually classes with public members. They support:
+- Constructors and destructors (implicit control flow)
+- Inheritance and vtables (hidden indirection)
+- Operator overloading (hidden function calls)
+- Access control (`private`/`protected`)
+
+Zig rejects all of these because they violate “explicit is better than implicit”. A C++ assignment may call an assignment operator, which could allocate, throw, or modify global state. In Zig, `a = b` is always a bitwise copy (for structs) – nothing more.
+
+**Rust structs**
+
+Rust’s structs share many traits with Zig’s: no inheritance, no default field values, and methods are just functions in an `impl` block. However, Rust has:
+- **Move semantics by default** – assigning a struct that does not implement `Copy` moves ownership and invalidates the source.
+- **Drop trait** – destructors that run implicitly when a value goes out of scope.
+- **Traits** – a form of compile‑time polymorphism with method dispatch (similar to Zig’s comptime duck‑typing but with explicit trait bounds).
+
+Zig’s approach is more uniform: all types are `Copy` in the sense that assignment copies bits. There is no move or borrow checker for structs (though pointers have lifetimes). Zig’s lack of destructors means you must call `deinit` manually – an explicit cost.
+
+**Go structs**
+
+Go also has structs without inheritance, and methods are ordinary functions with a receiver. Differences:
+- Go’s garbage collector means you rarely think about deinitialisation.
+- Go has embedded fields that promote methods (syntactic sugar for delegation), whereas Zig requires explicit qualification.
+- Go’s structs are passed by value, but the programmer often uses pointers to avoid copying.
+
+Zig’s explicit memory management and lack of GC make struct ownership and lifetime much more visible.
+
+---
+
+### 11.5 Common Mistakes
+
+**1. Forgetting that fields default to `undefined`**
+
+```zig
+const Timer = struct { start: u64, elapsed: u64 };
+var t = Timer{ .start = 100 };
+// t.elapsed is undefined – reading it is safety-checked UB.
+```
+
+**Fix**: Always initialise all fields, or use an `init` function that sets reasonable defaults.
+
+**2. Assuming structs are passed by reference**
+
+```zig
+fn reset(p: Point) void {
+    p.x = 0; p.y = 0; // Modifies a copy!
+}
+```
+
+**Fix**: Pass `*Point` when mutation is needed. Conversely, don’t take pointers unnecessarily for read‑only access; copies are cheap for small structs.
+
+**3. Using `packed struct` for performance without measuring**
+
+Packed structs trade space (no padding) for time (bit‑field access requires masks and shifts). On some architectures, unaligned access may be expensive or trap. Use normal structs for hot paths; reserve `packed` for binary protocols or memory‑constrained layouts.
+
+**4. Misunderstanding `packed` and endianness**
+
+```zig
+const Header = packed struct { port: u16, flags: u8 };
+const h = Header{ .port = 0x1234, .flags = 0x56 };
+// On little-endian, the raw bytes are: 0x34, 0x12, 0x56
+```
+
+**Fix**: When reading/writing network protocols, convert integers to/from network byte order explicitly.
+
+**5. Self‑referential structs without pointer indirection**
+
+```zig
+// This does NOT compile:
+// struct Node { value: u32, next: Node }
+```
+
+Zig requires a pointer for self‑reference because the size of a struct cannot be infinite.
+
+```zig
+const Node = struct {
+    value: u32,
+    next: ?*Node, // OK: pointer has known size
+};
+```
+
+**6. Over‑using opaque types**
+
+`opaque {}` declares an incomplete type with unknown size. It’s useful for C-style forward declarations but common mistakes include trying to instantiate an opaque struct or access its fields. You can only hold pointers to opaque types.
+
+---
+
+### 11.6 Performance Considerations
+
+**Copy cost and ABI**
+
+Passing a struct by value copies `@sizeOf(T)` bytes. For large structs (e.g., several cache lines), this can be expensive. However, the C ABI often passes small structs in registers (two 8‑byte fields or less on x86‑64). Zig follows the native C ABI for `extern struct`s, so performance mirrors C.
+
+For normal Zig structs, the compiler may also optimise away copies in many cases (e.g., when the copy is immediately used and then discarded). But you cannot rely on this; use pointers for large (>64 bytes) or frequently copied structs.
+
+**Padding and cache line utilisation**
+
+Default struct padding can waste space and reduce effective cache capacity. For arrays of large structs, consider reordering fields by decreasing alignment requirements (largest alignment first) to minimise padding. Zig does **not** automatically reorder fields, so you have control.
+
+Example of optimal field order:
+
+```zig
+// Poor: 8 bytes alignment for u64 forces padding after u8
+struct { a: u8, b: u64, c: u32 }  // 8+8+4+4? Actually 24 bytes on x64
+
+// Better: largest alignment first
+struct { b: u64, c: u32, a: u8 }   // 8+4+1+3 padding = 16 bytes
+```
+
+**Packed struct performance**
+
+Accessing a bit‑field in a packed struct compiles to a sequence of shifts and masks. For example, reading a `u3` field at bit offset 5 generates:
+
+```asm
+mov eax, [rdi]      ; load whole integer
+shr eax, 5          ; shift right to align LSB
+and eax, 7          ; mask 3 bits
+```
+
+This is fast (a few ALU ops) but not as fast as a single load for a byte‑aligned field. In tight loops, this overhead matters. Use packed structs only for space‑critical or hardware‑mapping scenarios.
+
+**Extern struct and ABI stability**
+
+`extern struct` guarantees the platform’s C ABI layout, which may involve slower alignment padding than a custom layout. However, it is mandatory for FFI. If you control both sides, normal structs give the compiler more optimisation freedom.
+
+**Inlining of methods**
+
+Because “methods” are just functions, the Zig compiler (via LLVM) freely inlines them when beneficial, especially if defined in the same file and not exported. Inlining can reduce call overhead and enable further optimisations like constant propagation across fields.
+
+---
+
+### 11.7 Best Practices
+
+**1. Use `init` and `deinit` for heap‑allocated structs**
+
+Always pair an `init` that possibly allocates with a `deinit` that frees. Document that the caller must call `deinit`.
+
+```zig
+const MyStruct = struct {
+    allocator: std.mem.Allocator,
+    data: []u8,
+
+    pub fn init(allocator: std.mem.Allocator, size: usize) !MyStruct {
+        return MyStruct{
+            .allocator = allocator,
+            .data = try allocator.alloc(u8, size),
+        };
+    }
+
+    pub fn deinit(self: *MyStruct) void {
+        self.allocator.free(self.data);
+        self.* = undefined;
+    }
+};
+```
+
+**2. Prefer composition over inheritance**
+
+If you want to reuse behaviour from another struct, embed it as a field and manually delegate methods when necessary.
+
+```zig
+const Logger = struct {
+    level: Level,
+    pub fn log(self: *Logger, msg: []const u8) void { ... }
+};
+
+const NetworkService = struct {
+    logger: Logger,  // composition
+    socket: Socket,
+
+    pub fn log(self: *NetworkService, msg: []const u8) void {
+        self.logger.log(msg);  // explicit delegation
+    }
+};
+```
+
+**3. Use `const self` parameters for read‑only methods**
+
+When a method does not modify the struct, mark the `self` parameter as `const` to allow calling on const values and to communicate intent.
+
+```zig
+fn magnitude(self: const Vec3) f32 { ... }
+```
+
+**4. Name the first parameter `self` or `ctx`**
+
+Consistency across a codebase improves readability. The standard library uses `self` for methods that logically belong to the type and `ctx` for allocator‑like contexts.
+
+**5. Use `packed struct` only for bit protocols or tiny flags**
+
+For networking headers, register maps, or state flags, `packed struct` is excellent. For general‑purpose data, avoid it.
+
+**6. Expose fields unless invariants require hiding**
+
+Zig has no `private` keyword. Idiomatic Zig exposes fields directly when there are no invariants to maintain. If invariants exist (e.g., a `len` that must match the actual slice length), provide functions to modify them and comment why direct access is discouraged.
+
+**7. Define tests inside the struct namespace**
+
+Tests can be placed right after the struct definition using `test` blocks. This ties tests to the code.
+
+```zig
+const Vec3 = struct {
+    x: f32, y: f32, z: f32,
+
+    fn dot(a: Vec3, b: Vec3) f32 { ... }
+
+    test "dot product" {
+        const v1 = Vec3{ .x = 1, .y = 2, .z = 3 };
+        const v2 = Vec3{ .x = 4, .y = 5, .z = 6 };
+        try std.testing.expectEqual(@as(f32, 32), dot(v1, v2));
+    }
+};
+```
+
+---
+
+### 11.8 Examples
+
+**Example 1: A 3D vector type with basic arithmetic**
+
+This example shows a normal struct, a `const self` method, and an in‑place modifying method. It uses no allocations and can be compiled with `zig build-exe example1.zig`.
+
+```zig
+const std = @import("std");
+
+const Vec3 = struct {
+    x: f32,
+    y: f32,
+    z: f32,
+
+    pub fn length(self: Vec3) f32 {
+        return @sqrt(self.x * self.x + self.y * self.y + self.z * self.z);
+    }
+
+    pub fn normalized(self: Vec3) Vec3 {
+        const inv_len = 1.0 / self.length();
+        return Vec3{
+            .x = self.x * inv_len,
+            .y = self.y * inv_len,
+            .z = self.z * inv_len,
+        };
+    }
+
+    pub fn add(self: *Vec3, other: Vec3) void {
+        self.x += other.x;
+        self.y += other.y;
+        self.z += other.z;
+    }
+};
+
+pub fn main() !void {
+    var a = Vec3{ .x = 1.0, .y = 0.0, .z = 0.0 };
+    const b = Vec3{ .x = 0.0, .y = 1.0, .z = 0.0 };
+    a.add(b);
+    std.debug.print("a = ({d:.1}, {d:.1}, {d:.1})\n", .{ a.x, a.y, a.z });
+    // Output: a = (1.0, 1.0, 0.0)
+}
+```
+
+**Example 2: Packed struct for a 32‑bit colour with bitfields**
+
+This demonstrates reading and writing individual colour components while the whole value fits in a `u32`. Useful for framebuffers or serialisation.
+
+```zig
+const std = @import("std");
+
+const Color = packed struct(u32) {
+    r: u8,  // bits 0..7
+    g: u8,  // bits 8..15
+    b: u8,  // bits 16..23
+    a: u8,  // bits 24..31
+};
+
+pub fn main() void {
+    var c = Color{ .r = 0xFF, .g = 0x80, .b = 0x40, .a = 0x00 };
+    const raw = @as(u32, @bitCast(c));
+    std.debug.print("raw = 0x{X:0>8}\n", .{raw}); // little-endian: 0x004080FF
+
+    // Modify the red component
+    c.r = 0x10;
+    std.debug.print("red = {}\n", .{c.r}); // 16
+}
+```
+
+**Example 3: Extern struct for C interop (POSIX timespec)**
+
+This shows how to match C’s `struct timespec` and call a C function (here we simulate with a Zig function that expects the same layout).
+
+```zig
+const std = @import("std");
+
+const Timespec = extern struct {
+    tv_sec: i64,
+    tv_nsec: i64,
+};
+
+// Simulate a C function that expects a timespec pointer
+extern fn clock_gettime(clk_id: i32, tp: *Timespec) i32;
+
+// Provide a dummy implementation when not linking libc
+fn clock_gettime_dummy(_: i32, tp: *Timespec) i32 {
+    tp.* = Timespec{ .tv_sec = 123456, .tv_nsec = 789 };
+    return 0;
+}
+const clock_gettime = if (@import("builtin").link_libc) clock_gettime else clock_gettime_dummy;
+
+pub fn main() !void {
+    var ts: Timespec = undefined;
+    _ = clock_gettime(0, &ts);
+    std.debug.print("sec={}, nsec={}\n", .{ ts.tv_sec, ts.tv_nsec });
+}
+```
+
+Compile with `zig build-exe example3.zig -lc` to use the real `clock_gettime` (on POSIX systems).
+
+---
+
+### 11.9 Summary & Exercises
+
+**Summary**
+
+- Zig structs are plain data aggregates with no hidden behaviour. They have no constructors, destructors, inheritance, or operator overloading.
+- Fields default to `undefined` unless explicitly set, encouraging deliberate initialisation.
+- Normal structs have compiler‑controlled padding; `packed struct` eliminates padding and allows bit‑fields; `extern struct` guarantees C ABI compatibility.
+- Composition (embedding a struct as a field) replaces inheritance. Method‑like functions are ordinary functions that take `self` or `*self`.
+- Performance: pass small structs by value, larger ones by pointer; be aware of padding for cache efficiency; use `packed` sparingly.
+- Best practices: provide `init`/`deinit` for heap‑allocated types, prefer composition, use `const self` for read‑only methods, and place tests inside the struct namespace.
+
+**Exercises**
+
+1. **2D vector with arena allocation**
+   Write a struct `Vec2` with `x: f64, y: f64`. Implement methods `add`, `sub`, `dot`, and `length`. Then write a function `fn scale_many(allocator: std.mem.Allocator, vectors: []const Vec2, factor: f64) ![]Vec2` that returns a newly allocated slice of scaled vectors. Use `std.testing.allocator` in a test to verify correct results and no leaks.
+
+2. **TCP header as a packed struct**
+   Define a `packed struct` representing a TCP header (RFC 9293):
+   - Source port (16 bits)
+   - Destination port (16 bits)
+   - Sequence number (32 bits)
+   - Acknowledgment number (32 bits)
+   - Data offset (4 bits), reserved (3 bits), flags (9 bits – NS, CWR, ECE, URG, ACK, PSH, RST, SYN, FIN)
+   - Window size (16 bits)
+   - Checksum (16 bits)
+   - Urgent pointer (16 bits)
+   Write functions to convert the header to/from a `[20]u8` buffer, handling network byte order (big‑endian) correctly. Test by encoding a header, sending it through a byte array, and decoding it on the other side.
+
+3. **Self‑referential intrusive linked list**
+   Implement an intrusive singly‑linked list where the node struct is defined as:
+   ```zig
+   const Node = struct {
+       value: u32,
+       next: ?*Node,
+   };
+   ```
+   Write functions to prepend a node (given `**Node` head pointer), traverse the list and print values, and free all nodes using an explicit `Allocator`. Use `std.testing.allocator` and verify that no memory is leaked. Extend the exercise to a doubly‑linked list with a `prev: ?*Node` field. This pattern is common in kernel and embedded code where allocation is separate from list logic.

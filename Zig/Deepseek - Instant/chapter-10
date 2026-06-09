@@ -1,0 +1,547 @@
+# Chapter 10: Arrays, Slices, and Pointers
+
+In systems programming, few concepts are as fundamental—or as perilous—as the way we lay out collections of data in memory and refer to them. Zig’s approach refines the C heritage by making explicit distinctions that C glosses over, eliminating entire classes of bugs while retaining full control over memory layout and access patterns. This chapter dissects the three core sequence types: fixed-size **arrays**, runtime-sized **slices**, and the various **pointer** types that bridge them to the rest of the language.
+
+---
+
+## 10.1 Basic Usage
+
+### Arrays – Fixed Size at Compile Time
+
+An array in Zig has a length known at compile time, and that length is part of the type. This is a *value semantics* type: assigning an array copies it element‑by‑element.
+
+```zig
+const std = @import("std");
+
+pub fn main() !void {
+    // Explicit type: [5]i32
+    var a: [5]i32 = undefined;
+    a[0] = 10;
+    a[1] = 20;
+    // The rest remain undefined (runtime safety will trap if read)
+
+    // Initialization with known values
+    const b = [3]u8{ 1, 2, 3 };
+
+    // Type inference from the literal
+    const c = [_]f64{ 1.0, 2.0, 3.0 }; // _ means "infer the length"
+
+    // Common operations
+    std.debug.print("len a = {d}\n", .{a.len});
+    std.debug.print("b[1] = {d}\n", .{b[1]});
+
+    // Iteration
+    for (c, 0..) |val, idx| {
+        std.debug.print("c[{}] = {d}\n", .{ idx, val });
+    }
+}
+```
+
+**Key points:**
+- `[N]T` is a concrete type distinct from `[M]T`.
+- Assignment `let x = a` produces a full copy (no hidden pointer decay).
+- The length is obtained via `array.len`, a compile‑time known value.
+
+### Slices – Pointer + Length at Runtime
+
+A slice `[]T` is a fat pointer carrying both a pointer to the first element and a runtime length. Slices provide safe, bounds‑checked views into contiguous sequences.
+
+```zig
+const std = @import("std");
+
+pub fn main() !void {
+    var array = [_]i32{ 10, 20, 30, 40, 50 };
+    // Create a slice covering the entire array
+    let full_slice: []i32 = &array;
+    // Create a subslice: elements 1 through 3 (indices 1,2,3)
+    let slice = array[1..4]; // []i32{20, 30, 40}
+
+    std.debug.print("slice.len = {d}\n", .{slice.len});
+    std.debug.print("slice.ptr = {*}\n", .{slice.ptr});
+
+    // Slices can be mutated if the underlying memory is mutable
+    slice[0] = 99; // now array[1] == 99
+
+    // Slicing with comptime-known bounds produces a known length type
+    const known_len_slice: *[3]i32 = array[1..4]; // pointer to array of length 3
+}
+```
+
+**Slice literal syntax:** `array[start..end]` where `start` and `end` are `usize` indices. The resulting slice includes `start` and excludes `end`. The shorthand `array[0..array.len]` is common, but `&array` (taking a slice of the whole array) is more idiomatic.
+
+### Pointer Types – Precision for Different Purposes
+
+Zig distinguishes several pointer kinds, each with a specific use case:
+
+| Syntax      | Name                  | Dereference | Points to                        |
+|-------------|-----------------------|-------------|----------------------------------|
+| `*T`        | Single-item pointer   | `ptr.*`     | Exactly one `T`                  |
+| `[*]T`      | Many-item pointer     | `ptr[i]`    | Contiguous sequence (C‑style)    |
+| `*const T`  | Immutable single-item | `ptr.*` (read‑only) | One `T`            |
+| `[*]const T`| Immutable many-item   | `ptr[i]`    | Read‑only sequence               |
+| `?*T`       | Optional single-item  | `ptr.?.*`   | One `T` or `null`                |
+
+```zig
+const std = @import("std");
+
+pub fn main() !void {
+    var x: i32 = 42;
+    var y: i32 = 99;
+
+    // Single-item pointer
+    const ptr: *i32 = &x;
+    ptr.* = 100; // x becomes 100
+    std.debug.print("x = {d}\n", .{x});
+
+    // Many-item pointer: points to an array without length info
+    var arr = [_]i32{ 1, 2, 3, 4 };
+    const many_ptr: [*]i32 = &arr;
+    many_ptr[2] = 30; // arr[2] == 30
+
+    // Optional pointer (nullable)
+    var opt_ptr: ?*i32 = null;
+    opt_ptr = &y;
+    if (opt_ptr) |p| {
+        p.* = 200; // y becomes 200
+    }
+
+    // Pointer arithmetic is allowed only on [*]T
+    const second = many_ptr + 1; // points to arr[1]
+    std.debug.print("second = {d}\n", .{second.*});
+}
+```
+
+**Important:** `*[N]T` (pointer to an array) is distinct from `[*]T`. The former preserves length information, the latter does not. Zig prefers slices `[]T` over raw many‑item pointers because slices carry safety information.
+
+---
+
+## 10.2 Under the Hood
+
+### Memory Layout
+
+**Arrays:** An `[N]T` occupies exactly `N * @sizeOf(T)` contiguous bytes, with no extra overhead. The address of the first element equals the address of the array itself.
+
+```
+array: [  T0  ][  T1  ][  T2  ] ... [ T{N-1} ]
+        ^
+        array & array[0] have same address
+```
+
+**Slices:** A slice `[]T` is a two‑word structure (16 bytes on 64‑bit systems):
+- `.ptr: [*]T` – pointer to the first element
+- `.len: usize` – number of elements
+
+No capacity field exists; slices are *views*, not owning containers. When you pass a slice to a function, you are passing these two words by value (copying the pointer and length). This is inexpensive.
+
+**Pointers:**
+- `*T` is a single word holding an address. The compiler assumes the address points to exactly one valid `T`.
+- `[*]T` is also a single word, but it signals the programmer that pointer arithmetic and indexing are allowed. No length is stored.
+
+### Bounds Checking and Safety
+
+In `Debug` and `ReleaseSafe` modes, every slice access `slice[i]` and every array access `array[i]` inserts a runtime check: `if (i >= slice.len) unreachable` (which becomes a panic). `ReleaseFast` and `ReleaseSmall` omit these checks. This is a deliberate trade‑off between safety and performance, controlled by the build mode.
+
+### Comptime and Arrays
+
+Array lengths must be compile‑time known. However, you can use `comptime` expressions to compute them:
+
+```zig
+fn comptimeLen(comptime n: usize) type {
+    return [n]u8;
+}
+const MyArray = comptimeLen(10);
+var arr: MyArray = undefined; // arr is [10]u8
+```
+
+Slices can have runtime lengths, but slicing an array with runtime indices produces a slice whose length is a runtime value. If both indices are comptime-known, the result is a pointer to an array `*[N]T`.
+
+### Sentinel Termination and the `[:0]T` Slice
+
+Zig supports null‑terminated slices for C interop: `[:0]const u8` is a slice that guarantees a `0` byte immediately after `slice.len`. This is not a separate type under the hood; it’s a slice with an extra invariant that the compiler uses for optimizations.
+
+---
+
+## 10.3 Why This Design?
+
+### No Implicit Decay – Explicitness Over Convenience
+
+In C, an array used in an expression “decays” to a pointer to its first element, discarding length information. This is the root cause of countless buffer overflows and `sizeof` confusion. Zig **never** performs implicit decay. If you want a pointer to the first element, write `&array` (which gives a slice) or `&array[0]` (which gives `*T`). If you want the array as a value, it stays an array.
+
+**Why this matters:** The programmer must be intentional about when they are discarding length information. This makes code review easier and eliminates “I thought this was an array but it’s a pointer” bugs.
+
+### Slices as the Universal View Type
+
+Many languages have separate concepts for “array reference” (Go’s slices), “span” (C++’s `std::span`), or “array slice” (Rust). Zig bakes the slice into the core language as the default way to pass a sequence of elements whose length is only known at runtime. The slice is simple, efficient, and works uniformly with arrays, `std.ArrayList`, and other contiguous memory.
+
+### Distinguishing `*T` vs `[*]T`
+
+By having separate pointer types, Zig clarifies intent:
+- `*T`: “I am pointing at **a single** `T`.” Indexing is not allowed; dereference yields `T`.
+- `[*]T`: “I am pointing at the start of **many** `T`s, and I intend to use pointer arithmetic or indexing.”
+
+This distinction prevents accidental out‑of‑bounds when you only meant to hold one item. It also mirrors hardware: a pointer to a single integer is just an address; a pointer to a buffer is the same address but with different semantics.
+
+### Why No Built‑in “Capacity” in Slices?
+
+Zig’s slices do not carry capacity because they are *non‑owning views*. An owning container like `std.ArrayList(T)` tracks capacity separately. This separation of concerns follows the “no hidden control flow” pillar: resizing a slice (e.g., appending) would require an allocator or capacity check, which must be explicit. You cannot accidentally append to a slice.
+
+---
+
+## 10.4 Competing Approaches
+
+### C
+
+| Concept | C | Zig |
+|---------|---|-----|
+| Array of fixed size | `int arr[10];` | `var arr: [10]i32 = undefined;` |
+| Pass array to function | Decays to `int*`, length lost | Pass as `[]i32` (slice) or `*[10]i32` |
+| Pointer to many elements | `int *p;` (no length info) | `[*]i32` or better `[]i32` |
+| Bounds checking | None (unless programmer adds) | Optional (safety modes) |
+| `sizeof` on array | Works (compile‑time) | `@sizeOf([N]T)` works |
+
+C’s decay is the primary source of unsafety. Zig’s explicit slice type eliminates the decay and makes length passing mandatory. Zig also replaces C’s `void*` with typed pointers and optional nullability.
+
+### Rust
+
+Rust’s slices `&[T]` are very similar to Zig’s `[]T` – both are fat pointers (ptr+len). Key differences:
+- Rust’s slices are always immutable unless written `&mut [T]`. Zig’s `[]T` is mutable by default; `[]const T` is the read‑only version.
+- Rust has a borrow checker enforcing that references do not outlive their data. Zig has no borrow checker; the programmer relies on conventions and `defer`/`errdefer` for lifetime management.
+- Rust’s `Vec<T>` owns its data and can grow; Zig’s `std.ArrayList(T)` serves the same role but requires an explicit allocator.
+
+Zig’s philosophy: lifetime correctness is the programmer’s job, but the language gives you the tools (safety modes, explicit allocators) to avoid mistakes without the complexity of a region‑based borrow checker.
+
+### Go
+
+Go slices have three fields: pointer, length, **and capacity**. They support append with potential reallocation. This convenience hides allocations and can lead to surprising sharing behavior (two slices sharing the same underlying array but with different capacities). Zig’s slices lack capacity because resizing is not a slice operation – you must use `std.ArrayList` or similar, making allocations visible.
+
+### C++
+
+C++ offers `std::array<T, N>` (fixed size, value semantics), `std::vector<T>` (owning, dynamic), and `std::span<T>` (non‑owning view). Zig’s `[N]T` corresponds to `std::array`, `[]T` to `std::span`, and `std.ArrayList(T)` to `std::vector`. The difference: Zig’s span (`[]T`) is a first‑class language type with built‑in syntax and bounds checking in safety modes, whereas `std::span` is a library feature added in C++20. Zig avoids the template metaprogramming needed to make `std::span` generic.
+
+---
+
+## 10.5 Common Mistakes
+
+### Use‑After‑Free of Stack Memory
+
+```zig
+fn bad() *i32 {
+    var x: i32 = 42;
+    return &x; // ERROR: pointer to local variable escapes
+}
+```
+
+Zig’s compiler prevents returning pointers to stack variables. But the equivalent with slices is not always caught:
+
+```zig
+fn badSlice() []i32 {
+    var arr = [_]i32{ 1, 2, 3 };
+    return arr[0..]; // ERROR: slice of local variable escapes
+}
+```
+
+The compiler detects this. However, if you allocate on the heap and then free too early, Zig’s safety checks may not catch it:
+
+```zig
+const std = @import("std");
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    let slice = try allocator.alloc(u8, 10);
+    defer allocator.free(slice);
+    let dangling = slice; // OK
+    // ... later, after free, 'dangling' is use‑after‑free
+}
+```
+
+**Fix:** Use `defer` carefully and consider arena allocators for temporary data.
+
+### Confusing `*[N]T` with `[]T`
+
+```zig
+var arr = [_]i32{1,2,3};
+const ptr_to_array: *[3]i32 = &arr;     // points to entire array
+const slice: []i32 = &arr;               // same memory, different type
+```
+
+`ptr_to_array.len` is known at compile time; `slice.len` is runtime. Many operations expect a slice, so you often convert: `const s = ptr_to_array[0..];`.
+
+### Forgetting That Slices Are Two Words
+
+Passing a slice to a function copies the pointer and length. Modifying the pointer in the function does **not** affect the caller’s pointer. This can lead to surprises when you want to re‑slice or advance:
+
+```zig
+fn advance(s: []u8, n: usize) void {
+    s = s[n..]; // This only changes the local copy!
+}
+// In caller: slice unchanged.
+```
+
+**Fix:** Return the new slice or pass a pointer to the slice: `fn advance(s: *[]u8, n: usize) void`.
+
+### Null Assumptions with `[*:0]T`
+
+When interfacing with C, you might use `[*:0]const u8` for null‑terminated strings. Zig does **not** guarantee that memory beyond the sentinel is accessible. Forcing a slice to a sentinel‑terminated pointer without checking the sentinel is unsafe.
+
+### Indexing with the Wrong Type
+
+```zig
+var slice: []u8 = ...;
+var idx: u32 = 5;
+_ = slice[idx]; // Compile error: expected usize, found u32
+```
+
+Zig requires `usize` for indexing because array lengths are `usize`. Use `@intCast(usize, idx)` after validating bounds.
+
+---
+
+## 10.6 Performance Considerations
+
+### Bounds Check Overhead
+
+In `Debug` and `ReleaseSafe`, each `slice[i]` emits a comparison and conditional branch. For tight loops, this can be significant. Use `ReleaseFast` when you have proven by other means that indices are valid, or iterate with `for (slice) |item|` which avoids explicit indexing and has no per‑iteration bounds check (the loop length is determined once).
+
+```zig
+// Good – no bounds checks inside loop
+for (slice) |val| {
+    // use val
+}
+
+// Less good – bounds check on each iteration
+for (slice, 0..) |_, i| {
+    _ = slice[i];
+}
+```
+
+### Copy Overhead of Arrays
+
+Passing an array by value copies `N * sizeof(T)` bytes. For large arrays, pass a slice or pointer to the array:
+
+```zig
+fn process(arr: []u32) void { ... }  // view, no copy
+fn processLarge(arr: *[10000]u32) void { ... } // pointer to array, no copy
+```
+
+### Cache Locality
+
+Arrays and slices provide excellent cache locality because elements are contiguous. Zig’s `std.mem.copy` and `std.mem.set` are optimized for this layout. However, pointer indirection (e.g., `[]*T`) destroys locality; consider storing `T` directly.
+
+### Many‑Item Pointer Arithmetic
+
+Using `[*]T` and manual pointer arithmetic (`ptr + i`) can be faster than slice indexing in `ReleaseFast` because the compiler may not need to re‑fetch the length. But this is micro‑optimization; prefer slices and only drop to `[*]T` when profiling shows a benefit.
+
+### Slice Creation Overhead
+
+Slicing an existing array or slice is just creating a new two‑word struct; it has no allocation cost. This makes slice views extremely cheap.
+
+### Alignment
+
+If you need aligned pointers for SIMD or hardware registers, use `@alignCast` and the `align` attribute on pointers. Slices inherit alignment from their underlying data.
+
+---
+
+## 10.7 Best Practices
+
+### 1. Prefer `[]T` for Function Parameters
+
+When you need a read‑only or mutable view into a sequence, take a slice. It works with arrays, `ArrayList`, and any other contiguous memory.
+
+```zig
+fn sum(values: []const i32) i32 {
+    var total: i32 = 0;
+    for (values) |v| total += v;
+    return total;
+}
+```
+
+### 2. Use `[]const T` for Immutable Access
+
+If you don’t need to modify the elements, write `[]const T` instead of `[]T`. This allows the caller to pass both mutable and immutable slices and documents your intent.
+
+### 3. Avoid `[*]T` Unless Doing C Interop
+
+Raw many‑item pointers lack length information and bounds checking. For internal Zig code, use slices. For C callbacks that demand `[*]T`, wrap them in a safe slice as soon as possible.
+
+### 4. Return Slices from Functions When Borrowing
+
+If a function returns a view into memory it does not own (e.g., a slice of a struct field), document the lifetime conventions. Zig has no borrow checker, so convention and careful code review must suffice.
+
+### 5. Use `&array` to Get a Full Slice
+
+`&array` where `array: [N]T` produces `[]T`. This is cleaner than `array[0..]`.
+
+### 6. Compile‑Time Array Bounds Validation
+
+For arrays with known bounds, use comptime to validate indices:
+
+```zig
+fn getAt(comptime idx: usize, arr: anytype) @TypeOf(arr)[idx] {
+    if (idx >= arr.len) @compileError("Index out of bounds");
+    return arr[idx];
+}
+```
+
+### 7. Prefer Iterators Over Manual Indexing
+
+```zig
+for (slice, 0..) |item, i| { // only when you need the index
+    // ...
+}
+```
+
+---
+
+## 10.8 Examples
+
+### Example 1: In‑Place Slice Reversal
+
+```zig
+const std = @import("std");
+
+fn reverse(slice: []u8) void {
+    var i: usize = 0;
+    while (i < slice.len / 2) : (i += 1) {
+        const j = slice.len - 1 - i;
+        const tmp = slice[i];
+        slice[i] = slice[j];
+        slice[j] = tmp;
+    }
+}
+
+pub fn main() !void {
+    var arr = [_]u8{ 'a', 'b', 'c', 'd', 'e' };
+    reverse(&arr);
+    std.debug.print("{s}\n", .{arr}); // prints "edcba"
+}
+```
+
+### Example 2: Using Pointers for Out Parameters
+
+```zig
+const std = @import("std");
+
+/// Splits a slice into two at the first occurrence of `sep`.
+/// Returns true and sets `before` and `after` if found; otherwise returns false.
+fn splitFirst(slice: []const u8, sep: u8, before: *[]const u8, after: *[]const u8) bool {
+    for (slice, 0..) |c, i| {
+        if (c == sep) {
+            before.* = slice[0..i];
+            after.* = slice[i+1..];
+            return true;
+        }
+    }
+    return false;
+}
+
+pub fn main() !void {
+    const input = "hello,world";
+    var first: []const u8 = undefined;
+    var second: []const u8 = undefined;
+    if (splitFirst(input, ',', &first, &second)) {
+        std.debug.print("'{s}' and '{s}'\n", .{ first, second });
+    }
+}
+```
+
+### Example 3: Fixed‑Capacity Stack Using an Array
+
+```zig
+const std = @import("std");
+
+fn Stack(comptime T: type, comptime capacity: usize) type {
+    return struct {
+        const Self = @This();
+        data: [capacity]T = undefined,
+        len: usize = 0,
+
+        pub fn push(self: *Self, value: T) !void {
+            if (self.len >= capacity) return error.Overflow;
+            self.data[self.len] = value;
+            self.len += 1;
+        }
+
+        pub fn pop(self: *Self) !T {
+            if (self.len == 0) return error.Underflow;
+            self.len -= 1;
+            return self.data[self.len];
+        }
+
+        pub fn peek(self: *const Self) ?T {
+            if (self.len == 0) return null;
+            return self.data[self.len - 1];
+        }
+
+        pub fn slice(self: *const Self) []const T {
+            return self.data[0..self.len];
+        }
+    };
+}
+
+pub fn main() !void {
+    var stack = Stack(i32, 10){};
+    try stack.push(100);
+    try stack.push(200);
+    std.debug.print("pop = {d}\n", .{try stack.pop()}); // 200
+    std.debug.print("peek = {?d}\n", .{stack.peek()}); // 100
+}
+```
+
+### Example 4: Arena‑Allocated Slice of Strings
+
+```zig
+const std = @import("std");
+
+pub fn main() !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Allocate a slice of strings
+    var strings = std.ArrayList([]const u8).init(allocator);
+    defer strings.deinit();
+
+    const names = [_][]const u8{ "Zig", "Rust", "C", "Go" };
+    try strings.appendSlice(&names);
+
+    // Append a dynamically constructed string
+    const dynamic = try std.fmt.allocPrint(allocator, "v{d}", .{0});
+    try strings.append(dynamic);
+
+    for (strings.items) |s| {
+        std.debug.print("{s}\n", .{s});
+    }
+}
+```
+
+All examples compile with `zig build-exe` or `zig test`. The arena allocator ensures all memory is freed at once.
+
+---
+
+## 10.9 Summary & Exercises
+
+### Summary
+
+- **Arrays** `[N]T` are fixed‑size, value types with compile‑time length. They never decay to pointers.
+- **Slices** `[]T` are fat pointers (ptr+len) providing safe, runtime‑sized views into contiguous memory. They are the preferred way to pass sequences in Zig.
+- **Pointers** come in several flavors: `*T` (single item), `[*]T` (many‑item, no length), and optional versions. Use the simplest that meets your need.
+- **Safety:** Bounds checking in `Debug`/`ReleaseSafe` prevents buffer overflows; `ReleaseFast` removes checks for performance.
+- **Explicitness:** No hidden control flow, no implicit decay, no hidden capacity – every operation that could fail or allocate is visible.
+
+### Exercises
+
+**Exercise 1: Rotate Slice in‑Place**
+Write a function `rotateLeft(slice: []u8, k: usize) void` that rotates the slice left by `k` positions. For example, `[a,b,c,d,e]` rotated left by 2 becomes `[c,d,e,a,b]`. Do this in O(n) time with O(1) extra memory (use three reverses trick). Add a test block.
+
+**Exercise 2: Generic Bounded Queue (Ring Buffer)**
+Implement a circular queue `RingBuffer(T, capacity)` backed by a fixed array. Provide `push` (returns `!void`), `pop` (returns `!T`), and `isEmpty()`/`isFull()`. Use modulo indexing. Ensure that pushing when full returns `error.Overflow` and popping when empty returns `error.Underflow`. Write a test that exercises wrap‑around.
+
+**Exercise 3: Longest Common Prefix of Two Slices**
+Write a function `longestCommonPrefix(a: []const u8, b: []const u8) []const u8` that returns a slice of the longest common prefix. The returned slice must be a subslice of `a` (i.e., no allocation). Edge cases: empty strings, no common prefix. Write a test with several examples.
+
+**Exercise 4: Debug vs. ReleaseFast Performance**
+Write a benchmark that sums 10 million integers in a slice using two methods: (a) manual indexing with `slice[i]`, (b) `for (slice) |x|`. Compile with `-Drelease-fast` and `-Drelease-safe`. Measure the time using `std.time.Timer`. Observe the impact of bounds checks. Report the ratio.
+
+*These exercises reinforce ownership, bounds safety, and slice manipulation without hidden allocations. Solutions should be idiomatic, include `test` blocks, and use `std.testing.allocator` for any required allocations.*

@@ -1,0 +1,470 @@
+## Chapter 24: Threads and the Memory Model
+
+### 1. Basic Usage
+
+Zig’s standard library exposes operating system threads directly through `std.Thread`. Spawning a thread requires a function that takes a single `*anyopaque` argument (or can be coerced), and returns `void` or `!void`. You pass the argument via a `struct` or a context pointer.
+
+**Spawning and joining a thread:**
+```zig
+const std = @import("std");
+
+fn worker(user_data: *anyopaque) void {
+    const value = @intFromPtr(user_data);
+    std.debug.print("Worker thread sees value: {d}\n", .{value});
+}
+
+pub fn main() !void {
+    const thread = try std.Thread.spawn(.{}, worker, @ptrFromInt(123));
+    thread.join();  // Wait for the thread to finish
+}
+```
+
+**Passing structured data:**
+```zig
+const std = @import("std");
+
+const Context = struct {
+    allocator: std.mem.Allocator,
+    id: u32,
+};
+
+fn threaded_task(ctx_ptr: *anyopaque) void {
+    const ctx: *Context = @alignCast(@ptrCast(ctx_ptr));
+    defer ctx.allocator.destroy(ctx);
+    std.debug.print("Thread {d} running\n", .{ctx.id});
+}
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const ctx = try allocator.create(Context);
+    ctx.* = .{ .allocator = allocator, .id = 42 };
+    const thread = try std.Thread.spawn(.{}, threaded_task, ctx);
+    thread.join();
+}
+```
+
+**Using a mutex for mutual exclusion:**
+```zig
+const std = @import("std");
+
+var counter: u64 = 0;
+var mutex = std.Thread.Mutex{};
+
+fn increment(iterations: usize) void {
+    for (0..iterations) |_| {
+        mutex.lock();
+        defer mutex.unlock();
+        counter += 1;
+    }
+}
+
+pub fn main() !void {
+    const t1 = try std.Thread.spawn(.{}, increment, .{1_000_000});
+    const t2 = try std.Thread.spawn(.{}, increment, .{1_000_000});
+    t1.join();
+    t2.join();
+    std.debug.print("Counter: {d}\n", .{counter}); // 2,000,000
+}
+```
+
+**Atomics – lock‑free counter:**
+```zig
+const std = @import("std");
+const atomic = std.atomic;
+
+var counter = atomic.Value(u64).init(0);
+
+fn add_no_lock(amount: u64) void {
+    _ = counter.fetchAdd(amount, .monotonic);
+}
+
+pub fn main() !void {
+    const t1 = try std.Thread.spawn(.{}, add_no_lock, .{1_000_000});
+    const t2 = try std.Thread.spawn(.{}, add_no_lock, .{1_000_000});
+    t1.join();
+    t2.join();
+    std.debug.print("Counter: {d}\n", .{counter.load(.monotonic)});
+}
+```
+
+> **Note**
+> `std.Thread.spawn` expects a function that is `ThreadFn`, i.e. `fn (*anyopaque) callconv(.C) void`. The examples above omit `callconv(.C)` for brevity, but Zig will coerce most functions automatically. For strict portability, annotate your thread entry point with `callconv(.C)`.
+
+---
+
+### 2. Under the Hood
+
+Zig maps `std.Thread` directly to the underlying operating system’s threading API: **pthreads** on POSIX systems, **CreateThread** on Windows, and similar on WASI/freestanding targets. There is **no green threading, no user‑space scheduler, and no implicit work stealing**. A `std.Thread` is a kernel‑managed execution context with its own stack and register state.
+
+#### Memory Model
+
+Zig inherits a **“catch fire” data race model** identical to C and C++: if two threads access the same memory location without synchronization and at least one access is a write, the behaviour is **undefined**. The compiler and hardware may reorder, speculate, or tear operations arbitrarily.
+
+To prevent undefined behaviour, Zig provides:
+- **Mutexes, rwlocks, condition variables** (`std.Thread.Mutex`, `std.Thread.RwLock`, `std.Thread.Condition`)
+- **Atomic operations** via `std.atomic.Value(T)` and builtins `@atomicLoad`, `@atomicStore`, `@atomicRmw`, `@cmpxchgWeak`, `@cmpxchgStrong`
+- **Fences** (`@fence`)
+
+The atomic operations follow the **C++20 memory ordering** taxonomy:
+- `.unordered` – No ordering guarantees (only atomicity).
+- `.monotonic` – No synchronisation with other threads, but a single thread sees its own monotonic writes in order.
+- `.acquire` – Prevents subsequent reads/writes from being reordered before the acquire. Synchronises with a `.release` in another thread.
+- `.release` – Prevents preceding reads/writes from being reordered after the release. Synchronises with an `.acquire`.
+- `.acq_rel` – Both acquire and release.
+- `.seq_cst` – Sequentially consistent (strongest, global total order).
+
+**Happens‑before** relationships are established by:
+- Thread spawn (all previous writes in the parent happen before the child’s first read)
+- Thread join (all writes in the child happen before the join returns)
+- Mutex lock/unlock (unlock in thread A happens before lock acquire in thread B)
+- Atomic operations with synchronising orderings (e.g. `release` writes happen before `acquire` reads that see the written value)
+
+**Volatile** (`@volatileCast`, `volatile` keyword on pointers) is **not** a thread‑synchronisation primitive. It only prevents the compiler from eliminating or reordering the access relative to other volatile accesses – it does **not** insert hardware fences or guarantee atomicity. Use atomics for concurrency.
+
+**ThreadSanitizer (TSan)** is available via `-f sanitize=thread` in `build.zig` or on the command line. TSan dynamically instruments loads and stores to detect data races, reporting them with stack traces. It is invaluable for testing concurrent code.
+
+---
+
+### 3. Why This Design?
+
+Zig deliberately avoids providing green threads, async/await, or any form of user‑space scheduling inside the standard library. The reasons are rooted in the language’s core pillars:
+
+**No hidden control flow** – A function call must look like a function call. If `spawn` or `await` could implicitly yield to a scheduler, that would violate the principle of “what you see is what you executes”. OS threads are explicit: `spawn` creates a new kernel thread; `join` blocks.
+
+**No hidden allocations** – Green threads typically require a stack per task, often allocated from a heap. Zig wants the programmer to see every allocation. With `std.Thread`, the OS allocates the stack, but that allocation is outside Zig’s control – a necessary concession to interfacing with the kernel.
+
+**Explicit over implicit** – Scheduling decisions, pre‑emption points, and parallelism are all explicit with OS threads. There is no magical work‑stealing runtime that decides how many threads to run. You, the programmer, call `spawn` exactly when you want another thread.
+
+**FFI and C compatibility** – Many system libraries (CUDA, OpenGL, Win32) are thread‑aware but assume OS threads. Green threads would require complex stack‑hopping or blocking the entire scheduler. Zig’s choice makes wrapping C libraries trivial.
+
+**Simplicity and predictability** – A runtime with green threads brings a scheduler, potentially a garbage collector for tasks, and complex debugging (e.g., “which goroutine deadlocked?”). Zig’s threading model fits in a few hundred lines of code in `std.Thread`, making it easy to reason about and port.
+
+> **Historical note** – Zig experimented with an `async`/`await` feature and a built‑in event loop (circa 0.9–0.11). It was removed because it added complexity, made the compiler harder to maintain, and forced hidden allocations and control flow. The community was encouraged to build asynchronous runtimes as libraries (e.g., `xev`, `zap`).
+
+---
+
+### 4. Competing Approaches
+
+| Language | Threading Model | Why different from Zig |
+|----------|----------------|------------------------|
+| **C** | OS threads (pthreads, win32) | Very similar, but Zig provides `std.Thread` with a uniform API, plus `errdefer` and `defer` for automatic mutex release. Zig’s atomics are built‑in, not library macros. |
+| **C++** | `std::thread` + async/future | C++ adds a memory model with data‑race UB (same as Zig), but also offers `std::async` (may or may not spawn a thread). Zig explicitly avoids “maybe thread” abstractions. |
+| **Rust** | `std::thread` + `Send`/`Sync` traits | Rust’s borrow checker statically prevents data races at compile time. Zig has no such guarantee; you rely on discipline and TSan. On the other hand, Rust’s ownership rules can be restrictive for complex concurrent structures. Zig gives you raw tools and assumes you know what you are doing. |
+| **Go** | Goroutines (green threads on a scheduler) | Go prioritises “scale to millions of tasks” and hides thread management. Zig says “OS threads are enough – if you need millions, design your own explicit work queue.” Go’s goroutines have growable stacks (hidden allocations). Zig’s OS thread stacks are fixed at creation (explicit). |
+| **Java** | `java.lang.Thread` + `ExecutorService` | Java also has OS threads, but the JVM adds a heavyweight memory model (happens‑before, `volatile` is sequentially consistent). Zig’s atomics match hardware capabilities more directly. |
+
+**Zig’s unique take:** No “async function coloring.” Every function in Zig is either blocking (if it calls `join`, `lock`, or system calls) or non‑blocking (if it avoids them). There is no split between async and sync functions. This simplifies generic code and avoids the “function colouring problem” (a term popularised by Bob Nystrom).
+
+---
+
+### 5. Common Mistakes
+
+**1. Data races due to missing synchronisation**
+```zig
+var shared: u32 = 0;
+fn bad_increment() void {
+    for (0..1000) |_| {
+        shared += 1;   // RACE: not atomic, no lock
+    }
+}
+```
+*Fix*: Use a mutex or `atomic.Value`.
+
+**2. Forgetting to join or detach**
+A `std.Thread` that is not joined nor detached leaks its resources (stack, thread handle). Zig does **not** automatically join threads when they go out of scope.
+```zig
+fn leak() !void {
+    _ = try std.Thread.spawn(.{}, worker, .{});
+} // thread continues, but handle is lost – you can never join it
+```
+*Fix*: Store the `Thread` handle and `join()` before returning, or call `thread.detach()` if you truly want a fire‑and‑forget thread (but then ensure no memory leaks).
+
+**3. Use‑after‑free of stack memory from parent thread**
+```zig
+fn parent() !void {
+    var local: u32 = 42;
+    const t = try std.Thread.spawn(.{}, child, &local);
+    t.join(); // If child reads `local` after parent’s stack frame is gone? Actually join waits, so safe here.
+}
+// But if you don't join: parent returns, its stack frame is destroyed,
+// child still reads the invalid pointer.
+```
+*Fix*: Allocate shared data on the heap (e.g., via `allocator.create`), or use a global/static variable.
+
+**4. Using `@volatileCast` or `volatile` for thread safety**
+Volatile does **not** provide atomicity or ordering. It only prevents the compiler from eliding accesses. Two threads incrementing a volatile `int` will still race.
+*Fix*: `std.atomic.Value` or explicit `@atomicRmw`.
+
+**5. Assuming sequential consistency for all atomics**
+The default memory ordering in `std.atomic.Value` methods is `.monotonic` for loads/stores (not `.seq_cst`). Many developers expect stronger semantics and introduce subtle ordering bugs.
+*Fix*: Explicitly pass the required ordering. When in doubt, use `.seq_cst` for correctness, then optimise later.
+
+**6. Deadlocks from inconsistent lock ordering**
+```zig
+mutex1.lock();
+mutex2.lock();
+// ...
+mutex2.unlock();
+mutex1.unlock();
+// Another thread acquires mutex2 then mutex1 -> deadlock.
+```
+*Fix*: Establish a global lock order (e.g., always lock mutex1 before mutex2) or use a try‑lock fallback.
+
+---
+
+### 6. Performance Considerations
+
+**Thread creation overhead** – Spawning an OS thread costs a syscall plus stack allocation (typically 1–8 MB). Creating thousands of threads is prohibitively expensive. For many small tasks, use a **thread pool** (`std.Thread.Pool` or build your own).
+
+**Context switching** – Switching between threads costs at least a round‑trip to the kernel (except for cooperative user‑space threads). High‑contention locks amplify this cost.
+
+**False sharing** – When two threads write to different variables that reside on the same cache line (64 bytes on x86), the hardware invalidates the line across cores, causing excessive cache misses.
+```zig
+// Bad: t1 writes to a[0], t2 writes to a[1] – likely same cache line.
+var a: [64]u64 align(64) = undefined;
+```
+*Fix*: Pad or align shared data to cache line boundaries (`@align(64)` or use `std.atomic.cacheLine`).
+
+**Mutex contention** – A heavily contested mutex forces threads to block in the kernel, or spin (if using `std.Thread.Mutex` which spins a few times before yielding). Reduce contention by:
+- Sharding data (e.g., per‑thread counters that are aggregated later)
+- Using read‑write locks for read‑heavy workloads (`std.Thread.RwLock`)
+- Lock‑free structures (`std.atomic.Queue`, `std.atomic.Stack`)
+
+**Performance of atomics** – On modern CPUs, `.relaxed` operations are nearly as cheap as normal loads/stores. `.acq_rel` costs about 10–30 cycles, `.seq_cst` is the most expensive (often a full memory barrier). Use the weakest ordering that preserves correctness.
+
+**When to use `@fence`** – Sometimes you need ordering without an atomic operation (e.g., to enforce ordering between non‑atomic accesses). Use `@fence(.acquire)`, `@fence(.release)`, or `@fence(.seq_cst)`. But prefer using atomic operations with ordering parameters – they are clearer.
+
+**ThreadSanitizer overhead** – TSan can slow down execution by 5–20× and increase memory usage. Use it only in test mode (`-f sanitize=thread`), never in production releases.
+
+---
+
+### 7. Best Practices
+
+**1. Pass a context struct** – For complex thread tasks, define a `struct` containing allocator, input data, and output channels. Let the thread own its context (and free it on completion).
+
+**2. Use `defer` for mutex unlocking** – This ensures the lock is released even if the thread returns early or hits an error.
+```zig
+mutex.lock();
+defer mutex.unlock();
+```
+
+**3. Prefer message passing over shared memory** – Where possible, send immutable data through a `std.atomic.Queue` or a channel library. This localises state and avoids locking.
+
+**4. Use `std.Thread.Pool` for task parallelism** – For many independent jobs (e.g., map‑reduce), a thread pool amortises creation overhead.
+```zig
+var pool: std.Thread.Pool = undefined;
+try pool.init(.{ .allocator = allocator });
+defer pool.deinit();
+try pool.spawn(worker, .{arg1});
+```
+
+**5. Annotate thread entry points with `callconv(.C)`** – This matches the OS expectation and improves portability.
+
+**6. Always join or detach** – Every spawned thread must be either `join()`‑ed or `detach()`‑ed. Unjoined threads leak resources.
+
+**7. Run tests with TSan** – Add a build step that runs tests with thread sanitizer:
+```zig
+// in build.zig
+const exe_tests = b.addTest(.{ .root_source_file = .{ .path = "src/main.zig" } });
+exe_tests.sanitize_thread = true;
+const run_tests = b.addRunArtifact(exe_tests);
+```
+
+**8. Keep thread stack sizes reasonable** – On POSIX, the default stack is often 8 MB. For many threads, reduce it using `std.Thread.SpawnConfig{ .stack_size = 64 * 1024 }`.
+
+**9. Avoid global mutable state** – If you must share, hide it behind a well‑defined API that encapsulates synchronisation.
+
+---
+
+### 8. Examples
+
+#### Example 1: Parallel sum reducer
+
+```zig
+const std = @import("std");
+
+const ThreadContext = struct {
+    slice: []const u32,
+    result: *u64,
+    mutex: *std.Thread.Mutex,
+};
+
+fn sumWorker(ctx_ptr: *anyopaque) callconv(.C) void {
+    const ctx: *ThreadContext = @ptrCast(@alignCast(ctx_ptr));
+    var local_sum: u64 = 0;
+    for (ctx.slice) |x| local_sum += x;
+    ctx.mutex.lock();
+    defer ctx.mutex.unlock();
+    ctx.result.* += local_sum;
+}
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const data = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    const num_threads = 4;
+    const chunk_size = data.len / num_threads;
+
+    var result: u64 = 0;
+    var mutex = std.Thread.Mutex{};
+    var threads: [num_threads]std.Thread = undefined;
+
+    for (0..num_threads) |i| {
+        const start = i * chunk_size;
+        const end = if (i == num_threads - 1) data.len else start + chunk_size;
+        const ctx = try allocator.create(ThreadContext);
+        ctx.* = .{
+            .slice = data[start..end],
+            .result = &result,
+            .mutex = &mutex,
+        };
+        threads[i] = try std.Thread.spawn(.{}, sumWorker, ctx);
+    }
+
+    for (threads) |th| th.join();
+    std.debug.print("Sum: {}\n", .{result}); // 55
+}
+```
+
+#### Example 2: Lock‑free queue with `std.atomic.Queue`
+
+```zig
+const std = @import("std");
+
+const Message = struct {
+    value: u32,
+};
+
+fn producer(queue: *std.atomic.Queue(Message), count: u32) !void {
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        try queue.put(.{ .value = i });
+    }
+}
+
+fn consumer(queue: *std.atomic.Queue(Message), expected: u32) !void {
+    var received: u32 = 0;
+    while (received < expected) {
+        if (queue.get()) |node| {
+            defer std.heap.page_allocator.destroy(node);
+            std.debug.assert(node.data.value == received);
+            received += 1;
+        } else {
+            std.time.sleep(1);
+        }
+    }
+}
+
+pub fn main() !void {
+    var queue = std.atomic.Queue(Message).init();
+    defer queue.deinit();
+
+    const count = 100_000;
+    const prod = try std.Thread.spawn(.{}, producer, .{ &queue, count });
+    const cons = try std.Thread.spawn(.{}, consumer, .{ &queue, count });
+
+    prod.join();
+    cons.join();
+}
+```
+
+#### Example 3: Custom thread pool (simplified)
+
+```zig
+const std = @import("std");
+
+pub fn ThreadPool(comptime WorkFn: type) type {
+    return struct {
+        const Self = @This();
+        allocator: std.mem.Allocator,
+        workers: []std.Thread,
+        queue: std.atomic.Queue(WorkFn),
+        running: std.atomic.Value(bool),
+
+        pub fn init(allocator: std.mem.Allocator, num_threads: usize) !Self {
+            var queue = std.atomic.Queue(WorkFn).init();
+            var workers = try allocator.alloc(std.Thread, num_threads);
+            var self = Self{
+                .allocator = allocator,
+                .workers = workers,
+                .queue = queue,
+                .running = std.atomic.Value(bool).init(true),
+            };
+            for (workers, 0..) |*worker, i| {
+                worker.* = try std.Thread.spawn(.{}, workerLoop, &self);
+            }
+            return self;
+        }
+
+        fn workerLoop(self_ptr: *anyopaque) callconv(.C) void {
+            const self: *Self = @ptrCast(@alignCast(self_ptr));
+            while (self.running.load(.monotonic)) {
+                if (self.queue.get()) |node| {
+                    defer self.allocator.destroy(node);
+                    node.data();
+                } else {
+                    std.time.sleep(1);
+                }
+            }
+        }
+
+        pub fn submit(self: *Self, work: WorkFn) !void {
+            const node = try self.allocator.create(std.atomic.Queue(WorkFn).Node);
+            node.* = .{ .data = work };
+            self.queue.put(node);
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.running.store(false, .monotonic);
+            for (self.workers) |worker| worker.join();
+            self.allocator.free(self.workers);
+            self.queue.deinit();
+        }
+    };
+}
+```
+
+---
+
+### 9. Summary & Exercises
+
+**Summary**
+
+- Zig exposes OS threads directly via `std.Thread` – no green threads, no built‑in scheduler.
+- Memory model: data races are undefined behaviour; synchronise with mutexes or atomics.
+- Atomic operations follow C++20 orderings: `.relaxed`, `.acquire`, `.release`, `.acq_rel`, `.seq_cst`.
+- ThreadSanitizer (`-f sanitize=thread`) is the primary tool for detecting races.
+- Performance considerations: thread creation overhead, false sharing, mutex contention.
+- Best practices: use `defer` for unlocks, pass context structs, always join or detach, prefer message passing.
+
+**Exercises**
+
+1. **Parallel map**
+   Write a function `parallelMap(allocator: std.mem.Allocator, slice: []u32, f: fn (u32) u32, num_threads: usize) ![]u32` that applies `f` to each element using `num_threads` worker threads. The result slice must be allocated and filled in parallel. Ensure no data race and that all threads finish before returning.
+
+2. **Thread‑safe ring buffer with atomics**
+   Implement a bounded multi‑producer, single‑consumer ring buffer using only atomic operations (no mutexes). The buffer should support `tryPush(value: T) bool` and `tryPop() ?T`. Use `std.atomic.Value` for the head and tail indices. Test it with two producers and one consumer.
+
+3. **Race detection exercise**
+   Take the following buggy code. Run it with and without ThreadSanitizer, identify the race, then fix it using the appropriate synchronisation primitive.
+   ```zig
+   var balance: i64 = 1000;
+
+   fn withdraw(amount: i64) void {
+       var b = balance;
+       std.time.sleep(1); // simulate work
+       balance = b - amount;
+   }
+
+   fn deposit(amount: i64) void {
+       var b = balance;
+       std.time.sleep(1);
+       balance = b + amount;
+   }
+   ```
+   Extend the exercise to reproduce a lost update (e.g., two withdrawals of 500 run concurrently, balance ends at 500 instead of 0). Fix with a mutex, then with `std.atomic.Value` using a compare‑exchange loop.

@@ -1,0 +1,288 @@
+## Chapter 18: Testing & Fuzzing
+
+Testing in Zig is not an afterthought bolted on by a third-party framework—it is a first‑class language feature. The compiler itself understands test blocks, and the standard library provides all the machinery needed for assertions, leak‑checking allocators, and even simple fuzz testing. This chapter shows how Zig’s approach to testing eliminates hidden behaviour, keeps test code close to the production logic, and gives you the same fine‑grained control you expect from the rest of the language.
+
+---
+
+### 1. Basic Usage
+
+A test is a named block introduced with the `test` keyword. You can place these blocks anywhere a normal declaration is allowed—at file scope, inside a struct, or even inside a function (though that is rare). To execute them, you run `zig test <file.zig>`.
+
+```zig
+const std = @import("std");
+
+test "basic arithmetic" {
+    try std.testing.expectEqual(@as(i32, 7), 3 + 4);
+}
+```
+
+If the block performs operations that can fail, declare it as returning an error union:
+
+```zig
+test "parse integer" !void {
+    const x = try std.fmt.parseInt(u16, "42", 10);
+    try std.testing.expectEqual(@as(u16, 42), x);
+}
+```
+
+`zig test` compiles all the test blocks in the given root file (and any modules it imports) into a single test runner binary, then executes it. Each test block becomes a separate function inside that runner. A test passes if it returns normally; it fails if it returns an error or triggers a panic.
+
+#### The Testing Allocator
+
+`std.testing.allocator` is a global `GeneralPurposeAllocator` configured to detect double‑frees and memory leaks. Use it in every test that performs allocation so you never accidentally ship a leak.
+
+```zig
+test "concatenate strings" !void {
+    const ally = std.testing.allocator;
+    const result = try std.mem.concat(ally, u8, &.{ "Hello, ", "world!" });
+    defer ally.free(result);
+    try std.testing.expectEqualStrings("Hello, world!", result);
+}
+```
+
+The test runner will report any memory that was allocated but not freed. This makes `std.testing.allocator` your first line of defence against the class of bugs that C’s `valgrind` and Rust’s `#[global_allocator]` tricks catch.
+
+#### Assertion Helpers
+
+The `std.testing` module provides a family of expectation functions, all returning `!void` so they compose cleanly with `try`:
+
+| Function | Purpose |
+|----------|---------|
+| `expect(ok)` | Fail if `ok` is `false` |
+| `expectEqual(expected, actual)` | Deep equality via `std.meta.eql` |
+| `expectEqualDeep(expected, actual)` | Recursive structural equality |
+| `expectEqualSlices(T, a, b)` | Compare slices element‑by‑element |
+| `expectError(expected_err, actual_err_union)` | Check a specific error |
+| `expectFmt(expected_str, comptime fmt, args...)` | Match formatted output |
+| `expectApproxEqAbs(expected, actual, tolerance)` | Absolute float tolerance |
+| `expectApproxEqRel(expected, actual, tolerance)` | Relative float tolerance |
+
+#### Table‑Driven Tests
+
+Zig does not provide a parameterized test decorator; instead, you write a simple loop over a slice of test cases. This is explicit, zero‑magic, and trivially composable with comptime.
+
+```zig
+test "URL parsing" !void {
+    const cases = [_]struct {
+        input: []const u8,
+        scheme: []const u8,
+        host: []const u8,
+    }{
+        .{ .input = "https://ziglang.org", .scheme = "https", .host = "ziglang.org" },
+        .{ .input = "ftp://example.com/",  .scheme = "ftp",   .host = "example.com"  },
+    };
+    for (cases) |tc| {
+        const parsed = try parseUrl(tc.input);
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(tc.scheme, parsed.scheme);
+        try std.testing.expectEqualStrings(tc.host, parsed.host);
+    }
+}
+```
+
+#### Fuzz Testing
+
+`std.testing.fuzz` takes a user‑provided function that accepts a `[]const u8` (random bytes) and runs it many times with different inputs. If the function returns an error or panics, the fuzz run fails. This is a simple *dumb* fuzzer—no coverage guidance—but it catches the most egregious crashes with minimal ceremony.
+
+```zig
+test "fuzz integer parser" !void {
+    try std.testing.fuzz(struct {
+        fn testOne(input: []const u8) anyerror!void {
+            _ = std.fmt.parseInt(i64, std.mem.trim(u8, input, &std.ascii.whitespace), 10) catch return;
+        }
+    }.testOne, .{});
+}
+```
+
+---
+
+### 2. Under the Hood
+
+When you invoke `zig test`, the compiler performs several steps:
+
+1. **Comptime test collection** – The compiler scans the entire module tree for `test` blocks. Each block is lowered into a function with a name derived from the block’s label. These functions are registered in an array that becomes the test suite’s table of contents.
+2. **Test runner generation** – The compiler emits a small runner binary (or uses one from the cache) whose `main` iterates over the registered test functions, calls them one by one, and prints results. The runner itself is written in Zig and lives inside the compiler’s source; you can inspect it by looking at the generated code.
+3. **Allocator setup** – `std.testing.allocator` is initialised with `std.heap.GeneralPurposeAllocator(.{ .safety = true, .verbose_log = true })`. This instance tracks every allocation and deallocation, and at the end of the test run it reports any blocks still outstanding.
+4. **Fuzz harness** – `std.testing.fuzz` uses a `std.Random` generator seeded by the test runner (or optionally with a fixed seed for reproducibility). It calls the provided function in a loop, catching errors and panics via `return` and `@setCold`. It is **not** a full `libFuzzer` harness; for coverage‑guided fuzzing you can link against `libFuzzer` directly because Zig speaks the C ABI, but the built‑in fuzzer is a zero‑effort way to add a basic robustness check to your CI.
+
+Because test blocks are ordinary Zig code collected at compile time, you can generate them with comptime metaprogramming. For example, you can use `@typeInfo` to derive a test for every enum member, or generate hundreds of combinatorial cases from a comptime data structure.
+
+---
+
+### 3. Why This Design?
+
+Zig’s testing philosophy flows directly from its core principles:
+
+- **No hidden control flow** – A `test` block is just a function that the compiler calls. There is no magic setup, no implicit mocking framework, no global test context that changes based on configuration files. You see exactly what runs.
+- **Explicit memory management** – `std.testing.allocator` forces every test that allocates to confront the allocator lifecycle. You cannot accidentally leave memory dangling; the test runner will tell you.
+- **Comptime over runtime magic** – Table‑driven tests and generated test suites are just comptime loops. You don’t need a separate macro language to create parameterised tests; you write normal Zig that runs at compile time to produce the test functions.
+- **Tests live with the code** – Because Zig has no header files and modules map directly to files, you can place a `test` block right next to the function it exercises. This reduces the distance between implementation and verification, a crucial advantage for maintenance.
+
+By making the compiler the test runner, Zig eliminates an entire category of tool‑chain friction. There is no separate build step for tests, no `--test` flag to a different binary. The same build system that compiles your library compiles and runs your tests with a simple sub‑command.
+
+---
+
+### 4. Competing Approaches
+
+**C** – Testing is entirely external. Frameworks like Unity, CUnit, or CMocka provide macros that expand to test registration code, but the C language itself knows nothing about tests. Leak detection requires `valgrind` or AddressSanitizer. Fuzzing usually means integrating with `libFuzzer` and a custom build system. Zig’s built‑in test blocks and allocator bring all of this into the compiler and standard library, eliminating the need for additional tooling.
+
+**Rust** – `cargo test` collects `#[test]` functions, and the standard library offers `assert_eq!`, `assert!`, etc. Table‑driven tests are typically written with loops, but the community often reaches for crates like `rstest` for parameterised testing. Rust’s ownership model obviates many memory leak tests, but when testing custom allocators or `unsafe` code, you must still set up a global allocator. Zig’s `std.testing.allocator` is simpler because you just pass it explicitly; there is no need for `#[global_allocator]` switches.
+
+**Go** – The `testing` package and `go test` tool feel similar to Zig’s model. Table‑driven tests are idiomatic, and the built‑in fuzzing support (since Go 1.18) is coverage‑guided. Go, however, leans on a garbage collector, so leak detection is not a primary concern. Zig’s explicit allocator testing addresses a domain that Go doesn’t need to consider.
+
+**C++** – Testing relies on frameworks (Google Test, Catch2) that use macros and code generation. Leak checking is typically done with external tools or custom `new`/`delete` overrides. Fuzzing again requires `libFuzzer` and compiler instrumentation. Zig’s unified approach—tests as a language feature, allocator checking in the std lib, and a simple fuzz harness—avoids the fragmentation inherent in the C++ ecosystem.
+
+The common thread: Zig does not try to be a better *framework*; it makes testing a natural part of the language, so you spend less time wiring tools together and more time verifying your logic.
+
+---
+
+### 5. Common Mistakes
+
+**Forgetting `!void` on test blocks that use `try`**
+
+A `test` block is a function that can optionally return an error. If you write `test "foo" { try something(); }` the compiler will reject it because `try` requires an error‑returning context. The fix is straightforward:
+
+```zig
+// ✗ Compile error
+test "bad" { try std.testing.expect(true); }
+
+// ✓ Correct
+test "good" !void { try std.testing.expect(true); }
+```
+
+**Using `std.testing.expectEqual` with floats without a tolerance**
+
+`std.meta.eql` performs exact bitwise equality (unless a custom `eql` method is defined). For floating‑point values, this often fails due to rounding. Use `expectApproxEqAbs` or `expectApproxEqRel`.
+
+**Assuming `std.testing.allocator` is reset between tests automatically**
+
+The global instance is not explicitly reset between test functions; it simply accumulates statistics. If test A allocates and intentionally leaks (perhaps to simulate a bug), that memory will be reported at the end of the **entire** run, potentially confusing the output. For tests that intentionally exercise leak paths, create a local `GeneralPurposeAllocator` and call `.deinit()` yourself.
+
+**Relying on `catch unreachable` in test code**
+
+Tests should propagate errors, not swallow them. `catch unreachable` hides the real error and makes debugging a nightmare. Prefer `try` and let the test runner report the actual error union payload.
+
+**Fuzzing a stateful function without reset**
+
+`std.testing.fuzz` calls your function repeatedly within the same test iteration. If your function accumulates state (e.g., writes to a global buffer), subsequent calls may produce spurious failures. Ensure the function is pure, or reset the state at the start of each call.
+
+---
+
+### 6. Performance Considerations
+
+The overhead of the test infrastructure is minimal:
+
+- **Test runner loop** – A simple `for` loop over an array of function pointers. No reflection, no dynamic dispatch.
+- **Assertion functions** – They perform the comparison and, on failure, return an error with a descriptive message. The error path does involve some formatting, but that cost is only paid when a test actually fails.
+- **`std.testing.allocator`** – Runs with safety checks enabled, which adds a few cycles per allocation. In release builds, these checks are stripped unless you explicitly request `ReleaseSafe`. The allocator’s internal bookkeeping is comparable to a typical debug allocator.
+- **Fuzzing** – The built‑in fuzzer is a brute‑force loop. It is not optimised for throughput. If you need to fuzz a performance‑critical parser, linking against `libFuzzer` will give you coverage‑guided mutation and significantly higher execution rates. The built‑in fuzzer is best used as a quick smoke test in CI.
+
+**Compile‑time cost** – Generating hundreds of test cases with comptime will increase compilation time. This is usually acceptable for a test suite, but be mindful if you embed heavy comptime computation inside a `test` block that is repeatedly evaluated.
+
+---
+
+### 7. Best Practices
+
+- **Keep tests in the same file** – For library code, place `test` blocks in the same file as the implementation. This makes it trivial to run `zig test src/foo.zig` and encourages keeping tests up to date. For larger integration tests, use a separate test root file.
+- **Always use `std.testing.allocator`** – Even if your function doesn’t allocate today, it might tomorrow. Having the allocator in the test signature forces you to think about memory management from the start.
+- **Prefer table‑driven tests** – They reduce duplication and make it easy to add new edge cases. Give each case a descriptive comment or a name field to make failure output clear.
+- **Leverage comptime for edge‑case generation** – Use `@typeInfo` to test all variants of an enum, or write a comptime loop that generates pairwise combinations of parameters.
+- **Fuzz all parsers and deserializers** – A 30‑second fuzz run with `std.testing.fuzz` can catch buffer overflows, integer underflows, and assertion failures that manual testing would miss.
+- **Use `errdefer` in tests that set up complex state** – Even though the test runner catches leaks, you still want to clean up temporary files, network sockets, or child processes on failure.
+- **Never `catch unreachable` in a test** – If an error can never happen according to your reasoning, use `catch |e| std.debug.panic("unexpected error: {s}", .{@errorName(e)});` instead. This gives you a clear message when your reasoning is wrong.
+
+---
+
+### 8. Examples
+
+All examples are self‑contained and can be run with `zig test <filename>.zig`.
+
+#### Example 1: Table‑Driven Test with Allocator
+
+```zig
+const std = @import("std");
+
+/// Joins a slice of strings with a delimiter.
+fn joinStrings(ally: std.mem.Allocator, delim: []const u8, parts: []const []const u8) ![]u8 {
+    if (parts.len == 0) return ally.dupe(u8, "");
+
+    var total_len: usize = delim.len * (parts.len - 1);
+    for (parts) |p| total_len += p.len;
+
+    const buf = try ally.alloc(u8, total_len);
+    errdefer ally.free(buf);
+
+    var stream = std.io.fixedBufferStream(buf);
+    const writer = stream.writer();
+    for (parts, 0..) |p, i| {
+        if (i > 0) try writer.writeAll(delim);
+        try writer.writeAll(p);
+    }
+    return buf;
+}
+
+test "joinStrings: table-driven" !void {
+    const ally = std.testing.allocator;
+
+    const cases = [_]struct {
+        delim: []const u8,
+        parts: []const []const u8,
+        expected: []const u8,
+    }{
+        .{ .delim = ", ", .parts = &.{ "a", "b", "c" }, .expected = "a, b, c" },
+        .{ .delim = "",   .parts = &.{ "a", "b" },     .expected = "ab" },
+        .{ .delim = " ",  .parts = &.{},               .expected = "" },
+    };
+
+    for (cases) |tc| {
+        const result = try joinStrings(ally, tc.delim, tc.parts);
+        defer ally.free(result);
+        try std.testing.expectEqualStrings(tc.expected, result);
+    }
+}
+```
+
+#### Example 2: Fuzz Testing a Simple Parser
+
+```zig
+const std = @import("std");
+
+/// Parses a `key=value` pair, returning both parts.
+fn parseKeyValue(input: []const u8) !struct { key: []const u8, value: []const u8 } {
+    const eq_pos = std.mem.indexOfScalar(u8, input, '=') orelse return error.InvalidFormat;
+    if (eq_pos == 0) return error.MissingKey;
+    if (eq_pos == input.len - 1) return error.MissingValue;
+    return .{
+        .key   = input[0..eq_pos],
+        .value = input[eq_pos+1..],
+    };
+}
+
+test "fuzz parseKeyValue" !void {
+    try std.testing.fuzz(struct {
+        fn testOne(input: []const u8) anyerror!void {
+            if (parseKeyValue(input)) |pair| {
+                // If successful, key and value must be non‑empty
+                _ = pair;
+                // We could add invariants here: e.g., key must not contain '='
+            } else |_| {
+                // Errors are expected for malformed input; that's fine
+            }
+        }
+    }.testOne, .{});
+}
+```
+
+---
+
+### 9. Summary & Exercises
+
+Zig treats testing as an integral part of software development, not an optional extra. The `test` block and `zig test` command give you a zero‑friction way to write and run tests, while `std.testing.allocator` ensures that memory management mistakes are caught immediately. Table‑driven tests are trivial to write without frameworks, and the built‑in fuzzer adds a first layer of robustness checking with virtually no setup.
+
+**Exercises**
+
+1. **Allocator leak detection** – Write a small arena allocator that records its peak usage. Then create a table‑driven test suite that verifies the peak is correctly updated, and that the arena properly frees all memory when `.deinit()` is called. Use `std.testing.allocator` as the backing allocator for the arena and confirm no leaks are reported.
+
+2. **Fuzzing a binary protocol parser** – Implement a function that parses a simple binary protocol: a 4‑byte little‑endian length prefix followed by that many bytes of payload. Write a fuzz test that feeds random byte slices into this parser. The test should verify that the parser never reads beyond the provided slice and never returns a payload that exceeds the declared length. Use `std.testing.fuzz` and ensure the test does not leak memory (use a local allocator that resets per call).
+
+3. **Comptime‑driven property test** – Choose a pair of functions that should round‑trip (e.g., `std.fmt.parseInt` and `std.fmt.bufPrint` for integers). Write a comptime loop that generates a hundred random integers, converts each to a string and back, and checks equality—all inside a single `test` block. Use a fixed random seed for reproducibility.

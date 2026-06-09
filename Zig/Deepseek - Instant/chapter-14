@@ -1,0 +1,471 @@
+## Chapter 14: Allocators: The Core Abstraction
+
+If you’ve spent time in C, you know `malloc` and `free` as global, implicit functions that grab memory from the heap. If you come from Rust, you’re used to the global allocator being hidden behind `Box` and `Vec`, with custom allocators still in the experimental `allocator_api` wilderness. In Zig, the allocator is not a global or a language runtime feature—it is an explicit, ordinary value that you pass around like any other dependency.
+
+This chapter dissects `std.mem.Allocator`, the interface that powers every allocation in the standard library and in well‑structured Zig code. You’ll learn how to use the built‑in allocators, what happens inside the vtable, why Zig forces you to spell out every allocation, and how to write your own allocators that obey the contract.
+
+---
+
+### 14.1 Basic Usage
+
+The `std.mem.Allocator` interface is defined by a small set of methods:
+- `alloc` – allocate memory for `n` items of type `T`
+- `create` – allocate and initialize a single value
+- `free` – release memory back to the allocator
+- `destroy` – free a single value created with `create`
+- `resize` – attempt to change the size of an existing allocation (optional)
+- `realloc` – reallocate, falling back to alloc/copy/free if resize fails
+
+Every function that needs to allocate memory in idiomatic Zig accepts an `Allocator` parameter. The standard library provides several ready‑to‑use allocators.
+
+```zig
+const std = @import("std");
+
+pub fn main() !void {
+    // 1. The page allocator – asks the OS for whole pages. Slow, but trivial.
+    const page_allocator = std.heap.page_allocator;
+    const slice = try page_allocator.alloc(u8, 4096);
+    defer page_allocator.free(slice);
+
+    // 2. GeneralPurposeAllocator – production ready, safety, leak detection.
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();  // reports leaks
+    const gpa_allocator = gpa.allocator();
+
+    const int_ptr = try gpa_allocator.create(i32);
+    defer gpa_allocator.destroy(int_ptr);
+    int_ptr.* = 42;
+
+    // 3. Arena allocator – allocates many objects, frees all at once.
+    var arena = std.heap.ArenaAllocator.init(gpa_allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const many_bytes = try arena_allocator.alloc(u8, 1024);
+    // no need to free each allocation – arena.deinit() frees everything.
+
+    // 4. FixedBufferAllocator – allocate from a static buffer (stack or global).
+    var buffer: [2000]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buffer);
+    const fba_allocator = fba.allocator();
+
+    const fixed_slice = try fba_allocator.alloc(u8, 500);
+    // fba_allocator.free(fixed_slice) is optional – you may reset the whole buffer.
+}
+```
+
+All allocation functions return error unions (`![]T` or `!*T`) because allocation can fail. Every successful `alloc` or `create` must be paired with a `free` or `destroy`, or you leak memory. The `defer` statement is the conventional tool for pairing these operations.
+
+---
+
+### 14.2 Under the Hood
+
+`std.mem.Allocator` is not a language built‑in; it is a plain struct with a **vtable** (a field called `ptr` and a field called `vtable`). The vtable holds function pointers for `alloc`, `resize`, `free`, and so on.
+
+```zig
+// simplified from std.mem.Allocator
+pub const Allocator = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        alloc: *const fn (ctx: *anyopaque, len: usize, ptr_alignment: u8, return_address: usize) ?[*]u8,
+        resize: *const fn (ctx: *anyopaque, buf: []u8, buf_alignment: u8, new_len: usize, return_address: usize) bool,
+        free: *const fn (ctx: *anyopaque, buf: []u8, buf_alignment: u8, return_address: usize) void,
+        // ...
+    };
+
+    pub fn alloc(self: Allocator, comptime T: type, n: usize) Allocator.Error![]T {
+        const byte_len = @sizeOf(T) * n;
+        const ptr = self.vtable.alloc(self.ptr, byte_len, @alignOf(T), @returnAddress()) orelse
+            return error.OutOfMemory;
+        return @as([*]T, @ptrCast(@alignCast(ptr)))[0..n];
+    }
+};
+```
+
+When you call `allocator.alloc(T, n)`, Zig:
+1. Computes the total byte size and required alignment at comptime.
+2. Calls the vtable’s `alloc` function, passing the allocator’s context pointer (`ptr`).
+3. The `alloc` implementation returns a `?[*]u8` (nullable pointer to bytes) – `null` means out of memory.
+4. `alloc` wraps that raw byte pointer into a slice of type `[]T` with safety checks (in Debug and ReleaseSafe modes).
+
+Each concrete allocator (e.g., `GeneralPurposeAllocator`, `ArenaAllocator`) defines its own context struct and vtable functions. For example, `FixedBufferAllocator`’s context holds the buffer slice and a current offset. Its `alloc` function simply advances the offset and returns a pointer into the buffer – no system call, no locking, just pointer arithmetic.
+
+Because the vtable is a regular struct of function pointers, Zig can inline the calls when the allocator type is known at comptime (e.g., when you pass a `FixedBufferAllocator` directly). When the allocator is only known at runtime (e.g., a function parameter of type `std.mem.Allocator`), the call goes through an indirect jump, which still costs very little compared to the allocation itself.
+
+---
+
+### 14.3 Why This Design?
+
+Zig makes allocators explicit because **hidden allocations violate the principle of “no hidden control flow” and destroy predictability**.
+
+In C++, `std::vector<T>::push_back` may allocate silently. In Go, `append` may allocate a new backing array. In Rust, `Vec::push` may allocate, but the allocator is a global hidden resource (unless you use the unstable `allocator_api`). In all these languages, you cannot tell by reading the source code whether a particular line will invoke the memory allocator or not.
+
+Zig’s rule is simple: if a function may allocate, it must accept an `Allocator` parameter, and the call site must pass one. This makes allocation visible in the same way that error handling is visible via `try`/`catch`. You cannot accidentally allocate memory inside a hot loop or an interrupt handler – you have to explicitly bring an allocator there, which forces you to think about whether that allocation is acceptable.
+
+Furthermore, passing allocators explicitly enables:
+- **Composability:** A library doesn’t dictate which allocator you use. You can pass a `GeneralPurposeAllocator` for debugging, an `ArenaAllocator` for a request‑scoped lifetime, or a `FixedBufferAllocator` for embedded use.
+- **Testability:** Leak detection and memory failure injection become trivial by substituting a custom allocator in tests.
+- **No global state:** Zig programs can have many allocators with different strategies (thread‑local, locked, lock‑free, bump, pool) without fighting a single global `malloc` heap.
+
+The designers explicitly rejected the idea of a default global allocator (like `std.heap.c_allocator` being automatically available) because that would reintroduce hidden allocations. Even the standard library’s `ArrayList` and `HashMap` require you to pass an allocator at initialization time.
+
+---
+
+### 14.4 Competing Approaches
+
+| Language | Allocation Model | Visibility | Custom Allocators |
+|----------|-----------------|------------|-------------------|
+| **C** | `malloc`/`free` are global, implicit. No parameter passing. | Hidden | Only by replacing `malloc` at link time or using macros. |
+| **C++** | `new`/`delete` use global `operator new`. Containers use allocator templates (e.g., `std::vector<T, Allocator>`). | Somewhat visible (template parameter), but often defaulted to `std::allocator<T>`, which calls global `new`. | Yes, but the interface is complex (rebind, propagate_on_container_copy, etc.). |
+| **Rust** | Global allocator via `#[global_allocator]`. `alloc` API is unstable. Collections use the global allocator implicitly. | Hidden, but custom allocators are being worked on (allocator_api). | Unstable, requires nightly. |
+| **Go** | Garbage collected. The runtime manages heap allocations. `new` and `make` hide allocation. | Completely hidden. | Not possible to replace. |
+| **Zig** | `std.mem.Allocator` passed explicitly. No global default. | Fully visible. | Trivial: implement the vtable. |
+
+Zig’s approach gives you the control of C’s allocator replacement (without link‑time hacks) and the composability of C++ allocator templates (without template bloat or complex rebinding). Unlike Rust’s unstable `allocator_api`, Zig’s allocator interface is stable, simple, and has been production‑proven in the standard library for years.
+
+The trade‑off is verbosity: you must type the allocator parameter everywhere. But verbosity in this case buys predictability. When you see a function that takes no allocator, you know it will never allocate memory (unless it calls a function that takes an allocator – that function will propagate the parameter). This property is essential for real‑time, embedded, and kernel code.
+
+---
+
+### 14.5 Common Mistakes
+
+**1. Forgetting to free**
+The most frequent leak pattern is allocating with `create` or `alloc` and forgetting the matching `destroy` or `free`. Always pair allocation with `defer` immediately after the `try`.
+
+```zig
+// BAD
+var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+const a = gpa.allocator();
+const p = try a.create(i32);
+// missing a.destroy(p) – leak
+
+// GOOD
+const p = try a.create(i32);
+defer a.destroy(p);
+```
+
+**2. Freeing with the wrong allocator**
+Each allocator’s `free` function assumes the pointer came from the same allocator. Passing a pointer from a `FixedBufferAllocator` to `GeneralPurposeAllocator.free` is undefined behavior (likely a crash). Mixing allocators is a common mistake when refactoring.
+
+```zig
+var fba = std.heap.FixedBufferAllocator.init(&buffer);
+const fixed_alloc = fba.allocator();
+var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+const gpa_alloc = gpa.allocator();
+
+const x = try fixed_alloc.create(u32);
+gpa_alloc.destroy(x); // UB! x was not allocated by gpa_alloc.
+```
+
+**3. Using stack memory after a `FixedBufferAllocator` goes out of scope**
+`FixedBufferAllocator` takes a slice that must outlive all allocations made from it. If the underlying buffer is stack‑allocated and the allocator outlives the buffer, you get a dangling pointer.
+
+```zig
+fn bad() !void {
+    var buffer: [100]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buffer);
+    const alloc = fba.allocator();
+    const slice = try alloc.alloc(u8, 10); // points into buffer
+    // buffer goes out of scope when function returns, but slice may be returned or stored.
+}
+```
+
+**4. Assuming all allocators support `resize` or `realloc`**
+`FixedBufferAllocator` and `ArenaAllocator` do not support shrinking or growing allocations. Calling `resize` will return `false`. The standard library’s generic code often falls back to alloc‑copy‑free when resize fails, but if you rely on reallocation, use `GeneralPurposeAllocator` or `page_allocator`.
+
+**5. Using `catch unreachable` on allocation failure in production code**
+Many developers write `const slice = allocator.alloc(T, n) catch unreachable;` because they “know” the allocation won’t fail. This crashes the program when memory is exhausted. Unless you are writing a program that is allowed to crash on OOM (e.g., a short‑lived command‑line tool), always handle the error or propagate it with `try`.
+
+---
+
+### 14.6 Performance Considerations
+
+**Indirect call overhead**
+Calling `allocator.alloc(...)` when the allocator type is only known at runtime involves a virtual call through the vtable. That indirection costs maybe 2–3 nanoseconds on a modern CPU, dwarfed by the actual allocation cost (which can be 50–200 ns for a `GeneralPurposeAllocator` and hundreds of microseconds for a system call with `page_allocator`). In extremely hot loops that allocate tiny objects, you can make the allocator comptime‑known by passing a concrete allocator type (e.g., `*FixedBufferAllocator` instead of `std.mem.Allocator`), allowing inlining.
+
+**GeneralPurposeAllocator overhead**
+`GPA` is a production allocator that maintains thread‑local caches, buckets for different size classes, and can be compiled with safety features (leak detection, memory poisoning). In `ReleaseFast` mode, it is roughly comparable to `malloc` in speed (sometimes faster for small allocations due to thread‑local caches). In `Debug` mode, it adds significant overhead (double‑free detection, sentinel values) – never use GPA in tight loops under debug builds.
+
+**Arena allocator speed**
+An arena allocator (bump pointer) is the fastest possible allocator for sequential allocations. It only increments an offset and returns the old offset. Freeing is O(1) for the entire arena (no per‑object free). Use arenas for transient, request‑scoped allocations. The only downside: memory can’t be reclaimed until the arena is reset or deinitialized.
+
+**FixedBufferAllocator for stack allocation**
+When you need heap semantics but want to stay on the stack (e.g., a small dynamic array in a no‑alloc function), `FixedBufferAllocator` over a static buffer eliminates system calls and heap fragmentation. The cost is a single integer addition per allocation – essentially free.
+
+**Locking**
+`GeneralPurposeAllocator` uses thread‑local storage for its size‑class caches, so most allocations do not take a global lock. `page_allocator` uses OS‑level primitives (usually a mutex inside the libc or kernel). `ArenaAllocator` and `FixedBufferAllocator` are not thread‑safe by default – you must add external synchronization if used from multiple threads.
+
+**Realloc behaviour**
+If you frequently need to grow a dynamic array, prefer `std.ArrayList` which doubles capacity using `realloc` when possible. However, many allocators cannot resize in place, forcing a copy. For performance‑critical code, consider pre‑allocating with a reasonable capacity or using a custom pool allocator.
+
+---
+
+### 14.7 Best Practices
+
+**1. Pass allocator as the first parameter**
+By convention, the allocator is the first parameter of any function that needs to allocate. This makes call sites consistent and allows `std.meta.fieldNames` style introspection when needed.
+
+```zig
+fn readLines(allocator: std.mem.Allocator, path: []const u8) ![][]const u8
+```
+
+**2. Name the allocator parameter `allocator` or `gpa`/`arena` when type is concrete**
+Use `allocator` for generic `std.mem.Allocator` parameters. Use `gpa`, `arena`, `fba` when you specifically need a concrete type for performance (comptime inlining).
+
+**3. Prefer `GeneralPurposeAllocator` for tests and long‑running applications**
+Always wrap your `main` with `gpa.deinit()` and assert that no leaks occurred. For libraries, accept an allocator parameter and let the caller decide.
+
+```zig
+const std = @import("std");
+
+fn testSomething() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit(); // catches leaks
+    const allocator = gpa.allocator();
+    // run tests using allocator
+}
+```
+
+**4. Use `arena` for temporary allocations in a scope**
+If you have many short‑lived allocations that all die together, an arena reduces fragmentation and speeds up allocation.
+
+```zig
+fn handleRequest(allocator: std.mem.Allocator, request_data: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    const parsed = try parse(arena_alloc, request_data);
+    const result = try compute(arena_alloc, parsed);
+    // no need to free parsed or result – arena cleans everything.
+}
+```
+
+**5. Never store an allocator inside a data structure unless it is the allocator itself**
+Storing an allocator in every node of a linked list wastes memory and invites using the wrong allocator for a given allocation. Instead, pass the allocator to functions that operate on the data structure.
+
+**6. Use `std.testing.allocator` in unit tests**
+This allocator wraps `GeneralPurposeAllocator` with additional checks and integrates with the test runner to report leaks.
+
+```zig
+test "example" {
+    const allocator = std.testing.allocator;
+    const slice = try allocator.alloc(u8, 10);
+    defer allocator.free(slice);
+    // ...
+}
+```
+
+**7. Distinguish between allocation and initialization**
+When you need a single value, prefer `create`/`destroy` over `alloc` + assignment. For arrays, use `alloc` followed by a loop or `@memset`. For zero‑initialized memory, use `allocWithZero` (though often you will manually initialize anyway).
+
+---
+
+### 14.8 Examples
+
+Each of the following examples is a complete, runnable program.
+
+#### Example 1: Leak Detection with GPA
+
+```zig
+const std = @import("std");
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit(); // prints leak report if any memory is not freed
+
+    const allocator = gpa.allocator();
+    const arr = try allocator.alloc(u32, 100);
+    defer allocator.free(arr);
+
+    for (arr, 0..) |*val, i| {
+        val.* = @intCast(i);
+    }
+
+    std.debug.print("arr[42] = {}\n", .{arr[42]});
+}
+```
+
+#### Example 2: Arena for Parsing Many Objects
+
+```zig
+const std = @import("std");
+
+const Point = struct { x: i32, y: i32 };
+
+fn readPoints(arena_allocator: std.mem.Allocator, data: []const u8) ![]Point {
+    var list = std.ArrayList(Point).init(arena_allocator);
+    defer list.deinit();
+
+    var it = std.mem.tokenizeAny(u8, data, " ;\n");
+    while (it.next()) |token| {
+        if (std.mem.indexOfScalar(u8, token, ',')) |comma| {
+            const x_str = token[0..comma];
+            const y_str = token[comma + 1 ..];
+            const x = try std.fmt.parseInt(i32, x_str, 10);
+            const y = try std.fmt.parseInt(i32, y_str, 10);
+            try list.append(Point{ .x = x, .y = y });
+        }
+    }
+    return try list.toOwnedSlice();
+}
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(gpa.allocator());
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const input = "1,2 ; 3,4\n5,6";
+    const points = try readPoints(allocator, input);
+    // points lives until arena.deinit() – no need to free individually.
+    for (points) |p| {
+        std.debug.print("({}, {})\n", .{ p.x, p.y });
+    }
+}
+```
+
+#### Example 3: FixedBufferAllocator for No‑Alloc Parsing
+
+```zig
+const std = @import("std");
+
+const MaxTokens = 64;
+const MaxTokenLen = 32;
+
+pub fn splitIntoStaticBuffer(buffer: []u8, separator: u8, output: []const []u8) usize {
+    var fba = std.heap.FixedBufferAllocator.init(buffer);
+    const allocator = fba.allocator();
+
+    var list = std.ArrayList([]u8).init(allocator);
+    defer list.deinit();
+
+    var start: usize = 0;
+    for (buffer, 0..) |ch, i| {
+        if (ch == separator) {
+            const slice = buffer[start..i];
+            list.append(slice) catch |err| {
+                std.debug.print("out of space: {}\n", .{err});
+                break;
+            };
+            start = i + 1;
+        }
+    }
+    if (start < buffer.len) {
+        list.append(buffer[start..]) catch {};
+    }
+    const result = list.items;
+    @memcpy(output[0..result.len], result);
+    return result.len;
+}
+
+pub fn main() !void {
+    var storage: [128]u8 = undefined;
+    var token_ptrs: [MaxTokens][]u8 = undefined;
+
+    const src = "hello:world:zig:allocators";
+    @memcpy(storage[0..src.len], src);
+    const count = splitIntoStaticBuffer(storage[0..src.len], ':', token_ptrs[0..]);
+
+    for (token_ptrs[0..count]) |tok| {
+        std.debug.print("token: {s}\n", .{tok});
+    }
+}
+```
+
+#### Example 4: Custom Allocator – Counting Allocations
+
+```zig
+const std = @import("std");
+
+pub const CountingAllocator = struct {
+    backing: std.mem.Allocator,
+    allocations: usize,
+    deallocations: usize,
+    current_bytes: usize,
+    peak_bytes: usize,
+
+    pub fn init(backing: std.mem.Allocator) CountingAllocator {
+        return CountingAllocator{
+            .backing = backing,
+            .allocations = 0,
+            .deallocations = 0,
+            .current_bytes = 0,
+            .peak_bytes = 0,
+        };
+    }
+
+    pub fn allocator(self: *CountingAllocator) std.mem.Allocator {
+        return std.mem.Allocator.init(self, struct {
+            fn alloc(ctx: *anyopaque, len: usize, log2_align: u8, ra: usize) ?[*]u8 {
+                const self_ptr: *CountingAllocator = @ptrCast(@alignCast(ctx));
+                const ptr = self_ptr.backing.rawAlloc(len, log2_align, ra) orelse return null;
+                self_ptr.allocations += 1;
+                self_ptr.current_bytes += len;
+                if (self_ptr.current_bytes > self_ptr.peak_bytes) {
+                    self_ptr.peak_bytes = self_ptr.current_bytes;
+                }
+                return ptr;
+            }
+            fn resize(ctx: *anyopaque, buf: []u8, log2_align: u8, new_len: usize, ra: usize) bool {
+                const self_ptr: *CountingAllocator = @ptrCast(@alignCast(ctx));
+                return self_ptr.backing.rawResize(buf, log2_align, new_len, ra);
+            }
+            fn free(ctx: *anyopaque, buf: []u8, log2_align: u8, ra: usize) void {
+                const self_ptr: *CountingAllocator = @ptrCast(@alignCast(ctx));
+                self_ptr.deallocations += 1;
+                self_ptr.current_bytes -= buf.len;
+                self_ptr.backing.rawFree(buf, log2_align, ra);
+            }
+        });
+    }
+};
+
+pub fn main() !void {
+    var backing_gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = backing_gpa.deinit();
+    var counter = CountingAllocator.init(backing_gpa.allocator());
+    const allocator = counter.allocator();
+
+    const a = try allocator.alloc(u8, 100);
+    defer allocator.free(a);
+    const b = try allocator.alloc(u8, 200);
+    defer allocator.free(b);
+
+    std.debug.print("allocations: {}, deallocations: {}, peak bytes: {}\n", .{
+        counter.allocations,
+        counter.deallocations,
+        counter.peak_bytes,
+    });
+}
+```
+
+---
+
+### 14.9 Summary & Exercises
+
+**Summary**
+- `std.mem.Allocator` is a vtable‑based interface that every allocation‑aware function accepts as a parameter.
+- Zig provides `page_allocator` (OS pages), `GeneralPurposeAllocator` (production), `ArenaAllocator` (batch free), and `FixedBufferAllocator` (stack‑backed).
+- The design forces allocation visibility, enables composability, and eliminates hidden global heaps.
+- Common pitfalls include forgetting to free, freeing with the wrong allocator, and assuming reallocation support.
+- Performance varies dramatically: arenas and fixed‑buffer allocators are extremely fast; GPAs compete with `malloc`; page allocators are slow.
+- Best practices: pass allocator as first parameter, use `defer` for pairing, prefer `GeneralPurposeAllocator` for tests, and use arenas for transient work.
+
+**Exercises**
+
+1. **Pool Allocator**
+   Write a fixed‑size object pool. Your allocator should pre‑allocate a contiguous slab of memory and serve fixed‑size chunks (e.g., 64 bytes each). Implement the `Allocator` interface so that allocations return one chunk and `free` returns it to a free list. Ensure the pool is thread‑safe using `std.Thread.Mutex`.
+
+2. **Bounded Allocator**
+   Build an allocator that wraps another allocator but fails once the total allocated bytes exceed a user‑supplied limit. Use it to test how a function behaves under low‑memory conditions. Your allocator should support `resize` by forwarding to the backing allocator and updating the byte count accordingly.
+
+3. **Peak Usage Tracker**
+   Extend the `CountingAllocator` from Example 4 to also track the maximum number of live allocations (not just bytes). Add a method `reset()` that clears the counters without freeing memory. Write a test that allocates and frees in a pattern and asserts the peak count matches the expected value.
+
+4. **No‑alloc JSON Parser**
+   Take a simple JSON document (e.g., `{"name": "zig", "version": 14}`) and write a parser that extracts values using only a `FixedBufferAllocator` with a stack‑allocated buffer of 4096 bytes. The parser may not call any function that accepts an allocator unless that allocator is the `FixedBufferAllocator`. Discuss the limitations of this approach compared to a general‑purpose allocator.

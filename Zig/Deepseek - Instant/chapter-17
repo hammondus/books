@@ -1,0 +1,415 @@
+## Chapter 17. Error Unions: Errors as Values
+
+Error handling in Zig is built around a single, unifying abstraction: the **error union**. Unlike exception unwinding, return-code checking, or panic-everywhere strategies, Zig forces you to acknowledge that a function may fail *at the call site*, in plain sight, using ordinary control flow. This chapter dissects how error unions work at the machine level, why the language chooses this model, and how to wield them without introducing accidental complexity or performance cliffs.
+
+---
+
+### 1. Basic Usage
+
+An error union is written as `!T` – pronounced “either an error or a value of type T”. It combines two distinct types: an **error set** (a small integer identifier) and a payload type. You create one by returning an error from a function whose return type includes `!`, or by calling a function that returns an error union and propagating it.
+
+```zig
+const std = @import("std");
+
+// A custom error set with three members
+const ParseError = error{
+    UnexpectedEof,
+    InvalidCharacter,
+    Overflow,
+};
+
+// Function that returns either a parsed integer or an error
+fn parseNumber(input: []const u8) ParseError!u64 {
+    if (input.len == 0) return ParseError.UnexpectedEof;
+    var result: u64 = 0;
+    for (input) |c| {
+        if (c < '0' or c > '9') return ParseError.InvalidCharacter;
+        const digit = @as(u64, c - '0');
+        if (result > (std.math.maxInt(u64) - digit) / 10) return ParseError.Overflow;
+        result = result * 10 + digit;
+    }
+    return result; // implicit conversion from u64 to ParseError!u64
+}
+
+// Consumer with explicit handling
+pub fn main() !void {
+    const gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    // Capture the union with 'catch' to provide a default
+    const val = parseNumber("123") catch 0;
+    std.debug.print("Parsed: {d}\n", .{val});
+
+    // Use 'try' to propagate errors upward
+    const val2 = try parseNumber("456");
+    std.debug.print("Parsed2: {d}\n", .{val2});
+
+    // Distinguish errors with 'if'
+    const result = parseNumber("12a");
+    if (result) |ok| {
+        std.debug.print("Success: {d}\n", .{ok});
+    } else |err| {
+        std.debug.print("Failed: {s}\n", .{@errorName(err)});
+    }
+}
+```
+
+The three core operations on an error union are:
+- **`try`** – If the value is an error, return that error from the current function (must have a return type that is an error union or error set). If it’s a payload, unwrap it.
+- **`catch`** – Unwrap the payload or evaluate the given expression (which may provide a fallback value or `return`, `break`, etc.).
+- **`if` with capture** – Branch on the discriminant, binding either the error or the payload in separate scopes.
+
+Error sets can be combined using the `||` operator (union of sets). The empty set is `error{}`, and the built-in `anyerror` represents the union of *all* possible errors across the program.
+
+```zig
+fn fallibleRead() !u8 { ... }
+fn fallibleWrite() !void { ... }
+
+// Combine two error sets into a larger set
+fn doBoth() !void {
+    const byte = try fallibleRead();
+    try fallibleWrite();
+    // The inferred error set is fallibleRead's error set ∪ fallibleWrite's error set
+}
+```
+
+When you need to convert a concrete error to `anyerror` (rarely necessary), Zig allows it implicitly because every error set is a subtype of `anyerror`.
+
+---
+
+### 2. Under the Hood
+
+An error union at runtime is a simple two-word struct (for `!T` where `T` has no alignment larger than a pointer). The compiler lays it out as:
+
+```zig
+// Conceptual representation (not legal Zig syntax)
+pub union ErrorUnion(T) {
+    err_code: u16,        // actually packed into a u16 global error table index
+    payload: T,
+    // plus a discriminant bit/byte
+}
+```
+
+More precisely, the in-memory representation for `E!T` is:
+- A discriminant (one byte, but often folded into the representation if `T` has unused bits).
+- For the error case: the error code is stored in an `u16` (or smaller, depending on the size of the error set). Error codes are global constants assigned at compile time.
+- For the payload case: the value of type `T`.
+
+When `T` is `void`, the error union reduces to a single `u16` error code (no payload, because success conveys no information). When `T` is a type with alignment requirements, the compiler may add padding to keep the payload correctly aligned.
+
+The discriminant is a single byte that tells whether the union holds an error (non‑zero) or a payload (zero). This is the same strategy used for tagged unions, but specialised for the `!T` syntax.
+
+Consider this function:
+
+```zig
+fn readByte(alloc: std.mem.Allocator) !u8 {
+    const buf = try alloc.alloc(u8, 1);
+    defer alloc.free(buf);
+    if (buf.len == 0) return error.OutOfMemory; // from alloc
+    return buf[0];
+}
+```
+
+The generated LLVM IR (or self-hosted backend output) will:
+1. Call `alloc.alloc` – which itself returns an error union.
+2. Insert a branch on the discriminant of that result. If error, copy the error code into the return slot and jump to the cleanup block.
+3. If success, proceed to the `defer` (which is lowered to a stack‐pushed cleanup action).
+4. At the end, store the payload (`buf[0]`) into the return union's payload slot, set the discriminant to zero, and return.
+
+No hidden exception tables, no stack unwinding metadata, no personality routines. It’s just conditional jumps and copies.
+
+**Error sets are enums with a globally unique integer tag**. When you write:
+
+```zig
+const MyError = error{FileNotFound, AccessDenied};
+```
+
+the compiler assigns `0` to `FileNotFound` and `1` to `AccessDenied` (subject to global numbering). The builtin `@errorName` maps that integer back to a string literal. This means error values can be passed across library boundaries without dynamic allocation or string copying.
+
+Because error unions are plain data, returning them from a function cannot fail – the function either returns a correctly formed union or, in the case of `noreturn` (e.g., `@panic`), doesn’t return at all. There’s no such thing as “double error” or “exception safety” problems.
+
+---
+
+### 3. Why This Design?
+
+Zig’s error handling philosophy can be summarised as **“errors are values, but they are special values with language support”**. The design choices stem from three core principles:
+
+**Explicit over implicit.** Every function that can fail must advertise that fact in its return type. There is no `throws` annotation hidden in a doc comment, no unchecked runtime exception type. The call site is forced to either `try`, `catch`, or `if` – you cannot ignore an error union without explicitly acknowledging it. This eliminates the C pitfall of forgetting to check `errno` or a return code.
+
+**No hidden control flow.** Exception unwinding can transfer control arbitrarily far up the call stack, executing destructors (C++) or `finally` blocks (Java) implicitly. Zig’s `try` is *lexically visible*: it returns only from the current function, and only to the immediate caller. There is no “resume” semantics, no stack scanning. This makes reasoning about error paths local and predictable.
+
+**Performance by default.** Error unions compile to branch‑and‑return sequences that are trivial for the CPU to predict. The common case (success) falls through with no additional indirection. Compare this to C++ exceptions where even the *absence* of an exception imposes a zero‑cost table lookup in the Itanium ABI (which still adds binary size and icache pressure), or to Rust’s panics that force either unwinding or abort. Zig’s approach avoids any runtime metadata for error propagation.
+
+**Small, simple runtime.** Because error codes are integers, they can be passed in registers (x86‑64: `RAX` for the union, `RDX` for the discriminant when payload exceeds register size). No heap allocation, no reference counting, no backtrace capture unless explicitly requested. This makes Zig viable in kernels, bootloaders, and embedded systems where dynamic memory is unavailable.
+
+**Complete control over the error path.** You are free to treat an error union as a regular value: store it in a struct, put it in an array, or pass it through a channel. Want to retry an operation? Capture the error union in a variable and loop. Want to log every error exactly once? Write a wrapper that inspects the discriminant. Nothing is hidden behind a runtime that decides for you.
+
+---
+
+### 4. Competing Approaches
+
+**C: Error codes and `errno`.**
+C functions indicate failure by returning a sentinel (e.g., `-1`, `NULL`) and set the global `errno`. This is implicit, concurrency‑unsafe (unless you use `errno` as a macro that expands to thread‑local storage, which is an afterthought), and easy to ignore. Zig’s error union makes the error path explicit and thread‑local by default, without requiring the programmer to remember to check a separate variable.
+
+**C++: Exceptions.**
+Exceptions separate error propagation from control flow, allowing clean separation of happy path and error logic. However, they introduce hidden control flow, require unwind tables, and complicate the ABI. Many C++ codebases disable exceptions altogether for performance or safety reasons. Zig’s error unions give similar conciseness (`try` vs `throw`) but remain visible and predictable.
+
+**Rust: `Result<T, E>`.**
+Rust’s `Result` is an enum with `Ok(T)` and `Err(E)`. The `?` operator works almost identically to Zig’s `try`. Major differences:
+- Rust’s error types are arbitrary user-defined types (any type that implements `std::error::Error`). This is flexible but often leads to dynamic dispatch (`Box<dyn Error>`) or painstaking error type composition (e.g., `map_err`). Zig’s error sets are structural and automatically compose with `||`.
+- Rust encourages `anyhow` or `thiserror` for application code; the standard library’s error handling is powerful but heavy. Zig keeps it primitive: error sets and `anyerror`.
+- Rust’s `Result` has many combinators (`map`, `and_then`, `or_else`). Zig intentionally omits them to avoid encouraging deep functional chains that obscure control flow; you write `if`, `switch`, and loops instead.
+
+**Go: Multiple return values (`(val, err)`).**
+Go’s pattern is `value, err := doSomething()` followed by `if err != nil`. This is nearly as explicit as Zig, but lacks a `try` operator, leading to repetitive boilerplate. Also, Go’s errors are interfaces (`error`), which often require heap allocation or string formatting. Zig’s error sets are zero‑allocation and comparable with a single integer operation.
+
+**Java: Checked exceptions.**
+Checked exceptions force the caller to either catch or declare `throws`. On paper this is explicit, but in practice developers abuse `throws Exception` or empty catch blocks. Java’s exceptions also incur unwinding overhead even when the exception is not thrown. Zig’s error unions provide similar “must handle” semantics but without the runtime cost or the bloated `throws` declarations.
+
+---
+
+### 5. Common Mistakes
+
+**Using `catch unreachable` for logic that can actually fail.**
+The most frequent abuse in Zig codebases is `catch unreachable` to silence an error that the programmer *believes* cannot happen. Unless you have proven invariants (e.g., a buffer is guaranteed to be large enough), this turns a recoverable error into a panic. Prefer `try` or an explicit `catch |err| { ... }` that logs or handles the error.
+
+**Confusing `error` with `!void`.**
+A function returning `error{MyError}` can only return an error; it cannot return success (since the success type is `void` implicitly? Actually `error{MyError}` is an error set, not an error union. Writing `fn foo() error{MyError}` means the function returns an error value – there is no success payload. To return either success (with no value) or an error, you need `!void`. This trips developers coming from Rust where `Result<(), E>` is explicit.
+
+**Returning `anyerror` from library code.**
+`anyerror` is the union of every error set in the entire program. When you write `fn parse() anyerror!u64`, you lose the ability for callers to know exactly which errors to expect. The compiler can still check that errors are handled, but the caller must either `catch` or propagate with `try` (which then infers `anyerror` up the chain). Library APIs should almost always return a concrete error set derived from their own logic plus the specific errors of the functions they call.
+
+**Forgetting that `try` returns from the *function*, not the block.**
+Unlike `catch` which only unwraps locally, `try` is a control flow operator that returns from the enclosing function. Newcomers sometimes write:
+
+```zig
+fn example() !void {
+    if (someCondition) {
+        try fallible(); // This returns from example() on error, not from the if block
+    }
+}
+```
+
+This is correct behaviour but surprising if you expect exception‑like semantics where the `try` is scoped to a block.
+
+**Mixing `errdefer` ordering assumptions.**
+While `defer` and `errdefer` were covered in Chapter 16, a common mistake is assuming `errdefer` runs for *any* return, including success. It runs only when the function returns an error through an unwinding path (explicit `return error.X` or `try` on an error). Placing an `errdefer` that mutates state intended only for error recovery and then later succeeding can lead to double‑free or corruption.
+
+**Comparing error values with `==` incorrectly.**
+Two different error sets can have the same integer value (e.g., both define `NotFound`). Zig’s `==` compares the error codes, not the set identity. This is usually what you want, but it means that `error{NotFound} == error{NotFound}` is true even though they are distinct types. The compiler treats them as compatible for comparisons but not for assignment without an explicit cast (via `@errorCast` or through `anyerror`). Rarely an issue, but can cause surprising type errors in generic code.
+
+---
+
+### 6. Performance Considerations
+
+Error unions are designed for the hot path (success) to stay fast. The typical sequence:
+
+1. Call function `f` that returns `E!T`.
+2. Test the discriminant. On x86‑64, this is a `test byte ptr [rsp+offset], 1` or similar.
+3. Predictable branch: the success case is taken almost always.
+
+Because the code for the error path is often cold, the compiler can move it to the end of the function (using `unlikely` hints). In practice, benchmarked overhead of `try` vs a hypothetical “zero‑cost” approach is indistinguishable from a hand‑written `if` check on a return code.
+
+**Binary size**: Each error union adds a discriminant branch. However, this is significantly smaller than exception handling tables (`.eh_frame` in C++), which can consume 10–30% of binary size in exception‑heavy code. Zig binaries with extensive error unions still see minimal bloat.
+
+**Error set explosion**: Every function that returns `!T` has a concrete error set derived from its body. If you deeply nest calls, the resulting error set can become a large union of many small sets. This does not affect runtime performance (the discriminant and error code remain a single integer), but it can increase compile times and memory usage in the compiler. For extreme cases (e.g., code generation from many fallible calls), consider coalescing errors into a smaller set or using `anyerror` at API boundaries.
+
+**Payload size matters**: If `T` is larger than 16 bytes (or contains alignment requirements), the error union’s memory representation grows. Returning a large struct as `!LargeStruct` forces a copy on every return, success or error. In performance‑sensitive code, you might instead return the struct via an output parameter (`*LargeStruct`) and use a separate error union return for the status.
+
+**No double‑error propagation**: Error unions cannot represent “an error that occurred while handling another error”. This is intentional: failure during cleanup is considered fatal (you `@panic` or log and continue). In practice, this avoids the complexity of fallible destructors (C++) or `Drop` that can itself panic (Rust).
+
+**Benchmark example**: A tight loop calling a function that returns `!void` (success always) and the caller `try`s it compiles to a single conditional jump that is never taken. This is identical to a `void` function that never fails. The compiler can even eliminate the discriminant entirely if it can prove that the error never occurs (e.g., a function that only returns `error{}!void`). Use `@compileError` or comptime assertions to help the optimizer.
+
+---
+
+### 7. Best Practices
+
+**Return the smallest meaningful error set.**
+Do not return `anyerror` from a library. Explicitly list the errors your function can produce, using `||` to combine errors from callees. This gives callers precise information and enables exhaustiveness checking.
+
+```zig
+// Good
+fn readConfig(path: []const u8) !Config {
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+    return try parseConfig(file.reader());
+}
+// Inferred error set: std.fs.File.OpenError || parseConfig's error set
+
+// Avoid
+fn readConfig(path: []const u8) anyerror!Config { ... }
+```
+
+**Name errors clearly and consistently.**
+Use `PascalCase` for error names, prefixed by a noun where helpful (e.g., `ParseError.UnexpectedEof` instead of just `Eof`). The standard library uses short names like `error.OutOfMemory` – follow that style.
+
+**Use `catch` for fallback values, not for logging side effects.**
+If you need to log and then propagate, prefer `if (result) |_| {} else |err| { log(err); return err; }`. A `catch` expression that returns an error is legal but less readable.
+
+**Prefer `try` over `if` + `return` for simple propagation.**
+`try` expresses intent in a single symbol, while an explicit `if` statement adds noise. Reserve explicit `if` for when you need to perform cleanup or transform the error before returning.
+
+**Wrap external errors with `errdefer` for resource cleanup.**
+When you acquire a resource after a potential failure point, use `errdefer` to release it only if the subsequent operations fail. But do *not* use `errdefer` as a substitute for checking error unions – it only triggers on the path that returns an error from the current function.
+
+**Test both success and error paths.**
+Zig’s `test` blocks make it easy to verify that a function returns the correct error:
+
+```zig
+test "parseNumber rejects invalid input" {
+    const result = parseNumber("123a");
+    try std.testing.expectError(ParseError.InvalidCharacter, result);
+}
+```
+
+The `expectError` function checks that the error union matches a specific error.
+
+**Leverage `switch` on error sets for exhaustive handling.**
+If a function returns a small, known error set, you can `switch` on the error:
+
+```zig
+const result = parseNumber(s);
+switch (result) {
+    ParseError.UnexpectedEof => handleEof(),
+    ParseError.InvalidCharacter => handleInvalid(),
+    ParseError.Overflow => handleOverflow(),
+    else => |other| return other, // if the set is not closed
+}
+```
+
+---
+
+### 8. Examples
+
+**Example 1: A command parser that aggregates errors from multiple steps**
+
+```zig
+const std = @import("std");
+
+const CommandError = error{
+    InvalidSyntax,
+    UnknownCommand,
+    MissingArgument,
+};
+
+fn parseCommand(input: []const u8) CommandError!struct { cmd: []const u8, args: []const u8 } {
+    var it = std.mem.tokenizeScalar(u8, input, ' ');
+    const cmd = it.next() orelse return CommandError.InvalidSyntax;
+    const args = it.rest();
+    if (!std.mem.eql(u8, cmd, "start") and !std.mem.eql(u8, cmd, "stop"))
+        return CommandError.UnknownCommand;
+    if (args.len == 0 and std.mem.eql(u8, cmd, "stop") == false)
+        return CommandError.MissingArgument;
+    return .{ .cmd = cmd, .args = args };
+}
+
+pub fn main() !void {
+    const tests = [_][]const u8{ "start server", "stop", "unknown x", "" };
+    for (tests) |t| {
+        const result = parseCommand(t);
+        if (result) |cmd| {
+            std.debug.print("OK: cmd='{s}', args='{s}'\n", .{ cmd.cmd, cmd.args });
+        } else |err| {
+            std.debug.print("ERR: {s}\n", .{ @errorName(err) });
+        }
+    }
+}
+```
+
+**Example 2: A generic retry loop with exponential backoff (simplified)**
+
+```zig
+fn retry(comptime func: anytype, max_attempts: usize) !@typeInfo(@TypeOf(func)).Fn.return_type.? {
+    var attempt: usize = 0;
+    while (attempt < max_attempts) : (attempt += 1) {
+        const result = func();
+        if (result) |success| return success else |err| {
+            if (attempt + 1 == max_attempts) return err;
+            std.time.sleep(1 << @as(u32, @intCast(attempt)) * std.time.ns_per_ms);
+            continue;
+        }
+    }
+    unreachable;
+}
+
+fn unreliableOperation() !u32 {
+    if (std.crypto.random.int(u32) % 2 == 0) return error.TemporaryFailure;
+    return 42;
+}
+
+test "retry eventually succeeds" {
+    const val = try retry(unreliableOperation, 10);
+    try std.testing.expectEqual(@as(u32, 42), val);
+}
+```
+
+**Example 3: Converting a C-style error code to an error union**
+
+```zig
+// Simulating a C API
+const C_ERR_NONE = 0;
+const C_ERR_NOT_FOUND = 1;
+const C_ERR_ACCESS = 2;
+
+fn c_like_open(path: [*:0]const u8) callconv(.C) i32 {
+    _ = path;
+    // mock: always return not found
+    return C_ERR_NOT_FOUND;
+}
+
+const MyError = error{NotFound, AccessDenied};
+
+fn safeOpen(path: [*:0]const u8) MyError!void {
+    const rc = c_like_open(path);
+    return switch (rc) {
+        C_ERR_NONE => {},
+        C_ERR_NOT_FOUND => MyError.NotFound,
+        C_ERR_ACCESS => MyError.AccessDenied,
+        else => unreachable, // unknown error from C stub
+    };
+}
+```
+
+**Example 4: Compile-time validation of error handling**
+
+```zig
+fn mustSucceed(comptime func: anytype) void {
+    const ReturnType = @typeInfo(@TypeOf(func)).Fn.return_type.?;
+    if (@typeInfo(ReturnType) != .ErrorUnion) {
+        @compileError("mustSucceed requires a function that returns an error union");
+    }
+    // comptime check that the error set is empty (cannot fail)
+    // This is a contrived demonstration; in practice you'd call @typeInfo on the error set.
+}
+
+fn alwaysWorks() !void {
+    return; // success only, error set is error{}
+}
+
+comptime {
+    mustSucceed(alwaysWorks); // passes
+    // mustSucceed(parseNumber); // would fail at compile time
+}
+```
+
+---
+
+### 9. Summary & Exercises
+
+**Summary**
+
+Error unions (`!T`) provide Zig with a visible, performant, and predictable error handling model. The compiler represents them as a discriminant plus a payload, turning every fallible call into a local branch. This design embodies the “no hidden control flow” pillar: errors are values you must handle, but the language assists with `try`, `catch`, and `if` capture. Compared to exceptions, return codes, or `Result` types in other languages, Zig’s error unions strike a balance between ergonomics and transparency. The key takeaways:
+
+- Error sets are global, integer‑backed enums that compose with `||`.
+- `try` propagates errors upward; `catch` provides local fallbacks.
+- Prefer concrete error sets over `anyerror` in library boundaries.
+- Performance is optimal for the success path; error handling adds minimal branch overhead.
+- Use `errdefer` for error‑only cleanup, but test both success and failure paths.
+
+**Exercises**
+
+1. **Implement a `try_map` function** that takes an error union `E!T` and a function `fn (T) U`, returning `E!U` (if the input is an error, propagate it; otherwise apply the mapping). Do not use `catch` or `try` internally – work directly with the `if` capture. Then benchmark it against the naive version using `try` and explain any differences in generated assembly.
+
+2. **Build a small HTTP status code parser** that accepts a `[]const u8` containing a three‑digit number and returns a tagged union `enum { ok, redirect, client_error, server_error }` or an error `InvalidStatusCode`. Write tests that verify the error set contains exactly `InvalidStatusCode` and that the success branches discriminate correctly. Extend the exercise by writing a function that takes a `std.fs.File` and reads a status line (e.g., `HTTP/1.1 200 OK`) – ensure all possible I/O errors (from `std.fs.File.Reader`) are correctly propagated without losing the concrete error type.
+
+3. **Design a small allocator wrapper** that uses error unions to simulate resource exhaustion. The wrapper should take an underlying allocator and a maximum allocation counter. It returns `error.OutOfMemory` once the counter reaches zero, and decrements the counter on each successful allocation. Use this allocator to test how a fallible function behaves under artificial memory pressure – then refactor the function to use a `FixedBufferAllocator` (which cannot fail, but may return `error.OutOfMemory` if the buffer is too small). Compare the two approaches in terms of API design and error handling ergonomics.

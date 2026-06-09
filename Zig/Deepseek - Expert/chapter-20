@@ -1,0 +1,435 @@
+# Chapter 20: Memory Layout & Alignment
+
+*The compiler’s view of your data—where the bits live, how they’re accessed, and the invisible padding that separates them—determines correctness, performance, and binary compatibility. Zig gives you both the **precision** to dictate exact layouts and the **trust** to let the compiler optimize when you don’t care.*
+
+---
+
+## 20.1 Basic Usage
+
+Zig provides three built-in functions for introspection and three directives for layout control:
+
+- **`@sizeOf(T)`** – total bytes of the type, including any trailing padding that makes an array of `T` correctly aligned.
+- **`@alignOf(T)`** – the alignment requirement of `T`; addresses of values must be multiples of this.
+- **`@offsetOf(T, field)`** – byte offset from the struct start to the named field (only valid for `extern` or `packed` structs, because in normal structs field order is undefined).
+
+Layout-control qualifiers for structs:
+
+- **Normal struct** (no qualifier): the compiler **may reorder fields** and insert padding to minimize size. Field offsets are not observable without `@offsetOf` being forbidden (causes compile error).
+- **`extern struct`**: fields are in declaration order, padding follows the C ABI of the target platform. This is for C interop.
+- **`packed struct`**: no padding between fields, total size is minimal; fields are bit-aligned (even sub-byte fields allowed) and laid out in order.
+
+Alignment can be requested on individual variables or struct fields with the `align(N)` modifier. For pointers, `[*]align(N) T` and `*align(N) T` enforce the pointed-to memory’s alignment. Conversions among alignments require `@alignCast` or `@ptrCast` when safe, but the onus is on the programmer to guarantee correctness.
+
+Let’s start with a simple investigation:
+
+```zig
+const std = @import("std");
+const expect = std.testing.expect;
+
+test "size and alignment basics" {
+    // u8 has natural alignment of 1, size 1
+    try expect(@sizeOf(u8) == 1);
+    try expect(@alignOf(u8) == 1);
+
+    // usize is pointer-sized (8 on 64-bit)
+    try expect(@sizeOf(usize) == @sizeOf(*u8));
+    try expect(@alignOf(usize) == @sizeOf(usize));
+
+    // A struct containing a u32 and a u8
+    const S = struct {
+        a: u32,
+        b: u8,
+    };
+    // On most platforms: size 8, alignment 4
+    // Padding of 3 bytes after b so that array S[2] works.
+    try expect(@sizeOf(S) >= 5);
+    try expect(@alignOf(S) == @alignOf(u32));
+}
+```
+
+**Packed structs** collapse fields to eliminate gaps and allow bit-level control:
+
+```zig
+const PackedHeader = packed struct {
+    version: u3,     // 3 bits
+    type: u4,        // 4 bits
+    has_extension: u1, // 1 bit
+    reserved: u8,    // next byte
+};
+test "packed struct size" {
+    try expect(@sizeOf(PackedHeader) == 2); // 3+4+1 bits + 8 bits = 2 bytes
+}
+```
+
+**Extern structs** mirror C:
+
+```zig
+const CHeader = extern struct {
+    id: u16,
+    flags: u32,
+    count: u64,
+};
+test "extern struct layout" {
+    // id at offset 0, flags probably at 4 (after 2-byte pad), count at 8.
+    // We'll check offsets later; here we just show usage.
+    var h = CHeader{ .id = 0x1234, .flags = 0xDEADBEEF, .count = 100 };
+    _ = h;
+}
+```
+
+`@offsetOf` is only allowed for `extern` and `packed` structs:
+
+```zig
+test "offsetOf on extern" {
+    const off = @offsetOf(CHeader, "flags");
+    // On most 64-bit targets: 4, because after the u16 id there are 2 bytes padding.
+    try expect(off >= 2);
+}
+```
+
+Alignment annotations on fields force the compiler to respect stricter boundaries:
+
+```zig
+const CacheLineAligned = struct {
+    counter: u64 align(64),   // each counter on its own cache line
+    other: u64 align(64),
+};
+test "aligned field" {
+    try expect(@alignOf(CacheLineAligned) == 64);
+    try expect(@sizeOf(CacheLineAligned) == 128); // 64 + 64, no packing needed
+}
+```
+
+Pointers carry alignment information. An `*align(8) u32` is a pointer to a 4-byte integer that resides at an 8-byte aligned address. Dereferencing a misaligned pointer is undefined behavior. Use `@alignCast` when you know the alignment is satisfied:
+
+```zig
+fn readU32BigEndian(raw: [*]const u8) u32 {
+    // We know raw is at least align(4) due to memory allocator behavior,
+    // but if it isn't, this cast is UB.
+    const aligned: *align(4) const u32 = @ptrCast(@alignCast(raw));
+    return @byteSwap(aligned.*);
+}
+```
+
+---
+
+## 20.2 Under the Hood
+
+At the compiler level, layout decisions involve two back‑end paths: the LLVM backend and the self‑hosted x86‑64 backend. Both follow the same Zig‑level rules but differ in how they map to target‑specific ABIs.
+
+### Normal Structs: Compiler Freedom
+
+When you declare a normal struct without `extern` or `packed`, Zig’s semantic analysis treats its fields as unordered. The compiler is free to reorder fields to reduce the total size while respecting alignment constraints. For instance, given:
+
+```zig
+const S = struct {
+    a: u8,
+    b: u32,
+    c: u16,
+};
+```
+
+The compiler might place `b` first (4‑byte alignment), then `c` (2‑byte alignment), then `a` (1‑byte) to achieve a size of 8 bytes instead of 12 if laid out in declaration order with padding. The result is equivalent to the `-fpack-struct`‑like optimization but deterministic for a given compiler version and target. **This is why `@offsetOf` is not allowed for normal structs:** there is no stable field ordering.
+
+The machinery works by collecting all fields, sorting them by descending alignment, then by size, and packing them greedily. The total struct alignment is the maximum alignment of any field, and the total size is padded so that an array `[N]S` has every element correctly aligned.
+
+### Extern Structs: C ABI
+
+`extern struct` disables reordering. Fields are placed sequentially in declaration order, each aligned according to the ABI rules of the target platform (typically the natural alignment of the field’s type). The compiler inserts padding bytes between fields and at the end to satisfy the element alignment for arrays. This layout precisely matches what a C compiler generates when given the same struct, modulo any compiler‑specific pragmas. Zig relies on LLVM’s (or the self‑hosted backend’s) knowledge of the target’s C ABI to compute sizes and offsets.
+
+### Packed Structs: Bit‑Level Control
+
+`packed struct` turns the struct into a single integer of `@sizeOf` bytes, with fields assigned contiguous bit ranges from least‑significant to most‑significant (on little‑endian targets the first field occupies the lowest bits). No padding is inserted; the size is the sum of all field bit widths rounded up to a byte boundary. Sub‑byte fields (e.g., `u3`) are packed tightly, and even fields with natural alignment greater than 1 are placed at arbitrary bit offsets. Accessing a field of a packed struct involves bit‑shifting and masking, which the compiler emits as an integer load/store sequence. This is fundamentally different from a normal struct where each field is independently addressable.
+
+### Alignment Annotations
+
+The `align(N)` modifier on variables and fields inserts padding in the parent layout to place the field at an `N`‑byte boundary. This works for both normal and extern structs (packed structs do not respect per‑field alignment; instead, the whole struct can be `align(N)`). At the LLVM level, `align` becomes an alignment attribute on the alloca or global, and loads/stores have align metadata. For fields, the compiler increases the struct’s own alignment to the maximum of all field alignments and adjusts preceding padding accordingly.
+
+### Type Erasure and Pointers
+
+Zig’s pointer types carry an alignment child: `*T` implies alignment of `@alignOf(T)`. When you coerce a `[*]u8` to `*T` via `@ptrCast`, Zig checks that the alignment is appropriate if the value is known at comptime; otherwise, it relies on the programmer’s guarantee. The runtime never checks alignment automatically, which is consistent with Zig’s “no hidden control flow” philosophy.
+
+---
+
+## 20.3 Why This Design?
+
+Zig’s layout system reflects three deliberate choices:
+
+1. **Default to “compiler knows best” for internal data.**
+2. **Explicit opt‑in for C compatibility and protocol‑level bit layouts.**
+3. **No implicit alignment checks or padding that could hide logic errors.**
+
+### No Hidden Layout Assumptions
+
+In C, struct field order is always fixed, so programmers casually rely on pointer arithmetic to access fields based on sizeof calculations. Zig rejects that by forbidding `@offsetOf` on normal structs. If you need a fixed layout, you must declare `extern` or `packed`. This forces the developer to **state intent**: “I’m talking to C,” or “I’m defining a wire format.” For all other uses, you trust the compiler to produce a compact representation, which saves both binary size and cache pressure.
+
+This is a direct application of “Explicit is Better Than Implicit.” If a field’s offset matters, you annotate it. Otherwise, you don’t pay attention to it, and the compiler is free to optimize across version updates. Contrast with languages where the default struct layout is fixed and programmers manually reorder fields for size—a discipline that’s easily forgotten and fragile across compilers.
+
+### Separation of Concerns: `extern` vs `packed`
+
+C compilers treat all structs as sequential, and to achieve bitfield packing you must use the `:` syntax inside structs. Zig separates the two concepts cleanly: `extern` gives you C ABI (with full‑width fields but no reordering), `packed` gives you bit‑level control with no ABI guarantees. You can even combine them: `packed struct` with `extern` is explicitly disallowed because they are contradictory. This design prevents the common C pitfall of trying to use a bitfield structure for both network protocols and cross‑language interop, only to discover that bitfield layout is implementation‑defined.
+
+### Alignment Awareness as a First‑Class Feature
+
+Zig embeds alignment into the type system instead of leaving it as a lint attribute. Pointers carry alignment, and casting between alignments requires an explicit `@alignCast`. This means that when you receive a pointer from an allocator or a C library, you are forced to think about alignment. Languages like C allow any pointer cast, leading to silent misaligned accesses that only crash on some architectures. Rust’s `align_of` and `repr(align)` provide similar safety but with more ceremony (e.g., `unsafe` blocks for pointer casts); Zig’s approach is leaner because it trusts the programmer after an explicit cast, yet makes that cast visible in the source as a point of review.
+
+### Zero Overhead Principle
+
+All layout‑related operations are compile‑time or no‑cost runtime operations. `@sizeOf` and `@alignOf` are comptime; `@offsetOf` is also comptime (for allowed types). There are no runtime alignment checks on dereferences—the compiler assumes you’ve upheld the guarantees. This aligns with Zig’s performance philosophy: “Pay for what you use, and don’t pay for what you don’t.”
+
+---
+
+## 20.4 Competing Approaches
+
+### C
+
+- **Layout:** Fields in order, padding inserted per ABI. Bitfields are implementation‑defined (ordering, sign, padding).
+- **Control:** `__attribute__((packed))`, `#pragma pack`, and manual reordering are the tools.
+- **Problems:** No portable bitfield layout; memory layout tied to declaration order invites fragile pointer arithmetic; no type‑level alignment beyond `_Alignas` (C11) which is often ignored.
+- **Zig’s advantage:** `packed struct` is portable and well‑defined across targets (LSB‑first bit ordering). `extern struct` matches C ABI without macros.
+
+### Rust
+
+- **Layout:** Default `repr(Rust)` allows reordering like Zig’s normal structs. `repr(C)` fixes order, `repr(packed)` removes padding, `repr(align(N))` sets alignment.
+- **Philosophy:** Rust discourages relying on layout unless you opt in, but `repr(C)` is needed for FFI. Field offsets are accessible via `offset_of!` macro (unstable for `repr(Rust)`).
+- **Compared to Zig:** Zig’s `@offsetOf` restriction on normal structs is stricter—Rust’s `offset_of!` is available on `repr(Rust)` as an unstable feature. Zig avoids that entirely to prevent false dependencies. Both languages require explicit annotations for fixed layout, but Zig’s `packed` is cleaner for bitfields than Rust’s `repr(packed)` which still aligns fields to their type boundary (Rust’s packed struct does not create bitfields). Zig’s `packed` can pack u3 fields across byte boundaries; Rust currently requires manual bit manipulation or external crates.
+
+### Go
+
+- **Layout:** Struct fields in declaration order, padded to natural alignment (like C). Go has `reflect.StructField.Offset`, which exposes layout. Alignment can be specified via `align` field tag (but it’s not a language feature, it’s just compiler directive). No reordering.
+- **Philosophy:** Go’s simplicity means you get deterministic layout, but you can’t ask the compiler to optimize it. Zig’s reordering normal structs can produce smaller binaries, which Go only achieves by manual field sorting.
+- **Comparison:** Zig’s explicit `extern`/`packed` forces you to declare your intent; Go’s default is like `extern` without the name. This can cause accidental reliance on field order that breaks when moving to another language or when someone adds a field.
+
+### C++
+
+- Similar to C but with more complexity: `alignas`, `offsetof` macro, `std::alignment_of`, `std::has_unique_object_representations`. Compilers can reorder base class subobjects but not member fields (except under the empty base optimization). Zig’s normal struct reordering is more aggressive and predictable.
+
+---
+
+## 20.5 Common Mistakes
+
+1. **Assuming `@offsetOf` works on normal structs**
+   Zig gives a compile error: “`@offsetOf` requires struct to be extern or packed.” The fix: use `extern struct` if you need stable offsets.
+
+2. **Using `packed` for speed without understanding the cost**
+   A packed struct’s field access compiles to bit shifting and masking, which is slower and may inhibit optimizations. Use `packed` only for wire formats or memory‑constrained environments.
+
+3. **Misaligned pointer casts**
+   Casting a `[*]u8` buffer from the network to a `*align(4) const Header` without verifying alignment causes UB on platforms that trap unaligned loads. Always align your buffer or use `@alignCast` after manual alignment verification.
+
+   ```zig
+   fn parseHeader(buf: []u8) !*Header {
+       const addr = @intFromPtr(buf.ptr);
+       if (addr % @alignOf(Header) != 0) return error.Unaligned;
+       return @ptrCast(@alignCast(buf.ptr));
+   }
+   ```
+
+4. **Neglecting alignment of stack variables**
+   By default, local variables have natural alignment. If you need, say, 16‑byte alignment for a SIMD type, use `var vec: @Vector(4, f32) align(16) = ...;`. Forgetting this may cause slow unaligned loads or compiler spills.
+
+5. **Using `extern struct` and then adding fields**
+   Adding a field changes the layout, potentially breaking C interop. Version your structs or use reserved fields.
+
+6. **Misunderstanding array size vs element alignment**
+   `@sizeOf([4]u8)` is 4, alignment is 1. But `@sizeOf([4]u32)` is 16, alignment 4. When you embed an array in a struct, the array’s alignment is the element alignment, which can introduce padding you didn’t expect.
+
+---
+
+## 20.6 Performance Considerations
+
+Memory layout directly affects **cache line utilization**, **false sharing**, and **SIMD efficiency**. The compiler’s reordering of normal structs is a win‑for‑free: fields accessed together are kept together, and the struct becomes as small as possible, improving cache density. However, when you know the access pattern, you can use `align(N)` to place heavily‑contended mutexes or counters on separate cache lines (usually 64 bytes on x86‑64).
+
+**False sharing** example:
+
+```zig
+const ThreadState = struct {
+    ready: bool align(64),
+    counter: u64 align(64),
+};
+```
+Without `align(64)`, two threads writing `ready` and `counter` respectively would invalidate each other’s cache line, tanking performance. The explicit alignment eliminates that.
+
+**Packed structs** incur a penalty for each field access. Instead of a single `mov` instruction, the compiler must emit shifts and bitwise AND/OR. This can be dozens of instructions, especially on platforms that lack efficient bit‑field extract instructions. For a protocol parser that only reads a few fields once, this cost is negligible. But for a struct that’s updated in a hot loop, avoid `packed`. Consider decoding the packed representation into a normal struct once.
+
+**Alignment of heap allocations** matters for SIMD. The standard library’s `Allocator` interface returns `[]u8` aligned to at least the allocation granularity, but the exact alignment depends on the allocator (e.g., `page_allocator` returns page‑aligned memory). When you need specific alignment, use an allocator that supports `alignedAlloc`, or over‑allocate and adjust the pointer manually with `@alignCast`. Zig doesn’t hide this—you’re in control.
+
+**Alignment and atomics**: Some atomic operations (e.g., `std.atomic.Queue` node) require alignment to avoid tearing across cache lines. Zig’s atomics work on naturally aligned integers; if you put an `u64` inside a packed struct, it may not be naturally aligned, making atomic operations UB. Always keep atomics in naturally aligned positions.
+
+---
+
+## 20.7 Best Practices
+
+- **Default to normal structs** for internal data. Let the compiler reorder and optimize.
+- **Use `extern struct`** when interacting with C libraries, saving/loading binary files with fixed layout, or implementing a stable ABI.
+- **Use `packed struct`** for bit‑level protocol headers, hardware register maps, or extreme memory savings. Document the bit ordering (always little‑endian LSB‑first in Zig).
+- **Verify layout with comptime tests**:
+
+  ```zig
+  test "packed header layout matches spec" {
+      const expected_size = 2;
+      try expect(@sizeOf(PackedHeader) == expected_size);
+      // Check that version occupies lowest 3 bits
+      const v: PackedHeader = .{ .version = 7, .type = 0, .has_extension = 0, .reserved = 0 };
+      const as_int: u16 = @bitCast(v);
+      try expect(as_int & 0x7 == 7);
+  }
+  ```
+
+- **Avoid using `@offsetOf` on normal structs** — it’s forbidden. If you need an offset, decide why and choose `extern` or `packed`.
+- **When casting from a byte buffer**, guarantee alignment or use unaligned reads via a utility that uses `@memcpy` (which handles unaligned). Example:
+
+  ```zig
+  fn readStructUnpacked(comptime T: type, bytes: []const u8) T {
+      var result: T = undefined;
+      @memcpy(@as([*]u8, @ptrCast(&result))[0..@sizeOf(T)], bytes[0..@sizeOf(T)]);
+      return result;
+  }
+  ```
+
+- **Use `align(N)` strategically for performance**, but don’t sprinkle it everywhere. Profile first.
+- **When designing allocators**, pass the requested alignment through to the backing allocator and respect it in `alloc` / `free`. Zig’s `std.mem.Allocator` interface includes an `alignment` parameter for `alloc`; always honor it.
+
+---
+
+## 20.8 Examples
+
+### Example 1: Parsing a Binary Network Header with Packed Struct
+
+This example reads a fixed‑length header from a slice, verifying alignment and extracting fields.
+
+```zig
+const std = @import("std");
+
+const ProtocolHeader = packed struct {
+    version: u2,
+    type: u4,
+    flags: u2,
+    length: u16,
+};
+
+fn parseHeader(buffer: []const u8) !*const ProtocolHeader {
+    if (buffer.len < @sizeOf(ProtocolHeader)) return error.ShortBuffer;
+    const addr = @intFromPtr(buffer.ptr);
+    // Packed structs have alignment 1, but the buffer must be at least align(2) for the u16 field.
+    if (addr % @alignOf(ProtocolHeader) != 0) return error.Unaligned;
+    return @ptrCast(@alignCast(buffer.ptr));
+}
+
+test "parse valid header" {
+    // Build a little‑endian header: version=0b10, type=0b1010, flags=0b01, length=0x4321
+    const raw = [_]u8{
+        0b01_10_1010, // bits: flags(2) type(4) version(2) from LSB
+        0x21, 0x43,   // length = 0x4321 LE
+    };
+    const h = try parseHeader(&raw);
+    try std.testing.expect(h.version == 2);
+    try std.testing.expect(h.type == 10);
+    try std.testing.expect(h.flags == 1);
+    try std.testing.expect(h.length == 0x4321);
+}
+```
+
+### Example 2: Cache‑Line Alignment to Avoid False Sharing
+
+A concurrent ring buffer where the producer and consumer indices are on separate cache lines to prevent ping‑ponging.
+
+```zig
+const std = @import("std");
+
+const CacheLineSize = 64;
+
+const SPSCQueue = struct {
+    buffer: []u8,
+    read_index: usize align(CacheLineSize),
+    write_index: usize align(CacheLineSize),
+
+    fn init(allocator: std.mem.Allocator, capacity: usize) !SPSCQueue {
+        const buf = try allocator.alloc(u8, capacity);
+        return SPSCQueue{
+            .buffer = buf,
+            .read_index = 0,
+            .write_index = 0,
+        };
+    }
+
+    fn push(self: *SPSCQueue, value: u8) !void {
+        if (self.write_index - self.read_index >= self.buffer.len) return error.Full;
+        self.buffer[self.write_index % self.buffer.len] = value;
+        @atomicRmw(usize, &self.write_index, .Add, 1, .monotonic);
+    }
+
+    fn pop(self: *SPSCQueue) ?u8 {
+        if (self.read_index == self.write_index) return null;
+        const value = self.buffer[self.read_index % self.buffer.len];
+        @atomicRmw(usize, &self.read_index, .Add, 1, .monotonic);
+        return value;
+    }
+};
+
+test "SPSC queue false sharing prevention" {
+    // Ensure indices are on separate cache lines
+    try std.testing.expect(@offsetOf(SPSCQueue, "read_index") % CacheLineSize == 0);
+    try std.testing.expect(@offsetOf(SPSCQueue, "write_index") % CacheLineSize == 0);
+
+    const allocator = std.testing.allocator;
+    var q = try SPSCQueue.init(allocator, 8);
+    defer allocator.free(q.buffer);
+    try q.push(42);
+    try std.testing.expectEqual(@as(?u8, 42), q.pop());
+    try std.testing.expectEqual(@as(?u8, null), q.pop());
+}
+```
+
+### Example 3: Comptime Verification of a C‑Compatible Struct
+
+Ensuring an `extern struct` matches a known C layout without relying on runtime checks.
+
+```zig
+const CHeader = extern struct {
+    tag: u32,
+    value: u64,
+};
+
+comptime {
+    // These assertions run at compile time.
+    if (@sizeOf(CHeader) != 12) @compileError("Bad size");
+    if (@offsetOf(CHeader, "tag") != 0) @compileError("tag offset wrong");
+    if (@offsetOf(CHeader, "value") != 4) @compileError("value offset wrong");
+}
+
+test "extern struct size never changes" {
+    // Just a runtime sanity check.
+    try std.testing.expect(@sizeOf(CHeader) == 12);
+}
+```
+
+---
+
+## 20.9 Summary & Exercises
+
+Zig’s memory layout system is a lattice of explicitness:
+
+- **Normal structs:** Compiler‑optimized layout—use for most internal data.
+- **`extern struct`:** Fixed, C‑compatible layout—use for FFI and stable binary formats.
+- **`packed struct`:** Bit‑level packing—use for protocols, memory‑mapped registers.
+- **`align(N)`** and **alignment‑aware pointers** give you control over performance‑sensitive alignment without hidden checks.
+
+The absence of `@offsetOf` on normal structs, the mandatory use of `extern`/`packed` for fixed layouts, and the need for explicit alignment casts are all deliberate guardrails. They prevent the silent introduction of ABI breakage and misaligned accesses that plague C and, to a lesser extent, other systems languages. At the same time, the compiler’s freedom to reorder normal structs gives you free size optimizations that you’d otherwise have to do by hand.
+
+### Exercises
+
+1. **Write a comptime validator for a packed struct.**
+   Given a packed struct type and an array of expected byte values (comptime), verify that the struct’s bit layout produces those bytes when an instance is `@bitCast` to an integer of the appropriate size. The function should cause a compile error if the layout does not match.
+   *Hint: Use `@typeInfo` to iterate over fields, construct a comptime instance, and compare `@as` integer against a slice.*
+
+2. **Implement a robust network message reader.**
+   Write a function `fn readMessage(comptime T: type, buffer: []const u8) !T` that:
+   - Checks that `buffer.len` is at least `@sizeOf(T)`.
+   - If `T` is a `packed` struct, performs an aligned read only if the buffer is aligned; otherwise, uses an unaligned `@memcpy` fallback.
+   - Returns an instance of `T`.
+   *This is a real‑world pattern used in protocol implementations.*
+
+3. **Design a thread‑local statistics struct that avoids false sharing.**
+   Create a struct that holds several `u64` counters, each aligned to 64 bytes, and a collection function that sums them. Measure the performance impact of alignment using `std.time.Timer` in a multi‑threaded microbenchmark (use `std.Thread`).
+   *Advanced: profile with `perf` and observe cache‑line bouncing when alignment is removed.*

@@ -1,0 +1,408 @@
+## Chapter 32: HTTP Clients & Servers
+
+HTTP is the universal protocol for connected systems. Zig’s standard library provides a capable, no-frills HTTP client and server in `std.http`. There’s no async runtime, no hidden I/O multiplexer, and no framework—just a parser, a transport, and a straightforward API. In this chapter, you’ll build TCP echo services from `std.net`, then ascend to full HTTP clients and servers, ultimately understanding how to structure production‑grade networked applications without sacrificing Zig’s core tenets.
+
+---
+
+### 1. Basic Usage
+
+#### A TCP Echo Server with `std.net`
+
+Before touching HTTP, understand the raw transport. A TCP echo server is the minimal networked program:
+
+```zig
+const std = @import("std");
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const address = try std.net.Address.parseIp4("127.0.0.1", 8080);
+    var listener = try address.listen(.{
+        .reuse_address = true,
+    });
+    defer listener.deinit();
+
+    std.log.info("Listening on {any}", .{address});
+
+    while (true) {
+        const connection = try listener.accept();
+        const handle_thread = try std.Thread.spawn(.{}, handleClient, .{ connection, allocator });
+        handle_thread.detach();
+    }
+}
+
+fn handleClient(conn: std.net.Server.Connection, ally: std.mem.Allocator) void {
+    defer conn.stream.close();
+    var buf: [4096]u8 = undefined;
+    const reader = conn.stream.reader();
+    const writer = conn.stream.writer();
+    while (true) {
+        const bytes_read = reader.read(&buf) catch |err| {
+            std.log.err("Read error: {}", .{err});
+            return;
+        };
+        if (bytes_read == 0) break; // EOF
+        writer.writeAll(buf[0..bytes_read]) catch |err| {
+            std.log.err("Write error: {}", .{err});
+            return;
+        };
+    }
+}
+```
+
+No allocation, no hidden buffering—just raw `read`/`write`. The `listener` returns a `std.net.Server.Connection`, which wraps a `std.net.Stream`. We spawn a detached thread per connection; that’s our concurrency model. Zig makes threading explicit; you can later replace `std.Thread` with a thread pool or an event loop, but you must build it.
+
+#### HTTP Client
+
+The `std.http.Client` sends requests and receives responses. It manages connection pooling via the `keep_alive` flag and handles request/response serialisation.
+
+```zig
+const std = @import("std");
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
+    const uri = try std.Uri.parse("http://example.com/index.html");
+    var request = try client.request(.GET, uri, .{ .allocator = allocator }, .{});
+    defer request.deinit();
+
+    // No body; immediately wait for response.
+    try request.start();
+    try request.wait();
+
+    var response = try request.reader();
+    const body = try response.readAllAlloc(allocator, 10 * 1024 * 1024);
+    defer allocator.free(body);
+
+    std.debug.print("Status: {d}\nBody:\n{s}\n", .{ response.status, body });
+}
+```
+
+The `Client.request` returns a `Client.Request` that is built in steps: `start()` sends the request line and headers, then `wait()` blocks until the status line and headers arrive. Afterwards, the request exposes a `Reader` for the response body. The body must be read entirely before another request on the same connection can be sent; keep‑alive management is manual but explicit.
+
+For a POST with a JSON payload:
+
+```zig
+const payload =
+    \\{"name": "Zig", "version": "0.13"}
+;
+const uri = try std.Uri.parse("http://httpbin.org/post");
+var request = try client.request(.POST, uri, .{
+    .allocator = allocator,
+    .extra_headers = &.{
+        .{ .name = "content-type", .value = "application/json" },
+    },
+}, .{});
+defer request.deinit();
+
+request.transfer_encoding = .{ .content_length = payload.len };
+try request.start();
+try request.writeAll(payload);
+try request.finish();
+try request.wait();
+
+var response = try request.reader();
+// handle body...
+```
+
+Notice the explicit content length. Zig does not automatically set it; you control the encoding.
+
+#### HTTP Server
+
+`std.http.Server` is a multithreaded, blocking-per-connection HTTP/1.1 server.
+
+```zig
+const std = @import("std");
+
+const Handler = struct {
+    allocator: std.mem.Allocator,
+
+    pub fn handle(self: *Handler, request: *std.http.Server.Request, response: *std.http.Server.Response) void {
+        defer request.deinit();
+        defer response.deinit();
+
+        const path = request.head.target;
+        if (std.mem.eql(u8, path, "/health")) {
+            response.status = .ok;
+            response.headers.content_type = .{ .override = "text/plain" };
+            const body = "OK\n";
+            response.transfer_encoding = .{ .content_length = body.len };
+            response.do() catch |err| {
+                std.log.err("Failed to send response: {}", .{err});
+                return;
+            };
+            _ = response.writer().writeAll(body) catch return;
+            response.end() catch return;
+        } else {
+            response.status = .not_found;
+            response.headers.content_type = .{ .override = "text/plain" };
+            const body = "Not Found\n";
+            response.transfer_encoding = .{ .content_length = body.len };
+            response.do() catch return;
+            _ = response.writer().writeAll(body) catch return;
+            response.end() catch return;
+        }
+    }
+};
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var server = std.http.Server.init(allocator, .{ .reuse_address = true });
+    defer server.deinit();
+
+    var handler = Handler{ .allocator = allocator };
+    try server.listen(try std.net.Address.parseIp4("127.0.0.1", 8080), &handler);
+}
+```
+
+`Server.listen` blocks the main thread while spawning a new thread for every accepted connection. Inside `handle()`, you process the request synchronously. The `response.do()` sends status line and headers; then you write the body and call `response.end()` to flush. The `defer request.deinit()` frees any request‑related resources.
+
+---
+
+### 2. Under the Hood
+
+Zig’s HTTP stack is a careful assembly of standard library components, not a black‑box runtime.
+
+**Client:**
+`std.http.Client` holds a `std.ArrayList` of connections, each wrapping a `std.net.Stream` (or a TLS stream from `std.crypto.tls`). When you call `request()`, the client searches for an idle keep‑alive connection to the target host/port, creates one if none exists, then associates it with the request. The connection remains alive until `client.deinit()` is called or until a protocol error occurs. The request parsing is implemented as a state machine in `std.http.Headers` and `std.http.Server.Connection` (shared with the server). The header parser uses a hand‑rolled iterator over a buffer; there’s no allocation until you extract a value. The body reader reads chunked or content‑length‑delimited streams. Everything is synchronous and blocking. If you need non‑blocking I/O, you must wrap the client’s file descriptor in an event loop yourself, but the standard library does not do it for you.
+
+**Server:**
+`std.http.Server` wraps a `std.net.StreamServer` (which does the `bind`, `listen`, `accept` loop) and a thread pool that is simply an `std.ArrayList` of spawned `std.Thread` handles. Each accepted connection is handed to a new thread running `Server.Connection.handler`. The handler calls your provided function pointer (or interface via `Handler`), passing `Request` and `Response`. The request is parsed immediately after the connection is established; all header parsing happens in that thread. The response builder manages buffering and ensures HTTP/1.1 semantics (e.g., automatically adding `Connection: close` when keep‑alive is off). There is no event loop: each thread blocks on `read`/`write`. This design is intentionally simplistic—you can replace it with a more efficient event‑driven server using the same `std.http` primitives.
+
+**Comptime and Resource Management:**
+Both client and server accept an allocator for any dynamic memory they need (e.g., growing header lists, temporary buffers). Because the entire HTTP parser is expressed in normal Zig code (no code generation), comptime can inspect the `std.http.Server.Request` and `Response` types, and you can easily write metaprograms that generate custom HTTP routers.
+
+---
+
+### 3. Why This Design?
+
+Zig’s HTTP module mirrors the language’s core philosophy: **explicit, composable, no hidden control flow**.
+
+- **No Built‑in Async Runtime.** Many languages couple HTTP with an event loop (Go’s goroutine scheduler, Rust’s tokio, Python’s asyncio). Zig provides synchronous blocking primitives; you build the concurrency model you need. This avoids function colouring, hidden allocations on task switches, and the “magic” of awaiting a future that might spawn I/O without your knowledge. If a function calls `request.wait()`, it blocks the current thread—that’s it.
+- **Explicit Connection Management.** The client’s connection pool is a manually‑managed structure; you control when connections are established and torn down. The server’s threading model is a thread‑per‑connection; if that’s inappropriate, replace it with a thread pool or an event loop. Zig doesn’t hide the underlying OS socket from you.
+- **Allocations Are Visible.** The client and server require an allocator. Any allocation done internally is documented (header fields, body buffers). You can pass an arena to scope all request‑related allocations and free them in one shot.
+- **No Framework, Only Building Blocks.** `std.http` is not a framework. It’s a parser and a thin transport. Middleware, routing, and static file serving are not included—they’re built by composition. This avoids the inversion of control that plagues “magic” HTTP frameworks, where a single `app.run()` call hides an entire pipeline.
+
+The design empowers you to create exactly the networking stack you need, with no more abstraction than necessary.
+
+---
+
+### 4. Competing Approaches
+
+| Language | HTTP Approach | Zig’s Stance |
+|----------|---------------|--------------|
+| **Go**   | `net/http` provides a highly concurrent server using goroutines and a default multiplexer. It manages keep‑alive, timeouts, and request multiplexing automatically. The runtime is hidden. | Zig’s server is blocking per connection; you must manage concurrency explicitly. There is no global goroutine scheduler, so you are free to choose OS threads, a thread pool, or an event loop—but you must implement it. The upside: no runtime overhead you didn’t ask for, no goroutine stack growth surprises. |
+| **Rust** | The ecosystem standard is `hyper` + `tokio`. Async I/O is fundamental; the `Future` combinators drive request handling. Error handling uses `Result` with `?` operator, similar to Zig’s `try`. | Zig avoids async/await syntax entirely. You don’t get a built‑in runtime, but you also don’t get the complexity of `Pin`, `Send` bounds, or `async`‑only libraries. Zig’s synchronous model is simpler to debug and profile, and it integrates naturally with C libraries that expect blocking I/O. |
+| **C++**  | `Boost.Beast` and `cpprestsdk` offer HTTP on top of `boost::asio` (proactor) or raw threads. Templates dominate. | Zig replaces template metaprogramming with comptime. The HTTP parser is readable normal code, not a maze of SFINAE or type traits. The build system integration is seamless: adding TLS support is a matter of linking OpenSSL or using Zig’s `std.crypto.tls`, no external build tools needed. |
+| **C**    | Hand‑written HTTP parsers (e.g., `libhttp`, `llhttp`), often callback‑based. Memory management is manual, error handling is error‑return. | Zig’s `std.http` offers the same level of control but with a safer, more expressive API. The parser is a single‑pass state machine, not a separate generated parser; error handling uses error unions, eliminating the need to check every return code. The result is code that is just as fast but far less error‑prone. |
+
+---
+
+### 5. Common Mistakes
+
+1. **Forgetting to Read the Entire Response Body.** If you do not fully drain the response body (e.g., you call `wait()` but then ignore the reader), the underlying keep‑alive connection becomes corrupted for the next request. Always consume or `discard()` the body before reusing the request.
+
+2. **Not Setting `transfer_encoding` Properly.** For POST/PUT, you must set either `content_length` or `chunked`. Zig will not infer it. Forgetting this leads to a malformed request or a hang.
+
+3. **Mismanaging Connection Lifetimes.** When using `client.deinit()`, all associated connections are closed. If you spawn a `client` per request, you lose keep‑alive benefits and create excessive TCP handshakes. Create one long‑lived client and reuse it.
+
+4. **Blocking the Server’s Acceptor Thread.** `server.listen()` runs on the calling thread; if that thread is also used for something else (e.g., a GUI event loop), you must spawn a dedicated thread for the server. The server will not return from `listen` until you explicitly stop it.
+
+5. **Allocation Errors in Handlers.** The `handle` function is passed an allocator that may be a thread‑local arena or a general purpose allocator. Do not assume it outlives the function. If you need to pass data elsewhere, copy it with a longer‑lived allocator.
+
+6. **Ignoring `errdefer` in Request/Response Cleanup.** If an error occurs after `request.start()` but before you call `defer request.deinit()`, you must use `errdefer request.deinit()` to avoid leaking a connection. The same applies to `response`.
+
+---
+
+### 6. Performance Considerations
+
+**Throughput with Thread‑per‑Connection:**
+The default `std.http.Server` spawns a new thread for each connection. On a system with many concurrent connections, thread creation/destruction and context switching become the bottleneck. For high‑performance scenarios, replace the thread‑spawning with a fixed‑size thread pool that reuses threads. You can implement this using `std.Thread.SpawnQueue` or `std.atomic.Queue` to pass accepted sockets to worker threads.
+
+**Memory Allocation:**
+Every request may allocate for header parsing and optional body buffering. Using a `FixedBufferAllocator` (backed by a stack buffer) for the request scope eliminates heap fragmentation and reduces latency. The standard library’s `std.http.Server.Request` accepts an allocator; you can pass a scoped arena that is reset between requests.
+
+**Connection Pooling:**
+The client’s connection pool is a simple list; there is no idle timeout by default. For long‑lived clients, implement periodic cleanup to close stale connections, or use a custom pool with TTLs.
+
+**Zero‑Copy Parsing:**
+The HTTP parser operates on slices of the read buffer; it does not copy header values unless you request them. When you read `request.head.target`, you get a slice into the request buffer that is valid until the next read. This minimizes allocation and memory traffic.
+
+**Benchmarking:**
+A raw TCP echo server implemented with `std.net` can handle millions of messages per second on a single thread. Adding the HTTP layer (header parsing, status code generation) reduces throughput, but the penalty is small—comparable to hand‑written C HTTP parsers and significantly faster than many interpreted‑language servers. Profile with `perf` and `zig build-exe -Doptimize=ReleaseFast`.
+
+---
+
+### 7. Best Practices
+
+1. **Wrap All HTTP Resources with `defer` and `errdefer`.** Always clean up:
+   ```zig
+   var request = try client.request(...);
+   errdefer request.deinit();
+   // ... operations ...
+   defer request.deinit();
+   ```
+
+2. **Pass Allocators Explicitly to Every Handler.** Even if you use a global allocator for convenience, make it explicit. This allows testing with `std.testing.allocator` and keeps the code honest.
+
+3. **Separate Business Logic from HTTP.** The `handle` function should parse the request, call a pure function that returns a result, and then serialise that result into the response. This makes the logic testable without a network.
+
+4. **Use a Router (Comptime‑Generated) for Non‑Trivial Servers.** Write a comptime function that builds a dispatch table mapping paths to handler functions, using `std.meta.stringToEnum` or a trie. This avoids runtime string comparisons and leverages comptime for performance.
+
+5. **Implement Middleware via Composition.** A middleware is a function that takes a handler and returns a new handler:
+   ```zig
+   fn loggingMiddleware(inner: Handler) Handler {
+       return Handler { .allocator = inner.allocator, .handleFn = struct {
+           fn handle(self: *Handler, req: *Request, resp: *Response) void {
+               std.log.info("{} {}", .{ @intFromEnum(req.head.method), req.head.target });
+               inner.handleFn(self, req, resp);
+           }
+       }.handle };
+   }
+   ```
+   This pattern keeps the request lifecycle visible; there is no hidden middleware stack.
+
+6. **For the Client, Reuse a Single `std.http.Client`.** Instantiate it once and pass it to the parts of your program that make HTTP calls. Use a shared allocator with a longer lifetime than any individual request.
+
+---
+
+### 8. Examples
+
+#### Example 1: HTTP Client with JSON Response Parsing
+
+This example fetches a JSON endpoint, parses it with `std.json`, and prints a field. It handles errors and cleans up.
+
+```zig
+const std = @import("std");
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
+    const uri = try std.Uri.parse("https://api.github.com/repos/ziglang/zig");
+    var request = try client.request(.GET, uri, .{ .allocator = allocator }, .{});
+    defer request.deinit();
+
+    try request.start();
+    try request.wait();
+
+    var response = try request.reader();
+    const body = try response.readAllAlloc(allocator, 10 * 1024 * 1024);
+    defer allocator.free(body);
+
+    if (response.status != .ok) {
+        std.log.err("Request failed: status={d}", .{response.status});
+        return error.HttpError;
+    }
+
+    // Simple JSON field extraction (for a robust solution, use std.json.Value)
+    var stream = std.json.TokenStream.init(body);
+    const root = try std.json.parse(std.json.Value, &stream, .{ .allocator = allocator });
+    defer root.deinit();
+
+    const full_name = root.object.get("full_name") orelse return error.MissingField;
+    std.debug.print("Zig repository: {s}\n", .{full_name.string});
+}
+```
+
+#### Example 2: HTTP Server with Static File Serving and Middleware
+
+A server that serves a single file and logs requests.
+
+```zig
+const std = @import("std");
+
+const Handler = struct {
+    allocator: std.mem.Allocator,
+    file_content: []const u8,
+
+    pub fn handle(self: *Handler, request: *std.http.Server.Request, response: *std.http.Server.Response) void {
+        defer request.deinit();
+        errdefer response.deinit();
+
+        const path = request.head.target;
+        if (std.mem.eql(u8, path, "/")) {
+            response.status = .ok;
+            response.headers.content_type = .{ .override = "text/html" };
+            response.transfer_encoding = .{ .content_length = self.file_content.len };
+            response.do() catch return;
+            _ = response.writer().writeAll(self.file_content) catch return;
+            response.end() catch return;
+        } else {
+            response.status = .not_found;
+            response.headers.content_type = .{ .override = "text/plain" };
+            const body = "404 - Not Found\n";
+            response.transfer_encoding = .{ .content_length = body.len };
+            response.do() catch return;
+            _ = response.writer().writeAll(body) catch return;
+            response.end() catch return;
+        }
+    }
+};
+
+fn loggingMiddleware(inner: *const Handler) Handler {
+    return Handler{
+        .allocator = inner.allocator,
+        .file_content = inner.file_content, // pass through
+        // By embedding a custom handle function, we demonstrate middleware composition.
+    };
+}
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const file_content = try std.fs.cwd().readFileAlloc(allocator, "index.html", 1024 * 1024);
+    defer allocator.free(file_content);
+
+    var base_handler = Handler{ .allocator = allocator, .file_content = file_content };
+    // For brevity, the middleware is not active; you'd wrap base_handler with loggingMiddleware.
+    // See the Best Practices section for the composition.
+
+    var server = std.http.Server.init(allocator, .{ .reuse_address = true });
+    defer server.deinit();
+
+    std.log.info("Serving on http://127.0.0.1:8080", .{});
+    try server.listen(try std.net.Address.parseIp4("127.0.0.1", 8080), &base_handler);
+}
+```
+
+#### Example 3: Raw TCP Echo Server with `std.net`
+
+(Already shown in Basic Usage—this is the unadorned networking foundation.)
+
+---
+
+### 9. Summary & Exercises
+
+Zig’s HTTP client and server embody the language’s design: they give you direct control over sockets, threads, and memory while providing a well‑tuned parser. There’s no hidden event loop, no automatic keep‑alive pool management, and no middleware magic. Instead, you assemble the exact networking stack your application requires, using the same `defer`, `errdefer`, and allocator discipline that characterises idiomatic Zig.
+
+**Key takeaways:**
+- The `std.http.Client` is synchronous, connection‑pooled, and allocator‑explicit.
+- The `std.http.Server` is a thread‑per‑connection model, easily replaced with a custom threading strategy.
+- Always set `transfer_encoding`, drain the response body, and use `defer`/`errdefer` for resource cleanup.
+- Middleware is just a function that wraps a handler; routing can be comptime‑generated.
+- Performance is limited by the threading model, not the HTTP parser; you can reach C‑competitive throughput with a careful design.
+
+**Exercises:**
+
+1. **Build a Thread‑Pooled HTTP Server.** Replace `std.http.Server`’s default thread‑per‑connection with a fixed‑size thread pool. Use `std.Thread.SpawnQueue` or an `std.atomic.Queue` to distribute accepted `std.net.Server.Connection` objects to worker threads. Measure the throughput improvement under high concurrency.
+
+2. **Implement a Comptime Router.** Write a comptime function that takes an array of `struct { path: []const u8, handler: fn(...) void }` and produces a dispatch function that uses a compile‑time generated perfect hash or trie to match paths without runtime string comparisons. Integrate it into a `Handler` that calls the appropriate function.
+
+3. **Create a Keep‑Alive‑Aware HTTP Client with Timeouts.** Extend `std.http.Client` to prune idle connections after a configurable duration and to enforce a timeout on `request.wait()`. Use `std.os.poll` or `std.Thread` to implement the timeout without busy‑waiting, and ensure proper cleanup when a timeout occurs.

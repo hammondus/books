@@ -1,0 +1,321 @@
+## Chapter 23. Comptime for Performance
+
+Compile-time execution in Zig isn't just a metaprogramming convenience—it's a first‑class performance tool. When we move work from runtime to compile time we eliminate initialization overhead, avoid runtime branching on known invariants, and generate precisely the code the target machine needs, without resorting to a separate macro language or external code generators. This chapter explores how to harness `comptime` to build lookup tables, unroll loops, validate configuration, and replace runtime reflection with static dispatch. We'll also confront the inevitable trade‑offs: compilation speed, binary size, and the danger of over‑specialization.
+
+---
+
+### 1. Basic Usage
+
+The simplest performance win is precomputing data that would otherwise be computed at startup or on every call. Zig lets you write normal Zig code inside a `comptime` block and assign the result to a `const` that lives in the binary's read‑only section.
+
+**A comptime lookup table.** Suppose you need a fast sine approximation for a fixed number of table entries. Instead of calculating the values at runtime, compute them once at compile time:
+
+```zig
+const std = @import("std");
+
+/// Number of entries in the sine table. Must be a power of two for the fast
+/// index masking we'll use later.
+const TABLE_SIZE = 256;
+
+/// Compile-time–generated quarter-wave sine table (values scaled to i16).
+const sine_table: [TABLE_SIZE]i16 = blk: {
+    var table: [TABLE_SIZE]i16 = undefined;
+    for (0..TABLE_SIZE) |i| {
+        const angle = @as(f64, @floatFromInt(i)) * (std.math.pi / 2.0) /
+            @as(f64, @floatFromInt(TABLE_SIZE - 1));
+        // Scale sine to full i16 range and round to nearest integer.
+        table[i] = @intFromFloat(@round(@sin(angle) * 32767.0));
+    }
+    break :blk table;
+};
+
+/// Fast sine lookup using only the first quadrant, exploiting symmetry.
+pub fn fastSin(theta: u16) i16 {
+    const quadrant = (theta >> 14) & 0x3; // top 2 bits
+    const index = (theta >> 6) & 0xFF;    // next 8 bits → 0..255
+    const val = sine_table[index];
+    return switch (quadrant) {
+        0 => val,
+        1 => sine_table[255 - index],
+        2 => -val,
+        3 => -sine_table[255 - index],
+    };
+}
+```
+
+The block labeled `blk` executes during semantic analysis. The resulting array `sine_table` is embedded in the binary as a static constant—no runtime initialisation, no heap allocation.
+
+**Compile-time loop unrolling.** When the trip count of a loop is known at compile time, Zig can fully unroll it, removing the branch and induction variable overhead:
+
+```zig
+/// Add two small fixed-size vectors of length N.
+pub fn addVectors(comptime N: usize, a: [N]f32, b: [N]f32) [N]f32 {
+    var result: [N]f32 = undefined;
+    for (0..N) |i| {
+        result[i] = a[i] + b[i];
+    }
+    return result;
+}
+```
+
+If you call `addVectors(3, a, b)`, the compiler instantiates a version where the loop is replaced by three sequential addition instructions, often vectorised further by the backend. The `comptime N` parameter ensures the trip count is a compile‑time constant, enabling this optimisation.
+
+**Compile-time validation.** You can reject invalid configurations without wasting a single CPU cycle at runtime:
+
+```zig
+pub fn initDevice(comptime config: DeviceConfig) Device {
+    if (config.baud_rate == 0) {
+        @compileError("Baud rate must be non-zero");
+    }
+    if (config.buffer_size & (config.buffer_size - 1) != 0) {
+        @compileError("Buffer size must be a power of two");
+    }
+    return Device{ .baud = config.baud_rate, .buf = [_]u8{0} ** config.buffer_size };
+}
+```
+
+A bad call like `initDevice(.{ .baud_rate = 0, .buffer_size = 100 })` fails at compile time with a clear message, not with a subtle runtime misbehaviour.
+
+---
+
+### 2. Under the Hood
+
+When the Zig compiler encounters a `comptime` expression, it doesn't emit code that runs later—it immediately evaluates the expression using an internal interpreter that executes ZIR (Zig Intermediate Representation). This interpreter has access to the full language, including function calls, allocations, and even I/O (though I/O at compile time is strongly discouraged). The result of evaluation is a compile-time–known value that gets embedded directly into the final binary as a constant or immediate operand.
+
+**Constant propagation.** After comptime evaluation, the produced constants participate in the usual optimisation pipeline. LLVM (or the self-hosted x86_64 backend) sees them as `constant` values in its IR, enabling constant folding, dead code elimination, and instruction selection that exploits known immediates. For example, a comptime-computed array used in a switch or lookup becomes a base address plus an offset; if the index is also comptime-known, the whole memory load can be replaced by the exact value.
+
+**Compile-time memory model.** Zig's comptime interpreter manages its own heap. Allocations made via an `Allocator` (even the `std.heap.page_allocator`) during comptime are tracked and freed when the compilation unit finishes—you don't pay for them at runtime. This allows building complex data structures (hash maps, trees) entirely at compile time and then embedding their final flattened form. However, note that the allocator used must be available in the comptime environment; `std.heap.page_allocator` works, but a custom allocator that relies on runtime operating system calls will fail to compile.
+
+**Function specialisation.** When a function takes a `comptime` parameter, Zig effectively generates a separate monomorphised copy for each distinct compile‑time value. The body of the function is re‑evaluated during semantic analysis with that parameter bound, allowing the compiler to perform aggressive optimisations tailored to that value. The resulting machine code sees the `comptime` parameter as a literal constant. This is similar to C++ template instantiation, but with the key difference that the body is interpreted as normal Zig code with full comptime capabilities, not an AST-level substitution.
+
+**Limits and quotas.** The interpreter imposes a branch evaluation quota (default 1000 backwards branches per comptime invocation) to prevent infinite loops from hanging the compiler. You can increase it with `@setEvalBranchQuota` if your comptime logic genuinely needs more iterations—common when generating large lookup tables or unrolling loops with high trip counts.
+
+---
+
+### 3. Why This Design?
+
+Zig's approach to compile-time performance optimisation flows directly from the language's core philosophy: **no hidden control flow, explicit is better than implicit, and comptime over runtime magic.**
+
+**No runtime cost for what can be done at compile time.** If a value is known when the program is built, it shouldn't consume CPU cycles every time the program starts. Traditional systems languages rely on static initialisers (C) or `constexpr` (C++) that are limited to simple expressions. Zig removes those restrictions: you write ordinary Zig code and mark it `comptime`. The compiler runs it, stores the result, and your runtime code never even knows it was computed. There's no hidden constructor, no lazy static initialisation, no `.init()` function called before `main`.
+
+**Safety through early failure.** By moving validation to compile time, you eliminate entire classes of runtime errors. A misconfigured buffer size or invalid pin assignment becomes a build failure, not a device that silently corrupts data. This shifts the debugging cycle left, catching problems before the binary is even linked—a direct embodiment of "fail fast, fail loudly."
+
+**Elimination of runtime reflection.** In many languages, handling a set of types uniformly (serialisation, message dispatch) requires runtime type information or dynamic dispatch. Zig's comptime allows you to iterate over `@typeInfo` at compile time and generate specialised code paths, completely avoiding vtables, boxed traits, or `switch` statements with unknown cases. The result is predictable, inlineable code with no indirection overhead.
+
+**The macro alternative considered harmful.** C's preprocessor is a text substitution system with no understanding of the language. It can generate lookup tables or unroll loops, but only through fragile, untyped token pasting. C++ templates are Turing-complete but notoriously opaque, with error messages that bury the actual problem under layers of instantiation backtraces. Zig's comptime is the same language, debugged with the same tools, and produces the same clear error messages. There is no separate metalanguage to learn.
+
+**Comptime enables the "don't pay for what you don't use" principle at a higher level.** If you never need a given feature—say, a serialiser for a particular type—comptime code that would generate it simply never runs. There's no global annotation processor or reflection registry scanning every type.
+
+---
+
+### 4. Competing Approaches
+
+**C.** The classic technique is hand‑written lookup tables (often precomputed by a separate script and pasted into a header) or C macros that abuse the preprocessor to unroll loops. Both are error-prone and bypass type checking. C23 added `constexpr`, but its capabilities are a tiny subset of Zig comptime. For anything beyond arithmetic, C programmers fall back to runtime initialisation or code generation outside the compiler.
+
+**C++.** `constexpr` has grown considerably and can now allocate memory, throw exceptions, and use virtual functions—but only in recent standards, and with many restrictions. Template metaprogramming can generate specialised code, but the syntax is arcane and debugging is a nightmare. A template instantiation is still a form of code generation; Zig’s comptime is execution of the language itself. C++20’s `consteval` brings immediate evaluation, but the compile‑time environment remains a limited subset of the full language.
+
+**Rust.** Const generics (`const N: usize`) allow compile‑time parameters for arrays and integers, and `const fn` can compute values at compile time. However, `const fn` is severely restricted: no allocations, no floating‑point (until recent editions), no loops with mutable variables in many contexts. Rust relies heavily on procedural macros for code generation, which are written in Rust but operate at the token stream level—powerful, but a separate domain. Zig’s comptime subsumes both const generics and macros without introducing a new language.
+
+**Go.** Go has no compile‑time code execution. Lookup tables are initialised in `init()` functions that run at program startup, consuming time and memory. Configuration validation happens at runtime, often through tests. The language prizes simplicity over such control.
+
+**Java / Python.** Runtime reflection is the norm, with all the associated overhead of JIT warm‑up or interpreter dynamic lookups. Annotation processors (Java) or decorators (Python) can generate code, but they are build‑time plugins external to the language, not an integrated comptime system.
+
+Zig’s unified comptime model offers the performance of hand‑crafted assembly constants with the expressiveness of the host language—an unprecedented combination in a systems language.
+
+---
+
+### 5. Common Mistakes
+
+Even experienced engineers can trip over comptime’s semantics when performance is the goal.
+
+- **Trying to mutate comptime data at runtime.** A `const` computed at compile time lives in read‑only memory. If you accidentally take a mutable pointer to it, you’ll get a compile error, but the root cause—treating a comptime value as a runtime buffer—is a frequent head‑scratcher for newcomers. Always use `*const` or value semantics for such data.
+
+- **Exploding binary size through over‑specialisation.** When you mark a parameter `comptime`, the compiler creates a separate copy of the function for each distinct argument. A function with `comptime strategy: Strategy` called with 50 different strategies will generate 50 copies, bloating the binary. Profile before you commit to making every parameter comptime; sometimes a runtime `switch` on a small enum is cheaper in total cache pressure.
+
+- **Comptime memory leaks and exhaustion.** While comptime memory is reclaimed after compilation, a single `comptime` evaluation that allocates excessively can slow down the compiler or exhaust its heap, causing a compilation failure. Avoid large, persistent allocations inside comptime loops; prefer constructing data incrementally and releasing temporary allocators when done.
+
+- **Confusing comptime performance with runtime benchmarks.** A `test` block that exercises a `comptime` function runs at compile time. If you try to measure its speed with `std.time.Timer`, you’re timing the compiler’s interpreter, not the generated runtime code. Always benchmark the final binary.
+
+- **Forgetting to mark a dependency `comptime`.** In a call like `generateTable(512)`, if the parameter is not declared `comptime`, the function will run at runtime even if `512` is a literal. The compiler can sometimes constant‑fold the call, but it's not guaranteed. Explicitly annotate parameters as `comptime` to guarantee compile‑time evaluation and unlock subsequent optimisations.
+
+- **Expecting comptime to cross compilation‑unit boundaries.** Comptime evaluation happens per compilation unit (per file). A comptime‑computed value in one module cannot be used to influence the code generation of another module at link time unless it is exported as a constant and the consumer also marks the corresponding usage as `comptime`.
+
+---
+
+### 6. Performance Considerations
+
+The shift from runtime to compile time is not a free lunch—it redistributes cost between binary size, compilation time, and runtime speed.
+
+**Binary size vs. speed.** A fully unrolled loop for a 256‑element operation may produce several kilobytes of straight‑line code, which can blow out the instruction cache. A compact loop with a single branch predictor might be faster on a modern CPU. Similarly, a 64 KiB lookup table may evict useful data from the data cache. Always measure. Use `@setRuntimeSafety(false)` only when you are sure the performance gain outweighs safety, and prefer to keep bounds checks in debug builds.
+
+**Compilation time impact.** Heavy comptime work increases the time it takes to build your project. If you generate a 10,000‑entry table with trigonometric functions, the compiler must evaluate each `@sin` call in its software floating‑point interpreter, which can be noticeably slow. Mitigate this by caching such tables in a separate module that changes infrequently, or by using incremental compilation (Zig’s build system supports watching files). In extreme cases, pre‑compute the data with a helper program and `@embedFile` the binary blob—this sidesteps comptime entirely while still embedding static data.
+
+**Cache‑friendly comptime dispatch.** When using `@typeInfo` to generate per‑type code, you can arrange the output so that related code paths are adjacent in the binary, improving instruction cache locality. For example, sort generated functions by a hotness heuristic at compile time. This is an advanced technique, but Zig gives you the control to do it.
+
+**SIMD synergy.** Comptime can generate vectorised code by unrolling loops into sequences of `@Vector` operations. The backend then maps those to SIMD instructions. The combination of comptime unrolling and explicit SIMD often outperforms compiler auto‑vectorisation, especially for odd data widths.
+
+**Example: Fast CRC table generation.** The standard library’s CRC implementations generate the lookup table at comptime, avoiding runtime initialisation and allowing the table to be placed in read‑only memory shared across processes (if loaded as a shared library). The cost is a one‑time compile‑time evaluation that is negligible compared to the total build time.
+
+**When not to use comptime.** If the data depends on runtime input, or if the function must work with many different values of a comptime parameter that would cause unacceptable binary growth, fall back to runtime evaluation. A good rule of thumb: if the parameter set is small and known at application design time (e.g., the width of a CRC polynomial, the number of lanes in a SIMD width, the structure of a network packet header), comptime is ideal. If the set is unbounded (e.g., user‑provided buffer sizes), runtime loops are more appropriate.
+
+---
+
+### 7. Best Practices
+
+- **Keep comptime functions pure.** Avoid side effects like writing files or logging to stdout during comptime. Not only is it unreliable across platforms, but it makes the build non‑deterministic and hard to debug. Use `@compileLog` for compile‑time debugging output.
+
+- **Separate comptime and runtime logic clearly.** Place comptime‑only code in a dedicated namespace or file (e.g., `comptime_tables.zig`). This prevents accidental runtime use and signals intent to maintainers.
+
+- **Use `comptime` parameters liberally for configuration.** If a function’s behaviour depends on a constant known at compile time, make that constant a `comptime` parameter and let the compiler specialise. This includes things like allocator strategies, algorithm variants, or buffer sizes. But remember to measure binary size impact.
+
+- **Provide comptime‑generated arrays via `pub const`.** Export the static data so other modules can reuse it without recomputation. The constant will be deduplicated by the linker if marked with the appropriate linkage (Zig does this automatically for `const` declarations).
+
+- **Test comptime code with `test` blocks that explicitly request comptime evaluation:**
+
+  ```zig
+  test "sine table is symmetric" {
+      const table = comptime generateSineTable(256);
+      try std.testing.expect(table[0] == 0);
+      try std.testing.expect(table[128] > 0);
+  }
+  ```
+
+  This ensures your comptime functions are exercised during `zig test` and fail at compile time if they contain bugs.
+
+- **Use `@compileError` for configuration validation.** Catch configuration errors as early as possible. The error message should explain what was wrong and how to fix it. This turns a potential runtime crash into a build failure that the developer sees immediately.
+
+- **Document why something is `comptime`.** When the reason is performance, add a comment explaining the trade‑off (e.g., “comptime to unroll the loop over the 6 faces of a cube” or “generates a 256-entry table to avoid runtime `@sin`”).
+
+---
+
+### 8. Examples
+
+The following examples are complete, compilable, and designed to illustrate real‑world usage.
+
+#### Example 1: Compile‑Time CRC‑8 Table
+
+```zig
+const std = @import("std");
+
+/// Polynomial for CRC‑8‑ATM (x^8 + x^2 + x + 1)
+const CRC8_POLY: u8 = 0x07;
+
+/// Generate the 256‑byte lookup table at compile time.
+const crc8_table: [256]u8 = blk: {
+    var table: [256]u8 = undefined;
+    for (0..256) |i| {
+        var crc: u8 = @intCast(i);
+        for (0..8) |_| {
+            if (crc & 0x80 != 0) {
+                crc = (crc << 1) ^ CRC8_POLY;
+            } else {
+                crc <<= 1;
+            }
+        }
+        table[i] = crc;
+    }
+    break :blk table;
+};
+
+/// Compute CRC‑8 of a byte slice using the comptime table.
+pub fn crc8(data: []const u8) u8 {
+    var crc: u8 = 0;
+    for (data) |byte| {
+        crc = crc8_table[crc ^ byte];
+    }
+    return crc;
+}
+
+test "CRC8 known answer" {
+    const input = [_]u8{ 0x31, 0x32, 0x33, 0x34 }; // "1234"
+    const result = crc8(&input);
+    try std.testing.expectEqual(@as(u8, 0xA0), result);
+}
+```
+
+The table lives in the `.rodata` section. The runtime `crc8` function is a trivial loop with a single table lookup per byte—no initialisation overhead.
+
+#### Example 2: Compile‑Time Unrolled Dot Product for Fixed‑Size Vectors
+
+```zig
+/// Compute dot product of two vectors of length N, unrolled at compile time.
+pub fn dot(comptime N: usize, a: @Vector(N, f32), b: @Vector(N, f32)) f32 {
+    // The @reduce builtin will be lowered to efficient SIMD shuffle + add.
+    const mul = a * b;
+    return @reduce(.Add, mul);
+}
+```
+
+For `N` known at compile time, the compiler generates an optimal sequence; for small `N` it may be fully unrolled scalar operations. The `@Vector` type naturally works with comptime lengths.
+
+#### Example 3: Compile‑Time Struct Validator & Serialiser Generator
+
+This example demonstrates how to use `@typeInfo` to generate a serialiser that avoids runtime reflection and allocates no memory.
+
+```zig
+const std = @import("std");
+
+/// Validate at compile time that every field of a struct is a scalar integer.
+fn assertAllInts(comptime T: type) void {
+    const info = @typeInfo(T);
+    if (info != .Struct) @compileError("Expected a struct, got " ++ @typeName(T));
+    for (info.Struct.fields) |field| {
+        const field_info = @typeInfo(field.type);
+        if (field_info != .Int) {
+            @compileError("Field " ++ field.name ++ " must be an integer, got " ++ @typeName(field.type));
+        }
+    }
+}
+
+/// Generate a serialise function that writes the struct's fields as little‑endian bytes.
+pub fn Serialiser(comptime T: type) type {
+    assertAllInts(T);
+    return struct {
+        /// Write the fields of a value into the given writer.
+        pub fn write(value: T, writer: anytype) !void {
+            inline for (std.meta.fields(T)) |field| {
+                const bytes = std.mem.asBytes(&@field(value, field.name));
+                try writer.writeAll(bytes);
+            }
+        }
+    };
+}
+```
+
+Usage:
+
+```zig
+const MyConfig = struct {
+    baud: u32,
+    flags: u16,
+};
+
+const serialiser = Serialiser(MyConfig);
+// In some runtime code:
+// try serialiser.write(config, &writer);
+```
+
+The `inline for` over `std.meta.fields` unrolls at compile time into a sequence of `writer.writeAll` calls, one per field. No loop, no reflection, no dynamic dispatch.
+
+---
+
+### 9. Summary & Exercises
+
+Comptime in Zig is a performance weapon: it lets you shift computation from runtime to compile time, eliminate runtime overhead, and enforce invariants before a single instruction executes. By generating lookup tables, unrolling loops, and specialising code based on types, you can achieve performance that would otherwise require external code generators or handwritten assembly—while staying entirely within a safe, readable language.
+
+However, comptime is not a panacea. It increases compilation time and, if overused, binary size. The art lies in choosing the right parameters to make `comptime`, measuring the effect on your specific target, and resisting the temptation to compile‑time‑evaluate everything.
+
+**Key takeaways:**
+- Use `comptime` blocks to embed precomputed constants in the binary.
+- Mark function parameters `comptime` to enable specialisation and loop unrolling.
+- Validate configuration at compile time with `@compileError`.
+- Replace runtime reflection with comptime loops over `@typeInfo`.
+- Profile both compilation time and runtime performance to find the right balance.
+
+**Exercises:**
+
+1. **Sine table with configurable precision.** Write a comptime function `genSineTable(comptime entries: usize)` that returns an array of `i16` representing one full wave (0–2π). Use it to build a fast sine oscillator for audio synthesis. Compare the runtime speed of the table lookup against calling `@sin` directly.
+
+2. **Compile‑time bytecode generator.** Design a simple stack‑based virtual machine with a handful of instructions (`PUSH`, `ADD`, `MUL`, etc.). Use comptime to generate a function `execute` that takes a comptime slice of instructions and emits straight‑line code (no interpreter loop) for that specific sequence. Measure the performance against an interpreter loop with a `switch` on each opcode.
+
+3. **Configuration driven peripherals.** Imagine an embedded system where a `PinConfig` struct defines the GPIO pins for SPI communication. Write a `initSpi` function that takes a comptime `PinConfig` and, at compile time, verifies that the chosen pins are valid for the target microcontroller (simulate this with an enum of valid pins). Use comptime to generate the correct register‑setting sequences tailored to those pins, avoiding any runtime pin mapping logic.

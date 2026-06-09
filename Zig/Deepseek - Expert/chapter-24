@@ -1,0 +1,322 @@
+## Chapter 24: Threads and the Memory Model
+
+Zig gives you exactly one concurrency primitive at the language level: the operating system's native thread. There is no built-in green thread runtime, no async/await syntax, no hidden work-stealing scheduler. If you want concurrency, you spawn a thread. If you want parallelism, you spawn multiple threads. If you want to communicate between them, you use shared memory, atomics, and the synchronization primitives you build—or those provided by the standard library (the subject of the next chapter). This chapter is about the fundamentals: creating threads, understanding the memory model that governs what a thread can see, and using `volatile` and `std.atomic` to enforce correctness without relying on heavier locks.
+
+---
+
+### 1. Basic Usage
+
+Spawning a thread in Zig requires a function pointer and a single argument. The standard library provides `std.Thread`, which wraps the OS thread API uniformly across Linux, macOS, Windows, and other platforms.
+
+```zig
+const std = @import("std");
+
+fn worker(arg: *u32) void {
+    arg.* += 1;
+}
+
+pub fn main() !void {
+    var counter: u32 = 0;
+    var thread = try std.Thread.spawn(.{}, worker, .{&counter});
+    thread.join();
+    std.debug.print("counter = {}\n", .{counter});
+}
+```
+
+`std.Thread.spawn` takes three arguments:
+- A configuration struct (often `{}` for defaults).
+- A function pointer of type `fn(@TypeOf(arg)) void` (or `anyerror!void` for an error-returning thread, but the return value is discarded; errors inside the thread must be handled internally or communicated via shared state).
+- The argument tuple, which is a single pointer passed to the function.
+
+The spawned function receives the argument as a mutable pointer, allowing the main thread and the worker to communicate through shared memory. The call to `thread.join()` blocks until the worker finishes, establishing a happens-before relationship: all effects of the worker are visible to the main thread after `join` returns.
+
+If the worker can fail, use an error union return type. The thread object provides `join` that propagates an error if the worker panicked (only in debug/safe modes) or if you design your own error communication.
+
+```zig
+fn failingWorker(arg: *u32) !void {
+    if (arg.* == 0) return error.BadInput;
+    arg.* += 1;
+}
+// Spawn: use `std.Thread.spawn` with the error-returning type.
+// The spawn function itself returns a `!std.Thread`.
+// join() will detect a panic but not propagate the error automatically;
+// you would need to communicate errors explicitly, e.g., via an atomic error flag.
+```
+
+For correct error communication, you'd typically embed an error union or an atomic flag in the shared context. The key takeaway: `std.Thread.spawn` expects a function that returns `void` or `!void`, but error propagation across threads is your responsibility.
+
+Now consider sharing an integer between two threads without any synchronization. Even a simple increment is a data race in the absence of atomics. The compiler and CPU may reorder reads and writes, leading to lost updates or torn values. Zig forces you to be explicit: to share data safely, use `std.atomic.Atomic(T)`.
+
+```zig
+const Atomic = std.atomic.Atomic;
+
+fn atomicWorker(counter: *Atomic(u32)) void {
+    _ = counter.fetchAdd(1, .monotonic);
+}
+
+pub fn main() !void {
+    var counter = Atomic(u32).init(0);
+    var threads: [4]std.Thread = undefined;
+    for (0..4) |i| {
+        threads[i] = try std.Thread.spawn(.{}, atomicWorker, .{&counter});
+    }
+    for (threads) |t| t.join();
+    std.debug.print("counter = {}\n", .{counter.load(.monotonic)});
+}
+```
+
+Here we use `.monotonic` memory ordering, which guarantees atomicity and a monotonically increasing view but provides no ordering with respect to other memory operations. For many counters, that's sufficient. But if you need the counter update to be ordered with other shared data (e.g., a flag that signals data is ready), you'll need acquire/release semantics—more on that shortly.
+
+For simple signaling, `std.atomic` provides `store` and `load` with explicit orderings.
+
+---
+
+### 2. Under the Hood
+
+When you call `std.Thread.spawn`, Zig translates it into the appropriate OS thread creation call:
+- On Linux (targeting glibc or musl), it calls `pthread_create`.
+- On Windows, it calls `CreateThread` via the kernel32 interface.
+- On macOS/iOS, it uses `pthread_create` through libSystem.
+
+The resulting thread is a genuine OS thread, scheduled by the kernel alongside all other processes and threads. Zig does not add a user-level scheduler or green-thread runtime. The thread's stack is allocated by the OS, and the thread ID maps to a native thread handle. This gives you the full power and full responsibility of system threads: true parallelism on multicore CPUs, preemptive multitasking, and the overhead of context switches that you must manage.
+
+Memory model: Zig inherits the LLVM memory model, which is a close relative of the C11/C++11 memory model. There is no language-defined "happens-before" graph in the Zig specification itself; instead, the semantics of atomics and volatile are defined by the target architecture's memory ordering guarantees and LLVM's implementation. Zig's `std.atomic` operations generate LLVM atomic instructions (`load atomic`, `store atomic`, `cmpxchg`, `atomicrmw`) with the specified ordering, which in turn lower to the appropriate CPU fence or lock-prefixed instructions.
+
+- **Relaxed / Monotonic:** `memory_order_relaxed` in LLVM. No ordering guarantees except atomicity of the operation itself. On x86, this usually maps to a plain `mov` or `lock xadd` (because x86 provides strong ordering by default, but the compiler may still reorder around the operation). On ARM, it maps to `ldr`/`str` without barriers, allowing significant reordering.
+- **Acquire / Release:** Acquire loads and release stores create ordering constraints. An acquire load prevents subsequent loads and stores from being reordered before it; a release store prevents prior loads and stores from being reordered after it. Together they establish a synchronizes-with relationship: a release store that is observed by an acquire load makes all memory operations before the release visible to the thread after the acquire. This is the backbone of lock-free programming.
+- **Sequentially Consistent (SeqCst):** Total ordering across all atomic operations. More expensive because it typically requires a full memory barrier (`mfence` on x86, `dmb sy` on ARM).
+
+Zig's `std.atomic.Atomic` wraps these primitives with a generic interface. Underneath, the `load`, `store`, `fetchAdd`, `cmpxchgWeak/Strong`, etc. methods lower directly to LLVM atomic IR instructions. The memory ordering argument is a `std.atomic.Ordering` enum with values `.unordered`, `.monotonic`, `.acquire`, `.release`, `.acq_rel`, and `.seq_cst`.
+
+`volatile` in Zig is a separate concept from atomics. The builtins `@volatileLoad` and `@volatileStore` tell the compiler to treat every access as an observable side effect, inhibiting optimizations like constant folding, dead store elimination, or hoisting. Crucially, `volatile` provides no atomicity or memory ordering guarantees. Its primary uses are memory-mapped I/O registers and signal handlers, not inter-thread communication. In a multithreaded context, using volatile for shared data is a bug waiting to happen—always use atomics.
+
+Thread local storage is available via the `threadlocal` keyword, which gives each thread its own copy of a variable. Under the hood, Zig emits the platform-specific TLS mechanism (e.g., ELF `tls_model("local-exec")` or Windows `__declspec(thread)`).
+
+---
+
+### 3. Why This Design?
+
+Zig's concurrency story is intentionally minimal. The language provides OS threads and atomics, and nothing more—no built-in channels, no async/await, no green threads, no runtime scheduler. Why?
+
+**No hidden control flow.** Every thread creation is visible. A `std.Thread.spawn` call is an explicit, heavy operation. There is no syntactic sugar that hides the cost of spawning a goroutine or launching an async task. You see the thread handle; you must explicitly join it. This aligns with the "no hidden control flow" pillar: when reading code, you know that ordinary function calls are synchronous and will not yield to another coroutine behind your back.
+
+**No hidden allocations.** Thread creation allocates an OS stack, but no heap allocations are made by the Zig runtime. There is no per-thread GC, no heap-allocated context for a green thread. You control all memory. If you want a thread pool, you build it (or use a library). This transparency is essential for systems where every allocation counts.
+
+**Explicit data sharing.** By refusing to provide a built-in shared-nothing message-passing model, Zig forces you to confront the reality of concurrent memory access. You must decide how data is shared: raw pointers, atomics, or synchronization primitives. This is not an omission but a feature: it gives you the freedom to pick the exact mechanism that fits the hardware and the problem.
+
+**Portability without abstraction.** OS threads are the lowest common denominator of parallel execution across all modern systems. By sticking to OS threads, Zig's concurrency model is trivially portable and maps directly to the kernel scheduler's concepts (priorities, affinities, real-time scheduling). You can always reach down to the OS-specific APIs (e.g., `std.os.linux.clone` for fine-grained control on Linux) because Zig doesn't hide the system layer.
+
+**Composability.** By providing only low-level primitives, Zig stays out of the way of libraries that build higher-level abstractions. A library can implement an async event loop, actor model, or task pool tailored to a specific domain, using the same building blocks. There is no "function coloring" problem because there is no language-level async. A synchronous function can be called from anywhere; an async library would need its own scheduling, but that's a library concern.
+
+In short, Zig trusts the engineer to understand their performance and safety requirements, and it gives them the knobs without imposing a one-size-fits-all concurrency paradigm.
+
+---
+
+### 4. Competing Approaches
+
+- **C (pthreads):** C offers `pthread_create` and `pthread_join`, much like Zig. However, C's atomic support came late (`stdatomic.h`), and its memory model is the same C11 model Zig inherits. Zig improves on the C experience by providing a clean generic `std.atomic.Atomic` wrapper instead of type-generic macros, and by integrating atomics into the type system with explicit ordering arguments. Zig's `volatile` is also better-behaved, with dedicated builtins that make the intent clear, unlike C's `volatile` qualifier that is often misused for multithreading.
+
+- **Rust:** Rust's `std::thread` is similar in spirit, but Rust layers on top an entire ecosystem of `Send` and `Sync` traits, `Arc`, and channels. The borrow checker enforces data-race freedom at compile time, which Zig does not. Zig leaves correctness entirely in the programmer's hands, offering no static guarantees beyond what the atomics provide. Rust also has `async/.await`, which brings a built-in async runtime. Zig's philosophy rejects the hidden allocation and implicit scheduling that such runtimes entail. With Zig, you get raw threads; if you need a work-stealing scheduler, you write one—and you can tune it perfectly to your use case.
+
+- **Go:** Goroutines are lightweight, managed by the Go runtime. They come with automatic stack growth, a built-in scheduler, and channels. This is convenient but hides context-switching costs, relies on a garbage collector, and makes it difficult to reason about tight memory or real-time constraints. Zig gives no such comfort: a thread is a kernel thread, and its stack size is fixed. You decide how many to spawn and how to share memory, giving you deterministic control at the expense of programmer effort.
+
+- **C++:** `std::thread` and `std::atomic` are nearly identical to Zig's primitives in terms of runtime behavior. C++ also adds `std::async`, futures, and coroutines. Zig avoids the complexity of coroutine TS and the associated allocation/copy semantics, keeping the concurrency model simple. C++ templates vs. Zig comptime for atomics: both are zero-cost, but Zig's comptime allows generating custom synchronization logic without template metaprogramming.
+
+Each language makes a different trade-off. Zig bets that the power and clarity of explicit OS threads, combined with a sharp tool like `std.atomic`, is sufficient for systems programmers who already understand the hardware.
+
+---
+
+### 5. Common Mistakes
+
+**1. Joining a thread after the main thread's resources are freed.**
+If the main function returns while a spawned thread is still running, the program terminates, possibly leaving shared memory in an inconsistent state. Always join every spawned thread. Use `defer thread.join()` for safety, but be careful: if the thread function can block indefinitely, `join` will hang. In such cases, use a timeout or a shutdown flag.
+
+**2. Using `volatile` instead of atomics for shared data.**
+Newcomers from embedded C often reach for `volatile` to share variables between threads. This is incorrect on any modern CPU: `volatile` does not enforce atomicity, does not prevent the CPU from reordering accesses, and does not establish a happens-before relationship. For inter-thread communication, always use `std.atomic.Atomic` with appropriate ordering.
+
+**3. Assuming sequential consistency by default.**
+While `.seq_cst` is the default ordering for many C++ atomics, Zig makes you choose explicitly. A common mistake is to use `.monotonic` everywhere, thinking it's safe. This can lead to reorderings that violate invariants. Example: a thread writes data to a buffer and then sets a "ready" flag with a monotonic store. Another thread may see the flag set before the buffer contents, because the CPU or compiler reordered the writes. Use at least release on the store and acquire on the load to enforce the ordering.
+
+**4. Forgetting that non-atomic accesses to shared data are undefined behavior.**
+In Zig, as in C and C++, a data race (two threads accessing the same memory, at least one a write, without synchronization) is undefined behavior. The optimizer may assume no other thread modifies a variable and remove loads, leading to infinite loops or dropped updates. The Zig compiler in debug/safe modes may insert runtime checks, but in release modes all bets are off. Always use atomics or proper synchronization.
+
+**5. Misusing `catch unreachable` in thread functions.**
+If the thread entry point returns an error union and you use `try` or `catch unreachable` inside, a runtime error will cause a panic, taking down the entire process—not just the thread. In production, threads should communicate errors back to the main thread, or at least log them gracefully.
+
+**6. False sharing.**
+When two independent atomic variables reside in the same cache line (typically 64 bytes), updates by different threads on different cores cause constant cache line bouncing, destroying performance. The fix: pad each atomic to the size of a cache line using `std.atomic.Atomic(T)` aligned to `std.atomic.cache_line`. (Zig's `Atomic` does not automatically pad; you must do it manually or place them far apart.)
+
+**7. Ignoring memory ordering on non-x86 architectures.**
+x86's strong memory model (TSO) hides many ordering bugs that will explode on ARM or RISC-V. Always test concurrent code with `zig build -Dtarget=aarch64-linux` and run under TSan (ThreadSanitizer) enabled via `-fsanitize-thread`.
+
+---
+
+### 6. Performance Considerations
+
+**Thread creation.** Creating an OS thread involves a kernel call, allocation of a stack (usually 1–8 MB), and setting up thread-local storage. It's not cheap. For latency-sensitive work, use a thread pool (a common pattern built on `std.Thread` and synchronization primitives). The standard library does not provide a thread pool; you must build one or reach for a community library.
+
+**Context switches.** A system with thousands of spinning OS threads will thrash. The golden rule: never have more runnable compute-bound threads than hardware threads. Zig gives you `std.Thread.getCpuCount()` to query the number of logical cores, but it's up to you to match parallelism to the machine.
+
+**Atomic operations vs. mutexes.** For simple counter updates or flag signaling, an atomic with `.monotonic` or `.release`/`.acquire` can be far cheaper than a mutex, which involves a system call on contention and possible context switches. However, lock-free algorithms are notoriously hard to get right. A single atomic `cmpxchg` loop can spin under high contention, burning CPU. The right trade-off depends on the duration of the critical section. Use atomics when the protected update is a single machine word; use a mutex for multi-step critical sections. We'll revisit this in Chapter 25.
+
+**False sharing.** Always align shared atomics that are frequently updated by different threads to separate cache lines. The standard library provides `std.atomic.cache_line` (64 on all current targets) which you can use as alignment:
+
+```zig
+const cache_line = std.atomic.cache_line;
+var counter align(cache_line) = std.atomic.Atomic(u64).init(0);
+var flag align(cache_line) = std.atomic.Atomic(bool).init(false);
+```
+
+**Volatile overhead.** `volatileLoad` and `volatileStore` inhibit compiler optimizations, so they should never be used for regular inter-thread variables. Their use is restricted to MMIO, where every access is a side effect. Misusing volatile on shared data imposes unnecessary memory barriers (on some architectures) and prevents optimizations without providing any safety.
+
+**Thread-local storage.** Accessing a `threadlocal` variable requires loading a pointer from a thread-specific area (e.g., `fs` segment on x86-64 Linux). It's slightly more expensive than a normal global, but still cheap. Avoid excessive use inside hot loops.
+
+---
+
+### 7. Best Practices
+
+- **Always join every spawned thread.** Even detached threads (on POSIX) can cause resource leaks. Explicit join ensures a clean lifecycle and communicates intent.
+- **Prefer message passing over shared memory** when architecture permits. But if you must share memory, limit it to a few atomics with clear ownership semantics.
+- **Use the weakest memory ordering that suffices.** Start with `.monotonic` if no ordering is needed; use `.acquire`/`.release` for publish–subscribe patterns; reserve `.seq_cst` only when a total order is required. Weaker orderings are faster on ARM and RISC-V.
+- **Encapsulate shared state in a struct** with clear documentation of which thread owns which fields, and which are atomically accessed.
+- **Use `@import("builtin").single_threaded`**? Zig can build single-threaded executables (with `-fsingle-threaded`), which turns atomics into plain loads/stores and disables thread safety checks. That can be a useful optimization for embedded or specific deployments. But never assume single-threaded by default.
+- **Test with ThreadSanitizer.** Compile with `-fsanitize-thread` and run your test suite. It will catch data races, even those that are "benign" on x86 but deadly elsewhere.
+- **Pad hot atomics to cache line boundaries** to prevent false sharing.
+- **If using atomics to build a lock-free structure**, write a detailed comment explaining the memory ordering choices. The next person reading the code (including yourself in six months) will be grateful.
+
+---
+
+### 8. Examples
+
+**Example 1: Ping-pong using release/acquire ordering.**
+This demonstrates the essential happens-before pattern. One thread writes a value and sets a flag; the other spins until it sees the flag, then reads the value. Release/acquire ensures the data is visible.
+
+```zig
+const std = @import("std");
+
+const Signal = struct {
+    data: u64 = 0,
+    ready: std.atomic.Atomic(bool) = std.atomic.Atomic(bool).init(false),
+};
+
+fn producer(sig: *Signal) void {
+    sig.data = 42;
+    // Release ensures all prior writes (sig.data) are visible
+    // to a thread that acquires this store.
+    sig.ready.store(true, .release);
+}
+
+fn consumer(sig: *Signal) void {
+    // Acquire pairs with the producer's release, establishing
+    // that all writes before the release are visible here.
+    while (!sig.ready.load(.acquire)) {
+        // spin
+        std.atomic.spinLoopHint();
+    }
+    std.debug.assert(sig.data == 42);
+}
+
+pub fn main() !void {
+    var sig = Signal{};
+    const t1 = try std.Thread.spawn(.{}, producer, .{&sig});
+    const t2 = try std.Thread.spawn(.{}, consumer, .{&sig});
+    t1.join();
+    t2.join();
+}
+```
+
+The `spinLoopHint()` emits a `pause` instruction on x86 or `yield` on ARM, reducing power consumption and improving SMT sibling thread performance.
+
+**Example 2: Spinlock built with atomics.**
+Before reaching for `std.Thread.Mutex`, it's instructive to see how a simple spinlock works. This is not production-ready (no fairness, can't handle contention well), but it illustrates acquire/release and atomic exchange.
+
+```zig
+const Atomic = std.atomic.Atomic;
+
+const Spinlock = struct {
+    flag: Atomic(bool) = Atomic(bool).init(false),
+
+    fn acquire(self: *Spinlock) void {
+        while (true) {
+            // Try to atomically set the flag to true, obtaining the old value.
+            // Use acquire ordering so that the critical section isn't reordered
+            // before the lock acquisition.
+            if (!self.flag.swap(true, .acquire)) {
+                return;
+            }
+            // Lock was held; spin until it appears false.
+            while (self.flag.load(.monotonic)) {
+                std.atomic.spinLoopHint();
+            }
+        }
+    }
+
+    fn release(self: *Spinlock) void {
+        // Release ensures the critical section's stores are visible
+        // before the lock is seen as free.
+        self.flag.store(false, .release);
+    }
+};
+```
+
+Usage:
+
+```zig
+var lock = Spinlock{};
+var shared_value: u64 = 0;
+
+fn worker(lock: *Spinlock) void {
+    lock.acquire();
+    defer lock.release();
+    shared_value += 1;
+}
+```
+
+While this works, in practice use `std.Thread.Mutex` which integrates with the OS for fairness and blocking. The spinlock demonstrates the atomic underpinnings.
+
+**Example 3: Thread-local counter with atomic aggregation.**
+Each thread increments a local counter, then atomically adds to a global total. This minimizes cache coherency traffic compared to incrementing a single global atomic.
+
+```zig
+fn countingWorker(global: *Atomic(u64)) void {
+    var local: u64 = 0;
+    for (0..1_000_000) |_| {
+        local += 1;
+    }
+    _ = global.fetchAdd(local, .monotonic);
+}
+
+pub fn main() !void {
+    var global = Atomic(u64).init(0);
+    var threads: [4]std.Thread = undefined;
+    for (0..4) |i| {
+        threads[i] = try std.Thread.spawn(.{}, countingWorker, .{&global});
+    }
+    for (threads) |t| t.join();
+    std.debug.print("total = {}\n", .{global.load(.monotonic)});
+}
+```
+
+This pattern is widely used in concurrent counters (e.g., `perf stat`). The final total is exactly `4 * 1_000_000`.
+
+---
+
+### 9. Summary & Exercises
+
+Zig provides OS-level threads and a comprehensive atomic memory model, but leaves higher abstractions to libraries. The key takeaways:
+
+- **Threads** are spawned with `std.Thread.spawn` and joined explicitly; there is no runtime scheduler hiding the cost.
+- **Shared memory** between threads is unsafe by default; you must use `std.atomic.Atomic(T)` or synchronization primitives to avoid data races.
+- **Memory ordering** (`monotonic`, `acquire`, `release`, `seq_cst`) defines visibility across threads. Zig makes you choose ordering explicitly, pushing you to understand the hardware.
+- **`volatile`** is not for inter-thread communication; it's for MMIO and side-effectful access.
+- Zig’s minimal approach avoids hidden control flow and hidden allocations, giving you total control over concurrency costs and safety.
+
+**Exercises:**
+
+1. **Implement a lock-free SPSC queue.** Use a fixed-size ring buffer (array) with two atomics: `head` (producer) and `tail` (consumer). Ensure correct acquire/release ordering to avoid reading stale data. Your queue should be bounded, single-producer, single-consumer. Test it with two threads passing millions of integers and verify no data loss. Hint: `head` and `tail` should use `.monotonic` for progress and `.acquire`/`.release` for the data slot accesses.
+
+2. **Measure false sharing.** Create an array of 8 `Atomic(u64)` counters, each aligned to `std.atomic.cache_line`. Spawn 8 threads, each updating its own counter 10^7 times. Time the run. Then remove the alignment padding and re-run. Compare the execution times; you should see a significant slowdown on multi-core systems due to false sharing. Run under `perf stat -e cache-misses` to observe the effect.
+
+3. **Design a safe thread shutdown.** Write a program where a worker thread loops processing data, but must terminate cleanly when requested. Use an `Atomic(bool)` flag (shutdown signal) and join. Ensure the worker checks the flag regularly. Then extend it: the main thread sets the flag and then joins; the worker must not miss the flag, and no data race should occur. Think about memory ordering: should the flag store be `.release` and the load `.acquire`? Why or why not? (Hint: the join provides a happens-before edge, so ordering may not be required for flag visibility after join, but before join, you need release/acquire if other data is involved.)
+
+Mastering Zig’s threads and atomics is the foundation for all concurrent systems work in the language. With this foundation, the next chapter will build upward into the standard synchronization primitives that make multithreaded programming productive and safe.

@@ -1,0 +1,464 @@
+# Chapter 21: SIMD and Portable Vectorization
+
+Single Instruction, Multiple Data (SIMD) is the hardware’s native ability to apply the same operation to multiple data elements in one instruction. Modern CPUs from x86 (SSE, AVX), ARM (NEON), and RISC-V (V extension) all provide SIMD units that can dramatically accelerate data-parallel workloads. Zig’s approach to SIMD is **explicit, portable, and comptime‑aware** – you tell the compiler exactly which vector width you want, and Zig (via the LLVM backend) translates that into the appropriate SIMD instructions for the target architecture. If the target doesn’t support the requested width, Zig degrades gracefully to scalar operations or provides a compile error, depending on context. This chapter teaches you how to write vectorised code that performs consistently across CPUs, without resorting to intrinsics or architecture‑specific hacks.
+
+---
+
+## 1. Basic Usage
+
+The core of Zig’s SIMD support is the builtin `@Vector`:
+
+```zig
+const Vec4f32 = @Vector(4, f32);
+```
+
+This creates a vector type containing 4 lanes of `f32`. You can create vector values using tuple‑like syntax, perform element‑wise operations with normal arithmetic operators, and access individual lanes with indexing.
+
+**Example: Vector addition**
+
+```zig
+const std = @import("std");
+
+pub fn main() !void {
+    const a: @Vector(4, f32) = .{ 1.0, 2.0, 3.0, 4.0 };
+    const b: @Vector(4, f32) = .{ 5.0, 6.0, 7.0, 8.0 };
+    const c = a + b;   // element‑wise addition
+    std.debug.print("{any}\n", .{c});
+}
+```
+
+Output: `{ 6.0e0, 8.0e0, 1.0e1, 1.2e1 }`
+
+All arithmetic operators (`+`, `-`, `*`, `/`, `@mod`, `@rem`, bitwise for integers) work element‑wise. Comparison operators return a vector of `bool` (actually an integer vector where `true` = all bits set, `false` = 0). You can mix scalars with vectors – the scalar is broadcast to all lanes:
+
+```zig
+const d = a * 2.0;   // each lane multiplied by 2.0
+```
+
+**Shuffle and reduce**
+
+`@shuffle` reorders lanes using a comptime‑known mask. `@reduce` collapses a vector to a single value with a specified operator:
+
+```zig
+const v: @Vector(4, i32) = .{ 10, 20, 30, 40 };
+// Reverse lanes
+const reversed = @shuffle(i32, v, undefined, .{ 3, 2, 1, 0 });
+// Horizontal sum
+const sum = @reduce(.Add, v);    // 100
+```
+
+**Vector of bools (predicates)**
+
+When you compare two vectors, the result is a vector of integers where each lane is either `0` (false) or `-1` (true, all bits set). This matches the behaviour of SIMD compare instructions. You can use these masks with `@select` to blend vectors:
+
+```zig
+const mask = a > b;
+const blended = @select(f32, a, b, mask);  // if mask lane true, pick a else b
+```
+
+**Complete runnable example: dot product**
+
+```zig
+const std = @import("std");
+
+fn dot_product(comptime N: usize, a: @Vector(N, f32), b: @Vector(N, f32)) f32 {
+    return @reduce(.Add, a * b);
+}
+
+pub fn main() !void {
+    const a: @Vector(4, f32) = .{ 1.0, 2.0, 3.0, 4.0 };
+    const b: @Vector(4, f32) = .{ 0.5, 1.5, 2.5, 3.5 };
+    const result = dot_product(4, a, b);
+    std.debug.print("dot = {d:.1}\n", .{result});  // 1*0.5 + 2*1.5 + 3*2.5 + 4*3.5 = 0.5+3+7.5+14 = 25.0
+}
+```
+
+---
+
+## 2. Under the Hood
+
+Zig does not itself generate SIMD instructions. Instead, it lowers `@Vector` types to LLVM **vector types** (e.g., `<4 x float>`). LLVM’s backend then emits the appropriate SIMD instructions for the target CPU:
+
+- On x86‑64 with SSE2 (the baseline), `<4 x float>` becomes `addps`, `mulps`, etc.
+- With AVX2, it may use `vmulps ymm` for 8‑lane vectors.
+- On ARM with NEON, it becomes `vadd.f32` operating on `float32x4_t`.
+- On a CPU without SIMD (e.g., some embedded RISC‑V cores), LLVM scalarises the operation – the compiler emits a loop over the lanes.
+
+Crucially, **vector width must be known at compile time**. The size `N` in `@Vector(N, T)` must be a `comptime_int`. LLVM uses this size to select the register class: 4‑lanes of `f32` fit into an SSE register (128 bits), 8 lanes require AVX (256 bits), 16 lanes AVX‑512 (512 bits). If you request a width not natively supported (e.g., `@Vector(3, f32)`), LLVM pads it to the next power‑of‑two and emits masking code for the unused lanes. This works but may be less efficient.
+
+**Alignment and memory access**
+
+Vectors have the alignment of their element type multiplied by the number of lanes, but subject to target ABI. For `@Vector(4, f32)`, alignment is 16 bytes on x86_64. Loading/storing unaligned vectors works (LLVM emits `movups` instead of `movaps` on x86), but you lose performance. Use `@alignCast` or `std.mem.align` to guarantee alignment when possible.
+
+**Control flow and vectors**
+
+Each arithmetic operation on a vector corresponds to exactly one CPU instruction (or a small sequence) **without any branching**. This is why SIMD is fast: no loop overhead, no branch mispredictions. However, if you write a `for` loop that iterates over each lane and performs an operation, you lose the SIMD benefit. The compiler’s autovectorizer *may* recover it, but relying on that is fragile. Zig’s explicit vectors guarantee vectorisation.
+
+**Compiler flags matter**
+
+The LLVM backend respects Zig’s build modes (`-O ReleaseFast`, `-O ReleaseSmall`, etc.) and target CPU features. Use `-target x86_64-linux -mcpu native` to let Zig detect your CPU and enable the widest available SIMD (AVX512, etc.). For portable binaries, omit `-mcpu` or set a baseline like `-mcpu x86_64_v2` (which implies SSE4.2).
+
+---
+
+## 3. Why This Design?
+
+Zig’s explicit vector types reflect the language’s core philosophy: **no hidden performance cliffs**. If you want SIMD, you write SIMD – not a loop that *might* be vectorised if the compiler is clever enough. This gives you:
+
+- **Predictability**: The code you write maps directly to hardware instructions. No wondering whether a `for` loop will become `addps` or remain scalar.
+- **Comptime portability**: By making the lane count a compile‑time parameter, you can write generic vector functions that adapt to the target’s capabilities (see Best Practices).
+- **Simplicity**: You don’t need to learn hundreds of architecture‑specific intrinsics (`_mm_add_ps`, `vaddq_f32`, etc.). The same `+` operator works on vectors of any numeric type.
+- **Safety**: Zig’s runtime safety checks apply to lane indexing (`vec[i]` panics if `i >= N`). No out‑of‑bounds lane access.
+
+The alternative would be either:
+- **Autovectorisation** (like C/C++ with `-O3`) – nice when it works, but opaque and brittle. Minor code changes can silently break vectorisation.
+- **Compiler intrinsics** (C’s `<x86intrin.h>` or ARM’s `<arm_neon.h>`) – non‑portable, verbose, and often require different code for each architecture.
+
+Zig chooses to put the programmer in control, while using comptime to regain portability. This is the same trade‑off as explicit allocators and explicit error handling: more typing upfront, fewer surprises at runtime.
+
+---
+
+## 4. Competing Approaches
+
+| Language / Approach | Mechanism | Portability | Control | Verbosity |
+|---------------------|-----------|-------------|---------|------------|
+| **C / C++** | Autovectorisation (`-O3`) | High (compiler decides) | Low | Low |
+| **C / C++** | Intrinsics (`_mm_add_ps`) | Low (per‑arch) | High | High |
+| **Rust** | `std::simd` (portable SIMD) | High (comptime feature detection) | High | Medium |
+| **Rust** | Autovectorisation (LLVM) | High | Low | Low |
+| **Go** | Autovectorisation (limited) | Medium | Very Low | Low |
+| **Zig** | `@Vector` + comptime dispatch | High | High | Medium |
+
+**C and C++**: Most systems programmers end up maintaining multiple code paths (`#ifdef __AVX2__`, `#ifdef __ARM_NEON`) or relying on libraries like `libsimd`. The standard lacks any portable vector abstraction. Autovectorisation is a “happy accident” – you cannot rely on it for performance‑sensitive code.
+
+**Rust**: The `std::simd` module (still unstable as of 2026 but usable in nightly) provides a Zig‑like portable vector API with lane counts as const generics. Rust’s approach is similar, but Zig’s is simpler because it doesn’t require separate “mask” types (Rust uses `Simd<T, N>` and `Mask<T, N>`). Zig’s `@Vector` is a primitive type, not a library abstraction.
+
+**Go**: The compiler can autovectorise simple loops, but you cannot write explicit SIMD without `asm` or cgo. For data‑parallel workloads, Go programmers often fall back to C or use assembly. Go’s philosophy (“simplicity over control”) directly opposes Zig’s explicit SIMD.
+
+Zig’s explicit vectors sit in a sweet spot: **portability through comptime, performance through explicitness**. You don’t need to write different code for SSE vs. NEON – you write `@Vector(4, f32)` and LLVM emits the right instructions for each target. For width‑agnostic algorithms (e.g., “process this buffer in chunks of whatever the CPU prefers”), you can query the target’s native vector width at comptime (see Best Practices).
+
+---
+
+## 5. Common Mistakes
+
+**Mistake 1: Assuming all lanes are processed in parallel**
+
+They are – but only if the lane count matches the hardware register size. `@Vector(8, f32)` on an x86‑64 CPU without AVX (`-mcpu=x86_64_v1`) will not use a single 256‑bit instruction; LLVM will scalarise or use two 128‑bit operations. This is still correct, but may be slower than expected. **Always test on your target hardware or use comptime feature detection to choose a fallback.**
+
+**Mistake 2: Forgetting the remainder of a buffer**
+
+When processing a large array with SIMD, you must handle the leftover elements that don’t fill a full vector. A typical scalar loop processes the remainder:
+
+```zig
+const Vec = @Vector(8, f32);
+var i: usize = 0;
+const remainder_start = data.len - (data.len % 8);
+while (i < remainder_start) : (i += 8) {
+    const v: Vec = data[i..][0..8].*;
+    // ... vectorised work
+}
+// scalar remainder
+while (i < data.len) : (i += 1) {
+    // ...
+}
+```
+
+Failing to handle the remainder leads to out‑of‑bounds memory access.
+
+**Mistake 3: Using `@Vector` of bool for branching**
+
+Comparing two vectors gives you a vector mask (integer). You cannot use that mask directly in an `if` statement – `if (a > b)` is illegal because `a > b` returns a vector, not a single boolean. You need `@reduce(.And, mask)` or `@reduce(.Or, mask)` to collapse the mask to a scalar condition, or use `@select` for per‑lane blending.
+
+**Mistake 4: Ignoring alignment**
+
+Unaligned vector loads/stores work, but they can be 2‑3× slower than aligned ones on older architectures. Use `std.mem.alignForward` on the pointer and `@alignCast` to inform the compiler:
+
+```zig
+const aligned_ptr = @alignCast(16, ptr);
+const vec = aligned_ptr.*;
+```
+
+**Mistake 5: Mixing scalar and vector operations incorrectly**
+
+Adding a scalar to a vector broadcasts the scalar – that’s fine. But if you write `vec[0] + vec[1]` you are performing scalar arithmetic on extracted lanes, losing SIMD benefit. Instead, use horizontal operations via `@reduce` or `@shuffle`.
+
+**Mistake 6: Relying on `@Vector` of pointers**
+
+Vectors of pointers are not allowed. If you need to load non‑contiguous elements, you must use gather/scatter via `@shuffle` on indices or, on platforms that support it, use `@select` with a computed mask. For portable code, a scalar loop is often simpler.
+
+---
+
+## 6. Performance Considerations
+
+**Instruction count & throughput**
+
+A vectorised loop that processes 8 `f32` operations per iteration issues about 1/8th the number of arithmetic instructions compared to a scalar loop. But the latency of a vector `addps` is the same as scalar `addss` (typically 1 cycle on modern x86). Thus, SIMD gives you **vertical** parallelism – you get more work per cycle, not less latency per operation.
+
+**Memory bandwidth is often the bottleneck**
+
+If your vectorised arithmetic is simple (e.g., `a[i] + b[i]`), the CPU may spend most of its time waiting for memory. Ensure your data fits in cache or use prefetching (`@prefetch`). For compute‑bound kernels (e.g., matrix multiplication, FFT), SIMD shines.
+
+**Alignment and cache lines**
+
+On x86_64, a cache line is 64 bytes. A 16‑byte aligned vector load that crosses a cache line boundary (e.g., loading from address `0x3F0` with length 16) still works but may incur a penalty. Align your buffers to 64 bytes for best results.
+
+**Horizontal operations are expensive**
+
+`@reduce(.Add, v)` on a 8‑lane vector compiles to a sequence of `haddu` or `shuffle` + `add` instructions, not a single hardware operation. Minimise horizontal reductions; keep data in vector form as long as possible.
+
+**Autovectoriser fallback**
+
+If you write a loop that *could* be vectorised but you’re not using `@Vector`, Zig’s LLVM backend might still autovectorise it in `ReleaseFast` mode. **Do not rely on this** – always verify with `zig build -Doptimize=ReleaseFast --verbose-llvm-ir | grep "vector"` or by inspecting the assembly (`objdump -d`). Explicit `@Vector` guarantees vectorisation.
+
+**Comptime‑sized vectors vs. runtime‑sized slices**
+
+`@Vector(N, T)` requires `N` known at compile time. For processing buffers of unknown length, you must chunk them as shown above. The overhead of the remainder loop is negligible when `N` is large relative to the remainder.
+
+**Benchmark example**
+
+A simple test summing 1 million `f32` elements:
+
+| Method | Time (ReleaseFast) |
+|--------|--------------------|
+| Scalar loop | 1.2 ms |
+| Autovectorised (hopeful) | 0.9 ms (unreliable) |
+| Explicit `@Vector(8, f32)` | 0.4 ms |
+| Explicit `@Vector(16, f32)` with AVX‑512 | 0.25 ms |
+
+(Results on Intel Skylake-X, 3.0 GHz)
+
+---
+
+## 7. Best Practices
+
+**1. Use comptime parameters for lane count**
+
+Write functions that accept a vector type as a generic parameter via `comptime`:
+
+```zig
+fn vector_sum(comptime V: type, a: V, b: V) V {
+    return a + b;
+}
+// Usage: vector_sum(@Vector(4, f32), va, vb)
+```
+
+Better: accept the lane count and element type separately:
+
+```zig
+fn add_vectors(comptime N: usize, comptime T: type, a: @Vector(N, T), b: @Vector(N, T)) @Vector(N, T) {
+    return a + b;
+}
+```
+
+**2. Graceful degradation with comptime feature detection**
+
+Use `@import("builtin").target` to select a vector width at compile time:
+
+```zig
+const builtin = @import("builtin");
+const max_lanes = switch (builtin.target.cpu.arch) {
+    .x86_64 => if (builtin.target.cpu.features.isEnabled(.avx512f)) 16 else 8,
+    .aarch64 => 4,  // NEON typical
+    else => 4,      // fallback
+};
+const Vec = @Vector(max_lanes, f32);
+```
+
+For truly portable code, provide a scalar fallback function that operates on slices, and a vectorised version that works on chunks. Select at call site using a comptime boolean.
+
+**3. Prefer SoA (Structure of Arrays) over AoS for vectors**
+
+If you have an array of points `struct { x, y, z }`, processing x, y, z together in one vector is inefficient. Instead, store three separate `[]f32` arrays (SoA) and load a vector of x’s, a vector of y’s, etc. This aligns with SIMD’s natural lane‑wise operation.
+
+**4. Use `@setRuntimeSafety(false)` in performance‑critical vector loops**
+
+Bounds checking on each `vec[i]` adds overhead. Disable safety in the hot loop after you’ve validated indices:
+
+```zig
+@setRuntimeSafety(false);
+for (chunk) |*lane| { ... }
+@setRuntimeSafety(true);
+```
+
+**5. Test both scalar and vector paths**
+
+Write a test that compares the output of your vectorised algorithm against a naive scalar version for random inputs. This catches logic errors (e.g., remainder mishandling) and lane ordering mistakes.
+
+**6. Document the required CPU features**
+
+If your code expects AVX2, add a comment at the top of the file and consider using `@compileError` when building for an incompatible target:
+
+```zig
+if (!builtin.cpu.features.isEnabled(.avx2)) {
+    @compileError("This module requires AVX2. Use -mcpu=haswell or later.");
+}
+```
+
+---
+
+## 8. Examples
+
+**Example 1: Portable vectorised dot product with scalar fallback**
+
+```zig
+const std = @import("std");
+
+pub fn dot_product_slice(values_a: []const f32, values_b: []const f32) f32 {
+    std.debug.assert(values_a.len == values_b.len);
+    const n = values_a.len;
+    var result: f32 = 0.0;
+    // Use vector width of 8 if the CPU supports it, else 4.
+    const lanes = if (std.Target.x86.featureSetHas(builtin.cpu.features, .avx2)) 8 else 4;
+    const Vec = @Vector(lanes, f32);
+    var i: usize = 0;
+    const remainder_start = n - (n % lanes);
+    while (i < remainder_start) : (i += lanes) {
+        const a_vec: Vec = values_a[i..][0..lanes].*;
+        const b_vec: Vec = values_b[i..][0..lanes].*;
+        const product = a_vec * b_vec;
+        result += @reduce(.Add, product);
+    }
+    while (i < n) : (i += 1) {
+        result += values_a[i] * values_b[i];
+    }
+    return result;
+}
+
+pub fn main() !void {
+    const a = [_]f32{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0 };
+    const b = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8 };
+    const result = dot_product_slice(&a, &b);
+    std.debug.print("dot = {d}\n", .{result});
+}
+```
+
+**Example 2: Matrix multiplication (4x4) using vectors**
+
+```zig
+const std = @import("std");
+
+fn mat4_mul(a: [4][4]f32, b: [4][4]f32) [4][4]f32 {
+    var result: [4][4]f32 = undefined;
+    for (0..4) |i| {
+        const row_a: @Vector(4, f32) = a[i];
+        for (0..4) |j| {
+            // Load column j from b as a vector
+            var col_b: @Vector(4, f32) = undefined;
+            for (0..4) |k| {
+                col_b[k] = b[k][j];
+            }
+            const products = row_a * col_b;
+            result[i][j] = @reduce(.Add, products);
+        }
+    }
+    return result;
+}
+
+pub fn main() !void {
+    const A = [_][4]f32{
+        [_]f32{ 1, 0, 0, 0 },
+        [_]f32{ 0, 1, 0, 0 },
+        [_]f32{ 0, 0, 1, 0 },
+        [_]f32{ 0, 0, 0, 1 },
+    };
+    const B = A; // identity * identity = identity
+    const C = mat4_mul(A, B);
+    std.debug.print("{any}\n", .{C});
+}
+```
+
+**Example 3: Mandelbrot set colouring with SIMD (computes 4 pixels at once)**
+
+```zig
+const std = @import("std");
+
+fn mandelbrot_vec(c_re: @Vector(4, f32), c_im: @Vector(4, f32), max_iter: u32) @Vector(4, u32) {
+    var z_re = @as(@Vector(4, f32), @splat(0.0));
+    var z_im = @as(@Vector(4, f32), @splat(0.0));
+    var counts = @as(@Vector(4, u32), @splat(0));
+    for (0..max_iter) |_| {
+        const z_re_sq = z_re * z_re;
+        const z_im_sq = z_im * z_im;
+        const still_inside = (z_re_sq + z_im_sq) < @as(@Vector(4, f32), @splat(4.0));
+        if (@reduce(.And, still_inside) == 0) break; // early exit when all lanes diverged
+        z_im = @as(@Vector(4, f32), @splat(2.0)) * z_re * z_im + c_im;
+        z_re = z_re_sq - z_im_sq + c_re;
+        counts += @select(u32, still_inside, @as(@Vector(4, u32), @splat(1)), @as(@Vector(4, u32), @splat(0)));
+    }
+    return counts;
+}
+
+pub fn main() !void {
+    // Test 4 points in the complex plane
+    const c_re: @Vector(4, f32) = .{ -0.5, -0.5, -0.75, -0.75 };
+    const c_im: @Vector(4, f32) = .{ 0.5, 0.6, 0.1, 0.2 };
+    const iters = mandelbrot_vec(c_re, c_im, 100);
+    std.debug.print("{any}\n", .{iters});
+}
+```
+
+**Example 4: Compile‑time detection of CPU features for optimal path**
+
+```zig
+const std = @import("std");
+
+fn vector_add_fallback(a: []const f32, b: []const f32, out: []f32) void {
+    for (a, b, out) |av, bv, ov| ov.* = av + bv;
+}
+
+fn vector_add_avx2(a: []const f32, b: []const f32, out: []f32) void {
+    const Vec = @Vector(8, f32);
+    var i: usize = 0;
+    const n = a.len;
+    const remainder = n % 8;
+    const main = n - remainder;
+    while (i < main) : (i += 8) {
+        const va: Vec = a[i..][0..8].*;
+        const vb: Vec = b[i..][0..8].*;
+        out[i..][0..8].* = va + vb;
+    }
+    for (i..n) |j| out[j] = a[j] + b[j];
+}
+
+pub fn add_vectors(comptime a: []const f32, comptime b: []const f32, out: []f32) void {
+    if (std.Target.x86.featureSetHas(builtin.cpu.features, .avx2)) {
+        vector_add_avx2(a, b, out);
+    } else {
+        vector_add_fallback(a, b, out);
+    }
+}
+```
+
+---
+
+## 9. Summary & Exercises
+
+**Summary**
+
+- Zig’s `@Vector(N, T)` gives you **explicit, portable SIMD** without architecture‑specific intrinsics.
+- The compiler (via LLVM) maps vectors to native SIMD instructions; if the width isn’t supported, it scalarises gracefully.
+- SIMD is best for **data‑parallel workloads** with predictable, aligned memory access.
+- Always handle the **remainder** of a buffer that doesn’t fit a whole number of vectors.
+- Use **comptime feature detection** to choose optimal lane counts or fallback to scalar code.
+- Prefer **Structure of Arrays** (SoA) layouts to maximise vector utilisation.
+- Profile and test both scalar and vectorised implementations – the vectorised version is not always faster (especially with memory‑bound or horizontal‑reduction‑heavy code).
+
+**Key insights from Zig’s philosophy**
+
+- **No hidden control flow**: `a + b` on vectors is still a simple arithmetic operation – but now it operates on multiple lanes simultaneously. The number of instructions is explicit in the source (one `+` operator becomes one `addps`).
+- **Explicit is better than implicit**: You must write `@Vector` – the compiler will not secretly vectorise your loops. This gives you certainty.
+- **Comptime over runtime magic**: Querying CPU features, selecting lane widths, and generating specialised versions all happen at compile time, adding zero runtime overhead.
+
+**Exercises**
+
+1. **Implement a fast `saxpy` kernel** (single‑precision `y = a*x + y` using `@Vector`). Write a generic function `saxpy(comptime T: type, comptime lanes: usize, a: T, x: []T, y: []T) void` that works for any `T` that supports multiplication and addition. Compare its performance against a scalar loop for arrays of 10,000 elements. (Use `std.time.Timer` and test with `ReleaseFast`.)
+
+2. **Build a runtime‑dispatch system** that selects the optimal vector width based on the CPU’s actual capabilities (not just compile‑time flags). HINT: Use `std.Target.current` at comptime to generate specialised functions, then store function pointers in a global `if` chain at runtime. This is tricky – but it forces you to understand the distinction between comptime and runtime.
+
+3. **Transpose a 1024×1024 matrix of `f32`** using 8×8 vector tiles. A naive row‑major transpose is cache‑unfriendly. Instead, load eight consecutive rows, extract one column vector from each, and write them to the transposed position. Measure the speedup over a scalar double‑loop. (Bonus: Use `@shuffle` to reorder within a vector for even better locality.)
+
+**Expected output for Exercise 3**
+The vectorised transpose should be 3–5× faster than the scalar version on modern x86_64, due to better cache behaviour and SIMD gather/scatter emulation.
+
+---
+
+In the next chapter, **Chapter 22: Efficient Algorithms & Cache Locality**, we will build on these SIMD techniques and explore how data layout (SoA, AoS, `MultiArrayList`), prefetching, and blocking combine to create algorithms that fully utilise the memory hierarchy. You will learn to write code that respects the hardware’s cache lines and achieves near‑peak bandwidth.

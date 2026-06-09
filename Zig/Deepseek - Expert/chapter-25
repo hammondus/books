@@ -1,0 +1,451 @@
+## Chapter 25: Synchronization Primitives
+
+When threads share mutable state, they must coordinate. Zig’s standard library provides the classic synchronization primitives—mutexes, condition variables, wait groups, and events—wrapped in a thin layer over the operating system’s own facilities. Zig also exposes low-level atomics and a lock-free multi‑producer, multi‑consumer queue. This chapter covers their usage, internals, trade‑offs, and the idiomatic patterns that keep concurrent Zig code understandable, correct, and fast.
+
+---
+
+### 1. Basic Usage
+
+Zig’s synchronization types live in `std.Thread`. They all follow the “open‑close” lifecycle: create or initialize the object, use it, then `deinit`/destroy it explicitly. There are no hidden destructors.
+
+#### Mutex
+
+A `std.Thread.Mutex` provides mutual exclusion. Its interface is minimal:
+
+```zig
+const std = @import("std");
+
+var counter: u64 = 0;
+var mtx: std.Thread.Mutex = .{};
+
+fn increment(amount: u64) void {
+    mtx.lock();
+    defer mtx.unlock();
+    counter += amount;
+}
+```
+
+`lock()` acquires the mutex, blocking if necessary. `unlock()` releases it. A `tryLock()` variant returns immediately if the mutex is already held:
+
+```zig
+if (mtx.tryLock()) {
+    defer mtx.unlock();
+    // critical section
+} else {
+    // couldn't acquire, do something else
+}
+```
+
+`Mutex` is statically initialized with `= .{}`. For dynamic allocation or when the mutex must outlive its creation scope, you can embed it inside a heap‑allocated struct; there is no need to pass an allocator to the mutex itself—it uses a platform‑specific handle that does not allocate Zig heap memory.
+
+#### Condition
+
+`std.Thread.Condition` lets a thread wait until some predicate becomes true. It is always used together with a `Mutex`. The canonical pattern:
+
+```zig
+var mtx: std.Thread.Mutex = .{};
+var cond: std.Thread.Condition = .{};
+var ready: bool = false;
+
+fn wait_for_ready() void {
+    mtx.lock();
+    defer mtx.unlock();
+
+    while (!ready) {
+        cond.wait(&mtx);
+    }
+    // ready is true, do work
+}
+
+fn signal_ready() void {
+    mtx.lock();
+    defer mtx.unlock();
+
+    ready = true;
+    cond.signal(); // wake one waiter
+    // or cond.broadcast() to wake all
+}
+```
+
+`wait` atomically releases the mutex and puts the thread to sleep. Upon wakeup it reacquires the mutex before returning. The `while` loop guards against spurious wakeups, which the POSIX specification explicitly allows. Zig follows the same contract: you must always re‑check the predicate after `wait`.
+
+#### WaitGroup
+
+`std.Thread.WaitGroup` (often called “wg”) waits for a collection of activities to finish.
+
+```zig
+var wg: std.Thread.WaitGroup = .{};
+wg.reset(); // set count to 0
+
+// Spawn a few threads
+for (0..3) |_| {
+    wg.start();
+    const handle = std.Thread.spawn(.{}, worker, .{&wg}) catch unreachable;
+    // ...
+}
+
+wg.wait(); // blocks until counter reaches 0
+```
+
+Inside a worker, each call to `start` increments the internal counter, and each call to `finish` decrements it. A common pattern is to `defer wg.finish()` at the top of the worker function:
+
+```zig
+fn worker(wg: *std.Thread.WaitGroup) void {
+    defer wg.finish();
+    // do work
+}
+```
+
+`WaitGroup` is not an opaque OS object; it is a small struct containing a mutex, a condition variable, and a counter. It must be `reset` before reuse.
+
+#### ResetEvent
+
+`std.Thread.ResetEvent` is a manual‑reset event: a boolean flag that threads can wait for. When set, all waiters are released; when reset, waiters block. It is simpler than a condition variable when the predicate is just “this event has occurred.”
+
+```zig
+var event: std.Thread.ResetEvent = .{};
+
+// In one thread:
+event.set();   // signal all current and future waiters
+// ...
+event.reset(); // go back to blocking
+
+// In another thread:
+event.wait(); // blocks until someone calls set()
+```
+
+There is also `event.timedWait(nanoseconds)` for a timeout. `ResetEvent` is built from a futex on Linux, or the equivalent OS primitive, and does not require an external mutex.
+
+#### Lock‑free queue: `std.atomic.Queue`
+
+When you need a fast, lock‑free multi‑producer, multi‑consumer FIFO, Zig offers `std.atomic.Queue(T)`. It is generic over the element type and uses an intrusive linked list: elements must embed a `next` field of type `?*@This()`.
+
+```zig
+const Node = struct {
+    data: u32,
+    next: ?*@This() = null,
+};
+
+var queue: std.atomic.Queue(Node) = .{};
+
+// Producer
+const node = try allocator.create(Node);
+node.data = 42;
+queue.put(node);
+
+// Consumer
+while (queue.get()) |node| {
+    defer allocator.destroy(node);
+    // process node.data
+}
+```
+
+The queue’s internal head and tail are atomically updated, making it suitable for low‑contention scenarios. It provides `put`, `get`, and `unget` for returning an item to the head.
+
+---
+
+### 2. Under the Hood
+
+Zig’s synchronization primitives are thin wrappers over OS‑level constructs. The implementation is in `std/Thread.zig` and `std/atomic.zig`, and it branches at compile time for different targets.
+
+- **Mutex** on Linux uses `pthread_mutex_t` via the libc stub or direct `futex` calls in freestanding mode. On Windows it uses `SRWLOCK`. In both cases, the lock is just an `i32` or a `usize` with no additional allocation.
+- **Condition** wraps `pthread_cond_t` / `CONDITION_VARIABLE`. It stores only the OS handle; the mutex pointer is passed at `wait` time.
+- **WaitGroup** is not an OS object. It is a struct containing a `Mutex`, a `Condition`, and a `u32` counter. `wait` acquires the internal mutex, then loops on the condition until the counter reaches zero.
+- **ResetEvent** on Linux uses a `futex` word (a single `i32`) plus the `FUTEX_WAIT` / `FUTEX_WAKE` syscalls. On macOS it uses `__ulock_wait`/`__ulock_wake`, and on Windows a manual‑reset `SRWLOCK`-backed event.
+- **`std.atomic.Queue`** is a Michael‑Scott lock‑free queue. Its head and tail are two `std.atomic.Value(usize)` pointers (actually `?*Node`). Producers CAS the tail pointer, consumers CAS the head pointer. The implementation is pure Zig, relying only on atomic loads/stores with appropriate memory orders (`.acquire`, `.release`, `.acq_rel`).
+
+Because these primitives do not allocate memory, they require no `Allocator`. Their `deinit` is either a no‑op (Mutex) or destroys the OS handle (Condition, ResetEvent). You can embed them directly in any struct, even those placed in static memory.
+
+---
+
+### 3. Why This Design?
+
+#### “No hidden control flow” applies to synchronization
+
+Zig’s primitives avoid magic. `lock()` is a regular function that returns `void`. There is no language‑level `synchronized` block, no automatic unlocking based on scope (like Java’s `synchronized` or Rust’s `MutexGuard`). You call `mtx.lock(); defer mtx.unlock();` explicitly. The programmer sees every acquire and release.
+
+This explicitness prevents several classes of errors:
+- **Accidental deadlocks** from implicit lock ordering in stack unwinding (no RAII means no surprise drops).
+- **Performance surprises**: a C++ `std::unique_lock` may unlock in a destructor that you didn’t realize was called early. In Zig, the `defer` is visible right next to the lock.
+- **Composability**: Because the unlock is explicit, you can interleave atomics and other operations without worrying about a hidden destructor releasing the lock prematurely.
+
+#### No built‑in channels or async runtime
+
+Zig does not ship a channel type or a coroutine‑based async runtime in the standard library (the historical async story has been deprioritized). Instead, Zig provides the OS‑level thread and synchronization primitives, trusting you—or a library—to build higher‑level abstractions on demand.
+
+This design reflects the Zig philosophy: **explicit is better than implicit**. Channels (like Go’s or Rust’s `mpsc`) embed a synchronization policy, a buffer strategy, and sometimes an allocator. They are not “free” abstractions. Zig forces you to decide exactly what your application needs and to pay only for that. When you need a channel, you build one (or pull in a third‑party package) using the same mutexes and condition variables you already understand.
+
+#### Error handling in concurrent code
+
+None of the synchronization primitives use error unions. `lock()`, `unlock()`, `wait()`, `signal()`, and `put()` are all infallible (`void` return). Why? Because low‑level synchronization failures (e.g., `futex` returning `EINVAL` because of a torn word) are always a programming bug, not a recoverable runtime condition. In Zig’s safety modes, these become panics; in `ReleaseFast` they are unchecked but still indicate programmer error. This keeps the API clean: you don’t have to `try` a lock acquisition.
+
+---
+
+### 4. Competing Approaches
+
+#### C (pthreads)
+
+Pthreads offers `pthread_mutex_t`, `pthread_cond_t`, and semaphores. The API is verbose, uses output parameters, and requires explicit `init`/`destroy`. Error handling is via return codes that are often ignored. Zig provides a much cleaner wrapper: `= .{}` for static init, `defer mtx.unlock()` patterns, and no need for manual error checking.
+
+Compared to C’s `pthread_join` on a per‑thread basis, Zig’s `WaitGroup` provides a higher‑level but still explicit mechanism for waiting on multiple threads without managing thread handles manually.
+
+#### C++ (std::mutex, std::condition_variable, std::latch, std::barrier)
+
+C++ has a rich threading library, but it relies heavily on RAII. `std::scoped_lock` / `std::lock_guard` unlock in destructors, which means the unlock point is tied to the lexical scope exit, including stack unwinding. Zig’s explicit `defer mtx.unlock()` makes the unlock point obvious and separates cleanup from control flow.
+
+C++ offers `std::counting_semaphore`, `std::binary_semaphore`, `std::latch`, and `std::barrier`. Zig’s stdlib provides WaitGroup (which is a latch) and ResetEvent (manual‑reset event). You can build a semaphore with a mutex and condition, or use the `std.Thread.Semaphore` wrapper on platforms that support it (though not as prominently featured). Zig opts to keep the stdlib small and encourages libraries for richer concurrency.
+
+#### Rust (std::sync::Mutex, crossbeam)
+
+Rust’s `std::sync::Mutex` wraps the data it protects. The lock method returns a `MutexGuard<T>`, which dereferences to `&mut T` and unlocks on `Drop`. This is safe and ergonomic, but it has a cost: the data must be stored inside the mutex. Zig’s `Mutex` is a separate object from the data it guards. This separation gives you more flexibility: you can protect multiple independent variables with the same mutex, or protect a field of a larger struct without moving it.
+
+Rust’s `crossbeam` provides channels that are more akin to Go’s, with select and buffering. Zig’s approach—no built‑in channels—is philosophically opposite: it trusts the programmer to choose the right tool, whether that be a simple `std.atomic.Queue` or a bespoke ring buffer.
+
+#### Go (goroutines and channels)
+
+Go’s mantra is “Do not communicate by sharing memory; instead, share memory by communicating.” Go provides goroutines and channels as language primitives. Zig does not have goroutines. Concurrency is explicit OS threads. Communication can be done via channels built in libraries, but Zig’s default stance is that sharing memory with well‑placed synchronization is often simpler and more performant for systems‑level problems. Zig gives you the tools to do both.
+
+---
+
+### 5. Common Mistakes
+
+- **Forgetting to re‑check the predicate after `cond.wait`.** In POSIX, spurious wakeups are allowed. Even on systems where they are rare, assuming the predicate is true after `wait` leads to subtle, hard‑to‑reproduce bugs. Always use a `while` loop.
+
+- **Calling `cond.wait` without holding the mutex.** This is undefined behavior in C and panics in Zig’s safe modes. Always lock the mutex before `wait`.
+
+- **Mismatched lock/unlock scope.** In Zig, `defer mtx.unlock()` at the top of a block is idiomatic, but it’s easy to forget that `defer` runs at the end of the *current* scope, not the function. If you enter a nested scope (like a loop or an `if`) and then use `defer` inside it, the unlock may happen earlier than intended. Carefully manage lock scoping.
+
+- **Using `WaitGroup.start` without a matching `finish`.** The `wait()` call will hang forever. Use `defer wg.finish()` immediately after `start` in the worker thread.
+
+- **Race conditions on predicates when using `ResetEvent`.** `ResetEvent` only tells you that the event was set at some point. If you need to consume the state that caused the event, you must protect that state with a separate mutex and not rely on the event alone for mutual exclusion. The event is just a signaling mechanism.
+
+- **Assuming `std.atomic.Queue` is allocation‑free.** The queue itself does not allocate, but it stores pointers to heap‑allocated nodes. If you forget to free nodes after `get`, you leak memory. Also, the queue does not provide any lifetime management; a node must remain alive until no thread holds a reference.
+
+- **Misusing `catch unreachable` with threads.** A thread spawned via `std.Thread.spawn` cannot propagate errors to the spawner. If you ignore the thread’s error union by using `catch unreachable` inside the thread function, you mask failures. Instead, capture the error and signal failure through a shared atomic or an error channel.
+
+---
+
+### 6. Performance Considerations
+
+#### Mutex scalability
+
+`std.Thread.Mutex` on Linux defaults to a `futex`‑based lock with no fairness guarantees. Under low contention it’s extremely fast: a lock/unlock pair is a few atomic operations. Under high contention, threads deschedule themselves via `FUTEX_WAIT`, which involves a context switch. Profiling with `perf` will show kernel time spent in `futex`.
+
+For read‑heavy workloads, consider building a read‑write lock using a mutex and condition, or a specialized lock‑free structure. Zig’s standard library does not yet ship an `RwLock` (though one may be added). You can use `std.atomic.Value` for simple cases.
+
+#### Condition variable overhead
+
+On Linux, a `pthread_cond_signal`/`broadcast` requires a system call (unless the waiter list is empty, in which case the kernel can optimize). The mutex is released and reacquired inside the `wait` call, adding further context‑switch potential. For high‑throughput signaling, consider using a lock‑free SPSC queue built on atomics.
+
+#### `ResetEvent` on Linux uses futex
+
+The `ResetEvent` implementation is essentially a futex word with a manual‑reset semantic. `set()` writes a value and wakes all waiters with `FUTEX_WAKE`. `wait()` uses `FUTEX_WAIT` if the value indicates the event is not set. This is very lightweight, but broadcasting to many waiters can thundering‑herd the threads, all of which will contend on whatever shared resource they protect after waking.
+
+#### Lock‑free queue performance
+
+`std.atomic.Queue` (Michael‑Scott queue) has excellent scalability when producers and consumers are balanced. However, it is a linked‑list‑based queue, so each element requires a separate allocation, which can be a bottleneck. Throughput is typically limited by the allocator. The atomic CAS on the tail pointer can cause contention under many producers. For many‑producer/many‑consumer scenarios with high throughput, consider a bounded array‑based queue (ring buffer) with atomics.
+
+#### Detecting races with ThreadSanitizer
+
+Zig supports ThreadSanitizer (TSan) via `-fsanitize-thread`. When enabled, every memory access is instrumented to detect data races. This slows execution (2x–5x) and increases memory usage, but catches races that would otherwise slip into production. To enable:
+
+```zig
+// In build.zig:
+exe.linkLibC();
+exe.sanitize_thread = true;
+```
+
+During testing and CI, run your concurrent tests with TSan to detect unprotected access to shared mutable state.
+
+---
+
+### 7. Best Practices
+
+- **Lock scope minimality.** Hold a mutex for as short a time as possible. If you must perform I/O or allocation under a lock, consider deferring that work to outside the critical section using a local copy of the data.
+
+- **Prefer atomics for simple shared state.** A single integer counter that is just incremented/decremented is better served by `std.atomic.Value(u64).fetchAdd(1, .monotonic)` than by a mutex.
+
+- **Use `WaitGroup` to track task completion, not thread lifetimes.** You can keep a thread alive and reuse it across multiple work items; the WaitGroup merely tells you when a batch of work is done.
+
+- **For pipelines, consider lock‑free structures.** If you have a producer‑consumer pattern, `std.atomic.Queue` or a bespoke ring buffer can outperform mutex‑based queues. Use `std.atomic.Stack` (Treiber stack) for LIFO work-stealing.
+
+- **Always pair `start` and `finish` with `defer`.** This ensures the WaitGroup counter is decremented even on early returns or errors.
+
+- **Never hold a mutex across a `cond.wait`.** You pass the mutex to `wait` so it can be released atomically. There’s no need to unlock manually before calling `wait`.
+
+- **When building channels, document the buffering policy.** If you implement a bounded channel, make the capacity a comptime parameter to enable stack‑based storage or to control memory footprint.
+
+- **Enable ThreadSanitizer during development.** Run your test suite with `-fsanitize-thread` and check for races before shipping.
+
+---
+
+### 8. Examples
+
+#### Example 1: Worker pool with WaitGroup and Mutex
+
+```zig
+const std = @import("std");
+
+const Task = struct {
+    id: u32,
+};
+
+const WorkerPool = struct {
+    allocator: std.mem.Allocator,
+    mutex: std.Thread.Mutex,
+    tasks: std.ArrayList(Task),
+    wg: std.Thread.WaitGroup,
+
+    fn init(allocator: std.mem.Allocator) WorkerPool {
+        return .{
+            .allocator = allocator,
+            .mutex = .{},
+            .tasks = std.ArrayList(Task).init(allocator),
+            .wg = .{},
+        };
+    }
+
+    fn deinit(self: *WorkerPool) void {
+        self.tasks.deinit();
+    }
+
+    fn addTask(self: *WorkerPool, task: Task) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.tasks.append(task);
+    }
+
+    fn runWorker(self: *WorkerPool) void {
+        self.wg.start();
+        defer self.wg.finish();
+
+        while (true) {
+            self.mutex.lock();
+            if (self.tasks.items.len == 0) {
+                self.mutex.unlock();
+                break;
+            }
+            const task = self.tasks.pop() orelse unreachable;
+            self.mutex.unlock();
+
+            // Simulate work
+            std.time.sleep(10 * std.time.ns_per_ms);
+        }
+    }
+
+    fn wait(self: *WorkerPool) void {
+        self.wg.wait();
+    }
+};
+
+test "worker pool" {
+    var pool = WorkerPool.init(std.testing.allocator);
+    defer pool.deinit();
+
+    try pool.addTask(.{ .id = 1 });
+    try pool.addTask(.{ .id = 2 });
+
+    const thread = try std.Thread.spawn(.{}, WorkerPool.runWorker, .{&pool});
+    pool.wait(); // wait for worker to drain tasks
+    thread.join();
+
+    // No tasks remain
+    pool.mutex.lock();
+    defer pool.mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 0), pool.tasks.items.len);
+}
+```
+
+#### Example 2: Signal shutdown with ResetEvent
+
+```zig
+const std = @import("std");
+
+fn run(event: *std.Thread.ResetEvent, id: u32) void {
+    std.log.info("worker {d} waiting for start", .{id});
+    event.wait();
+    std.log.info("worker {d} running", .{id});
+}
+
+test "ResetEvent broadcast" {
+    var event: std.Thread.ResetEvent = .{};
+
+    const t1 = try std.Thread.spawn(.{}, run, .{ &event, 1 });
+    const t2 = try std.Thread.spawn(.{}, run, .{ &event, 2 });
+
+    std.time.sleep(100 * std.time.ns_per_ms);
+    event.set();
+
+    t1.join();
+    t2.join();
+}
+```
+
+#### Example 3: Lock‑free multi‑producer, multi‑consumer queue
+
+```zig
+const std = @import("std");
+
+const Message = struct {
+    data: i32,
+    next: ?*Message = null,
+};
+
+test "atomic queue MP/MC" {
+    const allocator = std.testing.allocator;
+    var queue: std.atomic.Queue(Message) = .{};
+
+    // Two producers
+    const p1 = try std.Thread.spawn(.{}, struct {
+        fn f(q: *std.atomic.Queue(Message), alloc: std.mem.Allocator) void {
+            for (0..5) |i| {
+                const msg = alloc.create(Message) catch unreachable;
+                msg.data = @intCast(i);
+                msg.next = null;
+                q.put(msg);
+            }
+        }
+    }.f, .{ &queue, allocator });
+
+    const p2 = try std.Thread.spawn(.{}, struct {
+        fn f(q: *std.atomic.Queue(Message), alloc: std.mem.Allocator) void {
+            for (5..10) |i| {
+                const msg = alloc.create(Message) catch unreachable;
+                msg.data = @intCast(i);
+                msg.next = null;
+                q.put(msg);
+            }
+        }
+    }.f, .{ &queue, allocator });
+
+    p1.join();
+    p2.join();
+
+    // One consumer collects all messages
+    var count: u32 = 0;
+    while (queue.get()) |msg| {
+        count += 1;
+        allocator.destroy(msg);
+    }
+
+    try std.testing.expectEqual(@as(u32, 10), count);
+}
+```
+
+---
+
+### 9. Summary & Exercises
+
+In this chapter we explored Zig’s synchronization toolbox: `Mutex`, `Condition`, `WaitGroup`, `ResetEvent`, and `std.atomic.Queue`. These primitives map directly onto OS‑level constructs, exposing no hidden control flow, no implicit unlock, and no forced allocation. Their APIs are simple, infallible, and composable.
+
+Zig consciously does not provide a built‑in channel or goroutine abstraction. Instead, it gives you the building blocks to construct exactly the synchronization you need—whether that’s a lock‑free queue, a bounded ring buffer, or a CSP‑style channel.
+
+**Exercises:**
+
+1. **Build a semaphore.** Implement a counting semaphore using a `Mutex` and a `Condition`. It should support `acquire()` (decrement, block if count is zero) and `release()` (increment, wake one waiter). Add a `timedAcquire(ns)` that returns an error if the timeout expires. Write a test with multiple threads contending on the semaphore.
+
+2. **Write a lock‑free MPSC (multi‑producer, single‑consumer) queue.** Unlike `std.atomic.Queue`, a single consumer can avoid CAS on the consumer side. Design a node‑based queue with a single consumer and multiple producers, using atomic operations. Benchmark it against `std.atomic.Queue` for varying producer counts.
+
+3. **Detect a data race intentionally.** Write a small program where two threads increment a shared `u64` without synchronization. Run the program under ThreadSanitizer (`-fsanitize-thread`) and observe the race report. Then fix the race using either a mutex or an `std.atomic.Value`. Confirm TSan reports clean.
+
+4. **Implement a bounded channel with backpressure.** Design a channel with a fixed‑size buffer that blocks senders when full and blocks receivers when empty. Use `Mutex` and `Condition` internally, and provide `send()` and `receive()` methods. Measure throughput and compare with a simple lock‑free ring buffer for high‑contention scenarios.

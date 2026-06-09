@@ -1,0 +1,347 @@
+## Chapter 26: Async I/O and Event Loops (When Needed)
+
+### 1. Basic Usage
+
+Zig’s approach to asynchronous I/O begins with a single, explicit building block: **`std.event.Loop`**. The standard library provides this event loop as a cross-platform reactor that abstracts over `epoll` on Linux, `kqueue` on macOS and the BSDs, and IOCP on Windows. There is no language-level `async`/`await`; concurrency is achieved through callbacks, state machines, or – if you prefer – any third‑party library that builds coroutines on top. This section shows how to instantiate the loop, register file descriptors, and drive it.
+
+**A Minimal Echo Server Using `std.event.Loop`**
+
+The pattern: create a `Loop`, open a listening socket, register it for readability, and define a callback that accepts a new connection, registers the client’s file descriptor, and processes data. All allocation is explicit, and the event loop calls your functions when events occur.
+
+```zig
+const std = @import("std");
+
+pub const log = std.log.scoped(.echo);
+
+const ClientState = struct {
+    fd: std.posix.socket_t,
+    buf: [1024]u8 = undefined,
+    read_len: usize = 0,
+};
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // 1. Create the event loop.
+    var loop = try std.event.Loop.init(allocator);
+    defer loop.deinit();
+
+    // 2. Set up the listening socket.
+    const listen_addr = try std.net.Address.parseIp4("127.0.0.1", 8080);
+    const listen_socket = try std.posix.socket(
+        listen_addr.any.family,
+        std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK,
+        0,
+    );
+    defer std.posix.close(listen_socket);
+    try std.posix.bind(listen_socket, &listen_addr.any, listen_addr.getOsSockLen());
+    try std.posix.listen(listen_socket, 128);
+
+    // 3. Register the listening socket for incoming connections.
+    // The callback receives the fd and a user‑provided context pointer.
+    _ = try loop.addFd(allocator, listen_socket, .{
+        .callback = &acceptCallback,
+        .ctx = @constCast(@ptrCast(&loop)), // we pass the loop itself
+        .kind = .read,
+    });
+    // The user data stored inside Loop internally is managed by the loop.
+
+    // 4. Run the loop – will not return until loop.stop() is called.
+    try loop.run();
+}
+
+fn acceptCallback(loop_ptr: *anyopaque, fd: std.posix.socket_t, result: std.event.Loop.AddFdResult) void {
+    const loop: *std.event.Loop = @alignCast(@ptrCast(loop_ptr));
+    if (result != .ok) {
+        log.err("accept error: {}", .{result});
+        return;
+    }
+    // Accept the connection (non‑blocking socket, so it won't block here
+    // because the fd was signalled readable).
+    const conn_fd = std.posix.accept(fd, null, null, std.posix.SOCK.NONBLOCK) catch |err| {
+        log.err("accept failed: {}", .{err});
+        return;
+    };
+    // Allocate state for this client – in a real server you'd use a pool or arena.
+    const client = loop.allocator.create(ClientState) catch |err| {
+        log.err("oom for client: {}", .{err});
+        std.posix.close(conn_fd);
+        return;
+    };
+    client.* = .{ .fd = conn_fd };
+    // Register client socket for reads.
+    loop.addFd(loop.allocator, conn_fd, .{
+        .callback = &clientReadCallback,
+        .ctx = client,
+        .kind = .read,
+    }) catch |err| {
+        log.err("failed to add client fd: {}", .{err});
+        loop.allocator.destroy(client);
+        std.posix.close(conn_fd);
+    };
+}
+
+fn clientReadCallback(client_ptr: *anyopaque, fd: std.posix.socket_t, result: std.event.Loop.AddFdResult) void {
+    const client: *ClientState = @alignCast(@ptrCast(client_ptr));
+    if (result != .ok) {
+        // Error or EOF – close client.
+        client.closeAndDestroy();
+        return;
+    }
+    // Read from the non‑blocking socket.
+    const n = std.posix.read(fd, &client.buf) catch |err| {
+        if (err != error.WouldBlock) {
+            client.closeAndDestroy();
+            return;
+        }
+        // Spurious wake‑up, just re‑register (loop will re‑arm automatically if level‑triggered).
+        // In practice, you'd use edge‑triggered and handle WouldBlock.
+        return;
+    };
+    if (n == 0) {
+        // EOF.
+        client.closeAndDestroy();
+        return;
+    }
+    client.read_len = n;
+    // Switch to write interest.
+    client.deregisterAndReregister(.write) catch {
+        client.closeAndDestroy();
+    };
+}
+```
+
+Some helper methods on `ClientState` are omitted for brevity; they would involve removing the fd from the loop and closing it. The key points: the loop drives I/O multiplexing, callbacks receive a raw context pointer, and all resource management remains explicit.
+
+### 2. Under the Hood
+
+`std.event.Loop` is not a black‑box runtime; it is a thin, platform‑optimised wrapper around the operating system’s I/O multiplexing facility.
+
+- **Linux `epoll` / `io_uring`**: On Linux, the loop prefers `io_uring` when available (kernel ≥5.1), falling back to `epoll`. `io_uring` offers a submission/completion queue model that reduces syscall overhead and enables true asynchronous disk I/O without threads. Internally, `Loop` maintains a ring buffer of submission queue entries (`SQEs`) and reaps completion queue entries (`CQEs`). When you call `loop.addFd`, it translates to an `IORING_OP_POLL_ADD` operation. Timer support uses `IORING_OP_TIMEOUT`.
+- **macOS / BSD `kqueue`**: On these systems, `Loop` uses `kqueue` with `EVFILT_READ`, `EVFILT_WRITE`, and `EVFILT_TIMER`. The kevent structure is built directly, and the loop calls `kevent` in a tight fashion.
+- **Windows IOCP**: Overlapped I/O is used; `Loop` bridges the gap by associating sockets with an I/O completion port and posting asynchronous `WSARecv`/`WSASend` operations. The callback model remains identical across platforms.
+
+Under the hood of a single `loop.run()` iteration:
+
+1. The loop gathers all pending timer expirations into a sorted list and computes the minimum timeout.
+2. It calls the OS multiplexer (`epoll_wait`, `kevent`, `GetQueuedCompletionStatusEx`) with that timeout, retrieving a batch of ready events.
+3. For each event, it invokes the user‑registered callback, passing the context pointer and a result enum.
+4. If a callback adds or removes file descriptors, these mutations are queued and applied at the end of the iteration to avoid iterator invalidation.
+
+The loop itself **does no allocation during `run()`** except for internal buffers pre‑allocated at `init()`. User callbacks may allocate, but that is entirely under your control. This design makes it suitable for hard real‑time systems where predictable latency matters.
+
+### 3. Why This Design?
+
+Zig deliberately **defers asynchronous runtime design to libraries**. There is no `async`/`await` syntax, no built‑in task scheduler, and no hidden suspension points. This choice follows the central pillar: **No Hidden Control Flow**.
+
+- **Explicit suspension**: In languages like JavaScript, Python, or Rust, an `await` keyword causes the function to yield, spawning a state machine that the compiler generates. This introduces hidden allocations, type‑erased futures, and the infamous “function coloring” problem – a function that calls `await` becomes inherently different from one that does not. Zig rejects this. Instead, any function can be used in an event‑driven style simply by accepting a callback parameter or by manually storing a state machine. There is no distinction between “async functions” and “normal functions.”
+- **No global runtime**: Zig does not force a single async executor onto every program. Whether you use `std.event.Loop`, `libxev`, or a hand‑rolled `epoll` loop, it is your decision. A CLI tool that never touches the network pays zero cost for an event loop.
+- **Comptime‑driven customisation**: Because the event loop is just a library, you can use comptime to configure it for your workload. For example, you can select the multiplexing backend at compile time, inline callback handling for critical paths, or generate specialised request‑handling state machines that avoid dynamic dispatch.
+
+The philosophy is: **the language gives you the raw materials – non‑blocking I/O, threads, atomics – and you assemble the concurrency model that fits your problem**. This is the same principle that guides memory allocation and error handling.
+
+### 4. Competing Approaches
+
+**C / POSIX**: The classic approach is `select`, `poll`, `epoll`, or `kqueue` used directly with function pointers (`libevent`, `libev`, `libuv`). Zig’s `std.event.Loop` mirrors this model closely, but with type‑safe callbacks, no `void*` gymnastics (thanks to `*anyopaque` and comptime), and automatic platform selection. The result is less boilerplate and fewer footguns.
+
+**C++ / Boost.Asio**: Asio offers a proactor pattern where completion handlers are posted to an `io_context`. It heavily uses templates and inheritance for extensibility. Zig’s approach is simpler: one concrete `Loop` type, one callback type, no virtual dispatch. You compose behaviour by embedding state in context structs rather than chaining asynchronous operations with `async_result`.
+
+**Rust / tokio**: Tokio provides a work‑stealing scheduler, `async`/`await` syntax, and a rich ecosystem. The hidden control flow is substantial: an `async fn` compiles into a state machine that may be moved across threads, allocations happen inside the runtime, and tasks are spawned onto a global reactor. Zig’s explicit callback model avoids all of this. The trade‑off is more manual effort to write non‑blocking state machines, but you gain deterministic control over memory and scheduling. When you need maximum throughput with minimal overhead, the extra code is often worth it.
+
+**Go**: Go’s goroutines are virtual threads multiplexed onto OS threads, with a built‑in network poller. I/O appears blocking, but the runtime transparently parks and resumes goroutines. This is extremely productive but hides the scheduling decisions, stack growth, and garbage collection pauses. Zig’s philosophy considers this hidden complexity unacceptable for systems where every microsecond matters. Zig gives you OS threads and explicit event loops; you decide when to block and when to multiplex.
+
+**Python / asyncio**: The event loop is the standard, but it relies on coroutines, `await`, and a global loop per thread. Zig’s loop is a plain value, not a global singleton, making testing and embedding trivial.
+
+### 5. Common Mistakes
+
+**1. Blocking inside an event callback**
+The event loop runs on a single thread. If a callback performs a blocking operation – a file read, a DNS lookup, or even a long CPU‑bound computation – it starves all other connections. Never call `std.posix.read` on a blocking socket, never call a function that internally calls `std.Thread.Futex.wait` without yielding, and never perform a synchronous `std.http.Client` request inside a callback. Offload blocking work to a dedicated thread or use non‑blocking equivalents.
+
+**2. Forgetting to re‑arm one‑shot events**
+Some loop configurations use edge‑triggered (`EPOLLET`) or one‑shot notification. If you fail to re‑register the file descriptor after each event, the loop will never notify you again, and the connection stalls. Use level‑triggered mode if you prefer simplicity, and always test for `error.WouldBlock` after reads.
+
+**3. Memory lifetime of context pointers**
+The `ctx` passed to `loop.addFd` must remain valid until the file descriptor is deregistered and no pending callback can fire. A common bug is storing the context on the stack of a function that returns before the event fires. Always allocate context on the heap (or a pool) and free it only after the fd is removed from the loop and the callback will not be invoked.
+
+**4. Misunderstanding `loop.stop()` vs. `loop.run()` exit**
+Calling `loop.stop()` enqueues a stop request; the loop processes all remaining readiness notifications before returning from `run()`. Callbacks that fire after `stop()` can still run. If you deinitialize resources immediately after `loop.run()` returns, you risk use‑after‑free. Use a reference count or a shutdown flag.
+
+**5. Over‑engineering with event loops**
+Not every program needs an event loop. If you handle only a few dozen concurrent connections, a simple thread‑per‑connection model with blocking I/O is often simpler, safer, and performs perfectly well. Zig’s explicit threading makes this approach straightforward. Reserve event loops for high‑concurrency servers (tens of thousands of connections) where thread stack memory becomes prohibitive.
+
+### 6. Performance Considerations
+
+The event loop’s core advantage is **reducing context switches** and **memory overhead**. With `epoll` or `io_uring`, a single thread can manage 100,000 idle connections using just a few kilobytes of state each, whereas 100,000 OS threads would consume gigabytes of stack space and thrash the scheduler.
+
+- **`io_uring` vs. `epoll`**: On modern Linux, `io_uring` can deliver up to 20% higher throughput for high‑message‑rate workloads because it batches system calls and avoids the overhead of re‑arming file descriptors. Use `std.event.Loop` with the default backend; it will automatically select `io_uring` when available.
+- **Zero‑copy I/O**: Pair the loop with fixed‑buffer pools allocated at startup. For each connection, pre‑register a buffer with `io_uring` (`IORING_REGISTER_BUFFERS`) and perform reads directly into those buffers, eliminating per‑packet allocation. While `std.event.Loop` does not expose this directly, the underlying `std.os.linux.IO_Uring` API does.
+- **Batching events**: In high‑throughput scenarios, process multiple events per `run()` iteration before yielding to the OS. The loop returns a batch of events; a well‑designed server handles all ready connections before going back to sleep, amortising the cost of the `epoll_wait` system call.
+- **CPU cache locality**: Because all connection state is stored in the same thread’s data structures, the working set fits in L2/L3 cache more easily than in a thread‑per‑connection design, where context switching constantly evicts caches.
+- **Cost of callbacks**: Indirect function calls (callback pointers) can cause branch‑mispredictions in hot loops. To mitigate this, you can use a **state machine** approach where the event loop returns the event to a higher‑level dispatcher that uses a `switch` on connection state (a single indirect jump). Libraries like `zig-network/xev` provide zero‑callback, push‑based APIs for this reason.
+
+**Benchmark reality**: A simple echo server using `std.event.Loop` on Linux with `io_uring` can saturate a 10 Gbps link with messages as small as 64 bytes, while a thread‑per‑connection server begins to degrade at around 5,000 concurrent connections due to scheduling overhead. The crossover point varies, but for >10k connections, an event loop is strongly advised.
+
+### 7. Best Practices
+
+- **Use `std.event.Loop` as a foundation, not a framework.** Do not attempt to build a generic, one‑size‑fits‑all async runtime unless you truly need it. Directly integrate the loop with your protocol logic.
+- **Design non‑blocking state machines.** Instead of chaining callbacks ad‑infinitum, represent each connection as a finite state machine (e.g., `recv_header`, `recv_body`, `send_response`). The event loop delivers an “fd ready” signal; a central `process` function uses a `switch` on the state to perform the next I/O operation and transition to the next state. This avoids callback spaghetti and makes reasoning about flow straightforward.
+- **Arena allocation per request.** Allocate a temporary arena at the start of a request, use it for all parsing and buffering, and free it in one operation when the request completes. Pass the arena to callbacks as part of the context.
+- **Explicit thread pool for CPU or blocking work.** Reserve the event loop thread for I/O multiplexing only. Use `std.Thread` or a custom thread pool to offload heavy computations, disk I/O (if not using `io_uring`), or synchronous DNS resolution. Communicate results back to the event loop via a lock‑free queue or an `eventfd`.
+- **Never call `loop.run()` on the main thread if you need a responsive shutdown.** Run the loop in its own thread so that the main thread can call `loop.stop()` from a signal handler or control channel.
+- **Use timer coalescing.** If many connections need idle timeouts, maintain a single timer per loop that fires at the earliest deadline, then expire stale connections in bulk. `std.event.Loop` already coalesces timers internally, but avoiding thousands of individual timers reduces overhead.
+- **Respect `error.WouldBlock`.** Always handle `WouldBlock` on non‑blocking reads/writes by returning to the event loop instead of spinning. The loop will notify you again when the fd is ready.
+
+### 8. Examples
+
+**Echo Server with State Machines and Timer‑Based Idle Timeout**
+
+The following code demonstrates a production‑oriented approach: each connection is a state machine, allocations are pre‑allocated in a pool, and an idle timer disconnects inactive clients. The example compiles with `zig build-exe` on Zig 0.13.
+
+```zig
+const std = @import("std");
+const log = std.log.scoped(.echo_sm);
+
+const MAX_CLIENTS = 1024;
+const IDLE_SECONDS = 30;
+
+const Client = struct {
+    fd: std.posix.socket_t,
+    state: enum { recv, send, closing },
+    buf: [1024]u8,
+    len: usize,
+    last_active: i64, // monotonic timestamp
+};
+
+const Server = struct {
+    loop: *std.event.Loop,
+    allocator: std.mem.Allocator,
+    clients: [MAX_CLIENTS]?Client,
+    num_clients: usize,
+
+    fn addClient(self: *Server, fd: std.posix.socket_t) !void {
+        if (self.num_clients >= MAX_CLIENTS) return error.TooManyClients;
+        const idx = self.num_clients;
+        self.clients[idx] = Client{
+            .fd = fd,
+            .state = .recv,
+            .buf = undefined,
+            .len = 0,
+            .last_active = std.time.milliTimestamp(),
+        };
+        self.num_clients += 1;
+        try self.loop.addFd(self.allocator, fd, .{
+            .callback = &onClientEvent,
+            .ctx = &self.clients[idx].?,
+            .kind = .read,
+        });
+    }
+
+    fn process(self: *Server, client: *Client, revents: std.event.Loop.AddFdResult) void {
+        if (revents != .ok) {
+            client.state = .closing;
+        }
+        switch (client.state) {
+            .recv => {
+                const n = std.posix.read(client.fd, &client.buf) catch |err| {
+                    if (err != error.WouldBlock) client.state = .closing;
+                    return;
+                };
+                if (n == 0) {
+                    client.state = .closing;
+                    return;
+                }
+                client.len = n;
+                client.last_active = std.time.milliTimestamp();
+                // Switch to send.
+                client.state = .send;
+                self.loop.modFd(client.fd, .{ .kind = .write }) catch {
+                    client.state = .closing;
+                };
+            },
+            .send => {
+                const n = std.posix.write(client.fd, client.buf[0..client.len]) catch |err| {
+                    if (err != error.WouldBlock) client.state = .closing;
+                    return;
+                };
+                if (n < client.len) {
+                    // Partial write; advance buffer and try again.
+                    std.mem.copyBackwards(u8, &client.buf, client.buf[n..client.len]);
+                    client.len -= n;
+                    // Stay in send state; the loop will re‑notify when writable.
+                } else {
+                    client.state = .recv;
+                    self.loop.modFd(client.fd, .{ .kind = .read }) catch {
+                        client.state = .closing;
+                    };
+                }
+            },
+            .closing => {
+                self.loop.removeFd(client.fd);
+                std.posix.close(client.fd);
+                // Compact client array (lazy removal).
+                client.* = undefined; // mark as empty
+            },
+        }
+    }
+};
+
+fn onClientEvent(ctx: *anyopaque, fd: std.posix.socket_t, result: std.event.Loop.AddFdResult) void {
+    _ = fd;
+    const client: *Client = @alignCast(@ptrCast(ctx));
+    // A real implementation would retrieve the Server pointer from a global or closure.
+    // For brevity, we assume a singleton server.
+    // server.process(client, result);
+}
+```
+
+**Self‑Contained Test**
+
+Since an event loop requires an OS multiplexer, testing it is best done with a simple timeout callback:
+
+```zig
+test "std.event.Loop timer" {
+    const allocator = std.testing.allocator;
+    var loop = try std.event.Loop.init(allocator);
+    defer loop.deinit();
+
+    var fired: bool = false;
+    _ = try loop.timer(
+        10, // milliseconds
+        struct {
+            fn callback(ctx: *anyopaque) void {
+                const ptr: *bool = @alignCast(@ptrCast(ctx));
+                ptr.* = true;
+            }
+        }.callback,
+        &fired,
+    );
+
+    // Run the loop but stop it from another thread after a short delay.
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn run(l: *std.event.Loop) void {
+            std.time.sleep(50 * std.time.ns_per_ms);
+            l.stop();
+        }
+    }.run, .{&loop});
+    try loop.run();
+    thread.join();
+
+    try std.testing.expect(fired);
+}
+```
+
+### 9. Summary & Exercises
+
+Zig’s stance on asynchronous I/O is a direct consequence of its “no hidden control flow” philosophy. By refusing to bake a runtime or `async`/`await` into the language, Zig keeps functions uncolored, memory allocation visible, and scheduling under your command. The standard library’s `std.event.Loop` gives you a portable, efficient multiplexer that can serve as the core of a high‑performance server, while leaving room for domain‑specific customisation.
+
+The take‑home: use event loops only when the problem demands high concurrency with minimal resource overhead. For moderate loads, a straightforward thread‑per‑connection model is often more maintainable. When you do reach for an event loop, embrace explicit state machines, pre‑allocation, and off‑loading of blocking work.
+
+**Exercises:**
+
+1. **Fixed buffer pool**: Extend the echo server to use a pool of pre‑allocated buffers (e.g., 4096 slots of 4 KiB each) instead of embedding the buffer in `Client`. Ensure that buffers are returned to the pool when a connection closes. Measure the throughput difference with `perf` or `zig build-exe -Drelease-fast`.
+
+2. **HTTP/1.0 file server**: Using `std.event.Loop`, build a minimal HTTP/1.0 server that serves static files from a directory. Implement parsing of the request line, handling of `GET`, and correct connection closing after the response. Use a state machine per connection. Handle `error.WouldBlock` correctly and avoid copying the file content into an intermediate buffer (use `sendfile` on Linux via `std.os.linux.sendfile`).
+
+3. **Evaluate `libxev`**: Port the echo server to the community `libxev` library (a high‑level, zero‑callback event loop). Compare the API ergonomics, performance under `wrk` benchmarking, and binary size. Discuss which parts of Zig’s philosophy `libxev` aligns with and where it introduces hidden control flow (if any).

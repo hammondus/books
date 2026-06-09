@@ -1,0 +1,526 @@
+## Chapter 19: Debugging and Safety Modes
+
+Zig’s approach to debugging and safety flips the C model on its head. Where C gives you undefined behavior and optional tools like `-fsanitize=address`, Zig builds safety checks directly into the language, then gives you surgical control over them through **build modes** and `@setRuntimeSafety`. This chapter covers how to leverage these tools to catch bugs early, ship confidently, and—when necessary—strip away safety for maximum speed.
+
+---
+
+### 1. Basic Usage
+
+#### Build Modes at a Glance
+
+Zig provides four standard build modes, controlled via `-O` (optimization) flags or the build system:
+
+| Mode | `-O` flag | Safety Checks | Optimization Level | Use Case |
+|------|-----------|---------------|--------------------|-----------|
+| Debug | `-ODebug` (default) | Full | None | Development, iteration |
+| ReleaseSafe | `-OReleaseSafe` | Full | High (speed) | Production binaries where safety matters |
+| ReleaseFast | `-OReleaseFast` | None | Aggressive | Performance-critical production |
+| ReleaseSmall | `-OReleaseSmall` | None | Size-focused | Embedded, WASM, constrained environments |
+
+**From the command line:**
+```bash
+zig build-exe main.zig -OReleaseSafe
+zig build-exe main.zig -OReleaseFast --strip  # strip debug symbols
+```
+
+**In `build.zig`:**
+```zig
+const exe = b.addExecutable(.{
+    .name = "myapp",
+    .root_source_file = b.path("src/main.zig"),
+    .target = target,
+    .optimize = .ReleaseSafe,  // or .Debug, .ReleaseFast, .ReleaseSmall
+});
+```
+
+#### Runtime Safety in Action
+
+When safety checks are enabled, Zig inserts runtime guards that panic (with a stack trace) on:
+- Out‑of‑bounds slice/array access
+- Integer overflow (in all operators except `%` wraparound variants)
+- `@intCast` truncation that loses data
+- `@ptrCast` with invalid alignment
+- Unwrapping an `null` optional (`.?` or `orelse unreachable`)
+- Unwrapping an `error` union without `catch`/`try` in a context expecting payload
+- Division by zero
+- Shift amount ≥ bit width
+- `@enumFromInt` with invalid integer
+
+**Example: intentional panic**
+```zig
+const std = @import("std");
+
+pub fn main() void {
+    var arr = [3]u8{ 10, 20, 30 };
+    arr[3] = 99;  // safety: index out of bounds
+}
+```
+Run with `zig build-exe main.zig -ODebug` → runtime panic with file/line.
+
+#### Debugging Output
+
+**`std.debug.print`** – raw, unbuffered, writes to stderr (or via OS-specific mechanism). Use for quick tracing:
+```zig
+std.debug.print("value = {d}\n", .{x});
+```
+
+**`std.log`** – structured, level‑based logging. Scoped to modules:
+```zig
+const log = std.log.scoped(.network);
+
+pub fn connect() void {
+    log.info("connecting to {}", .{"127.0.0.1:8080"});
+    log.debug("socket fd = {d}", .{fd});  // only shown if log level allows
+}
+```
+Set log level at compile time: `-Dlog-level=debug`. Default levels: `err`, `warn`, `info`, `debug`.
+
+**`std.debug.assert`** – conditional panic, disabled when runtime safety is off:
+```zig
+std.debug.assert(ptr != null);  // check invariant
+```
+
+#### Runtime Safety Toggle
+
+Use `@setRuntimeSafety(bool, scope)` to enable/disable safety checks in a block:
+```zig
+pub fn sum(slice: []u32) u32 {
+    var total: u32 = 0;
+    @setRuntimeSafety(false, .{
+        // No bounds checks inside this block
+        for (slice) |x| total += x;
+    });
+    return total;
+}
+```
+The `scope` argument can be `.block` (enclosing block) or `.function` (entire function). Be extremely careful with this function.
+
+---
+
+### 2. Under the Hood
+
+#### How Safety Checks Are Implemented
+
+For every operation that can fail, the Zig compiler injects a conditional branch that checks the validity condition. For example, slice indexing `slice[i]` becomes something like (conceptually):
+
+```zig
+if (@inComptime() or !@runtimeSafety()) {
+    // use raw pointer arithmetic
+} else if (i >= slice.len) {
+    panic("index out of bounds: {} >= {}", .{i, slice.len});
+} else {
+    // safe access
+}
+```
+
+These checks are **not** part of the Zig source AST; they are inserted during the AstGen → ZIR → Sema → LLVM IR pipeline. The `@setRuntimeSafety` builtin instructs the compiler to omit them in the given scope.
+
+**Integer overflow example**: addition `a + b` becomes:
+```zig
+if (!@runtimeSafety()) {
+    return a +% b;  // wraparound using LLVM’s `add nuw` is disabled
+} else {
+    const result = a +% b;
+    if (@bitCast(u1, @overflowFlag())) {  // pseudo: actual mechanism varies by target
+        panic("integer overflow");
+    }
+    return result;
+}
+```
+The actual implementation uses LLVM’s `llvm.sadd.with.overflow` intrinsic (or target‑specific overflow detection) to avoid double computation.
+
+#### Build Mode Internals
+
+- **Debug**: `-O0`, no LLVM optimizations, full safety, debug info (`-g`), stack frames intact.
+- **ReleaseSafe**: `-O2` or `-O3`, full safety, debug info by default (can be stripped).
+- **ReleaseFast**: `-O3`, `-DNDEBUG` equivalent, no safety, may enable fast‑math flags.
+- **ReleaseSmall**: `-Oz` (aggressive size optimization), no safety, often combined with `-fstrip`.
+
+The compiler also injects different LLVM attributes: `"noalias"`, `"nosanitize"`, etc., depending on mode.
+
+#### Interaction with Debug Info
+
+Zig emits DWARF (on ELF/Mach-O) or CodeView (on COFF) when debug info is enabled. This happens automatically in Debug and ReleaseSafe (unless overridden). Use `--strip` to remove symbols from the final binary. Stack traces produced by panics rely on debug info to resolve symbol names; without it, you see raw addresses.
+
+---
+
+### 3. Why This Design?
+
+#### Safety as a Default, Not an Add‑On
+
+In C, safety is external: `-fsanitize=address`, `valgrind`, static analyzers. Developers must remember to enable them, and they often slow execution to a crawl. In Zig, **safety is part of the language semantics**—every build produces a binary that either checks (and panics) or assumes correctness (and may exhibit UB). There is no “maybe undefined” limbo.
+
+#### Per‑Scope, Not Per‑Project
+
+Unlike Rust’s `unsafe` (which marks a whole block as allowing certain operations), Zig lets you flip safety on/off arbitrarily. This allows:
+- Keep safety on globally, disable it inside a hot loop after manual verification.
+- Enable safety in release builds for critical modules, disable for well‑tested data paths.
+
+The philosophy: **the programmer knows best where to trade safety for speed**, and Zig provides the scalpel, not the chainsaw.
+
+#### No Hidden Control Flow
+
+Even with safety checks, Zig maintains “no hidden control flow” at the semantic level. A safety check is **not** a hidden allocation, destructor call, or exception unwind. It’s a predictable conditional branch that leads to a panic—which is just an abrupt termination. You can reason locally about performance: a bounds check adds O(1) work. There is no global unwinding table or stack walk except at panic time.
+
+#### Build Modes Reflect Real‑World Needs
+
+Four distinct modes map to the four common phases of software:
+- **Development**: fast iteration, catch bugs early (Debug).
+- **Pre‑release testing**: keep safety but with realistic performance (ReleaseSafe).
+- **Performance tuning**: measure, then decide where to add back safety (ReleaseFast).
+- **Embedded/size‑limited**: often no safety due to ROM constraints (ReleaseSmall).
+
+This separation avoids the “debug vs release” dichotomy that forces you to choose between safety and speed.
+
+---
+
+### 4. Competing Approaches
+
+| Language | Default Safety | Opt‑out Mechanism | Build Modes | Debugging Support |
+|----------|----------------|-------------------|-------------|--------------------|
+| **C** | None (UB) | N/A | `-O0`/`-O2`/`-Os`, sanitizers separate | GDB, but UB makes debugging unreliable |
+| **C++** | None, but RAII helps | N/A | Similar to C, plus iterator debug modes (e.g., libstdc++ `_GLIBCXX_DEBUG`) | Similar |
+| **Rust** | Safe by default (bounds, overflow‑check in debug) | `unsafe` blocks | `dev` (debug), `release` (no overflow checks, but unsafe still unsafe) | `rust-gdb`, `RUST_BACKTRACE` |
+| **Go** | Bounds checks always, integer overflow wraps | Cannot disable | None (always on) | `dlv` debugger, stack traces |
+| **Zig** | Configurable per‑scope | `@setRuntimeSafety(false)`, `ReleaseFast`/`ReleaseSmall` | Four explicit modes | GDB/LLDB with DWARF, plus native panic |
+
+**Key differences:**
+- **Rust** ties “unsafety” primarily to pointer dereferencing and unsafe code blocks; overflow checks are disabled in release builds (like C++), but you cannot re‑enable them per function without a crate. Zig gives you `@setRuntimeSafety` toggles at any granularity.
+- **Go** guarantees no out‑of‑bounds access (panics), but also makes it impossible to disable checks even when you have proven bounds. This hurts performance for numerical kernels.
+- **C** leaves everything UB. Zig’s ReleaseFast also has UB (e.g., overflow wraps, out‑of‑bounds access may corrupt memory), but the programmer consciously opts into that mode.
+
+Zig’s design acknowledges that sometimes you **need** undefined behavior for performance (e.g., SIMD loops with pre‑checked bounds), but forces you to say so explicitly.
+
+---
+
+### 5. Common Mistakes
+
+#### Mistake 1: Leaving Safety Checks On in Production Without Knowing the Cost
+
+Beginners often ship `-ODebug` binaries, wondering why their server is slow. Debug mode not only adds safety checks but also disables all optimizations—easily 50‑100x slower than ReleaseFast. **Always use `-OReleaseSafe` or `-OReleaseFast` for production.**
+
+#### Mistake 2: Over‑Using `@setRuntimeSafety(false)` Globally
+
+Putting `@setRuntimeSafety(false, .function)` at the top of every function defeats the safety net. Reserve it for hot loops where you have:
+- Manually verified bounds (e.g., `if (i < slice.len) { @setRuntimeSafety(false, .{ ... }) }`).
+- Proven that overflow cannot happen via integer ranges.
+
+**Wrong:**
+```zig
+fn add(a: u32, b: u32) u32 {
+    @setRuntimeSafety(false, .function);  // DANGER: hides overflow
+    return a + b;
+}
+```
+
+**Right:**
+```zig
+fn addAssumeNoOverflow(a: u32, b: u32) u32 {
+    if (a > std.math.maxInt(u32) - b) unreachable; // prove
+    @setRuntimeSafety(false, .{
+        return a + b;
+    });
+}
+```
+
+#### Mistake 3: `std.debug.assert` with Side Effects
+
+Because `std.debug.assert` compiles to nothing when runtime safety is off, any side‑effect inside the condition disappears:
+```zig
+std.debug.assert(do_something());  // do_something() not called in ReleaseFast!
+```
+Always ensure the assert argument is pure or that you don’t mind the call being omitted.
+
+#### Mistake 4: Assuming Debug Mode is “Safe Enough” for Benchmarking
+
+People often benchmark in Debug mode and conclude “Zig is slow.” Debug mode includes zero optimizations—it’s meant for debugging, not performance measurement. Always benchmark with `-OReleaseSafe` or `-OReleaseFast`.
+
+#### Mistake 5: Ignoring `@setRuntimeSafety` Scope Rules
+
+The second argument to `@setRuntimeSafety` is a **scope tag**. This is a compile‑time value, not a runtime block. You cannot write:
+```zig
+if (debug_mode) {
+    @setRuntimeSafety(true, .block);  // error: .block is not a runtime value
+}
+```
+Instead, use comptime branching:
+```zig
+if (comptime debug_mode) {
+    @setRuntimeSafety(true, .block);
+}
+```
+
+#### Mistake 6: Mixing `std.log` Levels Inappropriately
+
+`std.log.debug` messages are **not printed** at default log level (which is `info`). New developers add `log.debug` expecting to see output and see nothing. Set `-Dlog-level=debug` or use `log.info`.
+
+---
+
+### 6. Performance Considerations
+
+#### Cost of Safety Checks
+
+Typical overhead on modern CPUs (estimates, depending on microarchitecture):
+
+| Check Type | Instruction Overhead | Memory/Other |
+|------------|----------------------|--------------|
+| Slice bounds | 1–2 ALU ops, 1 branch | None (no extra memory load) |
+| Integer overflow | 2 ALU ops + conditional | None (uses flags) |
+| Optional unwrap | 1 cmp + branch | May cause a load if optional is pointer‑sized |
+| `@intCast` truncation | 2 comparisons (min/max) | None |
+
+In practice, safety checks increase runtime by:
+- **Debug mode**: huge (optimizations off) – can be 50‑100x slower.
+- **ReleaseSafe**: typically 10‑30% overhead vs ReleaseFast, depending on workload.
+- **ReleaseFast**: no safety overhead, but may have UB.
+
+#### When to Disable Safety for Performance
+
+**1. Bounds checks in tight loops** – after proving the index range:
+```zig
+fn vecAdd(a: []f32, b: []f32, out: []f32) void {
+    std.debug.assert(a.len == b.len and a.len == out.len);
+    @setRuntimeSafety(false, .{
+        for (0..a.len) |i| {
+            out[i] = a[i] + b[i];
+        }
+    });
+}
+```
+
+**2. Wrap‑around semantics are intended** – use `+%`, `-%`, `*%` operators instead of disabling safety globally:
+```zig
+// Counter that must wrap on overflow
+var c: u8 = 255;
+c +%= 1;  // becomes 0, no panic, no safety toggle needed.
+```
+
+**3. Embedded systems with no panic handler** – but ensure invariants statically.
+
+**4. Real‑time constraints** where the timing of a safety check might cause deadline misses. In such cases, design the code to be provably safe (e.g., using fixed‑size arrays and static indices) and disable safety for the whole module.
+
+#### Profiling with Different Modes
+
+Use `perf` or `valgrind` (though valgrind is slow) to compare safety overhead:
+
+```bash
+zig build-exe bench.zig -OReleaseSafe
+perf stat ./bench
+zig build-exe bench.zig -OReleaseFast
+perf stat ./bench
+```
+
+Also consider using `std.time.Timer` to micro‑benchmark specific blocks with/without `@setRuntimeSafety`.
+
+---
+
+### 7. Best Practices
+
+#### 1. Default to `-OReleaseSafe` for production services
+
+It’s the sweet spot: performance close to ReleaseFast (within 30%), but still catches memory corruption bugs and integer overflows that could be exploited. Only move to ReleaseFast after profiling proves that safety checks are the bottleneck.
+
+#### 2. Use `std.log` for all diagnostic output, not `std.debug.print`
+
+`std.debug.print` bypasses logging levels and is unbuffered – fine for quick hacks, but for any structured program use `std.log`. Scoped loggers give you per‑module control at runtime (via `-Dlog-scope`).
+
+**Recommended setup in `main.zig`:**
+```zig
+const log = std.log.scoped(.app);
+pub fn main() !void {
+    std.log.info("starting application", .{});
+    defer log.debug("exiting", .{});
+    // ...
+}
+```
+
+#### 3. Use `std.debug.assert` for invariants, not for input validation
+
+Assertions document programmer assumptions. Input validation should use explicit `if` and error returns.
+
+**Good:**
+```zig
+fn pop(queue: *Queue) !u32 {
+    std.debug.assert(!queue.isEmpty());  // internal invariant
+    // ...
+}
+```
+
+**Bad:**
+```zig
+fn setTemperature(celsius: i32) !void {
+    std.debug.assert(celsius > -273);  // not an invariant: wrong! Use error.
+    // ...
+}
+```
+
+#### 4. Place `@setRuntimeSafety(false)` in the smallest possible scope
+
+Prefer a block nested inside a verified region:
+```zig
+if (i < array.len) {
+    @setRuntimeSafety(false, .{
+        array[i] = compute();  // safe because i < len
+    });
+}
+```
+
+Avoid disabling safety for whole functions unless the entire function is proven safe by construction (e.g., operates only on compile‑time known sizes).
+
+#### 5. Use `@addWithOverflow` etc. when you need to check overflow manually
+
+Instead of disabling safety and then checking later, use the builtins that return a flag:
+```zig
+const result = @addWithOverflow(u32, a, b);
+if (result[1] != 0) return error.Overflow;
+return result[0];
+```
+This is often more efficient than a safety‑disabled addition followed by manual check, because the CPU’s overflow flag is directly captured.
+
+#### 6. Keep debug symbols in ReleaseSafe for production crash reports
+
+Do not strip the binary unless you have a separate symbol server. Zig’s panic handler prints file/line info when DWARF is present. Stripping makes debugging customer issues significantly harder.
+
+#### 7. Use `@compileLog` and `@breakpoint` for advanced debugging
+
+`@compileLog` prints values during comptime execution; `@breakpoint()` inserts a debugger trap (useful for attaching GDB).
+
+---
+
+### 8. Examples
+
+#### Example 1: Build Modes in `build.zig`
+
+```zig
+const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    const exe = b.addExecutable(.{
+        .name = "safety_demo",
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Ensure we can pass custom log level at compile time
+    exe.root_module.addCMacro("LOG_LEVEL", b.option([]const u8, "log-level", "Log level") orelse "info");
+
+    b.installArtifact(exe);
+}
+```
+
+#### Example 2: Safety Panic Demonstration
+
+```zig
+const std = @import("std");
+
+pub fn main() !void {
+    var slice = try std.heap.page_allocator.alloc(u8, 10);
+    defer std.heap.page_allocator.free(slice);
+
+    // Safety check triggers: index 10 >= len 10
+    slice[10] = 42;
+}
+```
+Compile with `-ODebug` → panic with trace. Compile with `-OReleaseFast` → undefined behavior (possible memory corruption).
+
+#### Example 3: Using `std.log` with Scopes and Runtime Filtering
+
+```zig
+const std = @import("std");
+
+const log_network = std.log.scoped(.network);
+const log_parser = std.log.scoped(.parser);
+
+pub fn main() void {
+    // These appear only if log level allows (default = info)
+    log_network.info("listening on port {}", .{8080});
+    log_parser.debug("token: {s}", .{"EOF"});  // not shown by default
+
+    // Override log level at compile time with -Dlog-level=debug
+}
+```
+
+#### Example 4: Strategic `@setRuntimeSafety`
+
+```zig
+const std = @import("std");
+
+/// Assumes both slices are same length and caller guarantees no overlap.
+fn add_vectors(a: []f32, b: []f32, out: []f32) void {
+    std.debug.assert(a.len == b.len and a.len == out.len);
+
+    // After assertion, we know lengths are equal and valid
+    @setRuntimeSafety(false, .{
+        for (0..a.len) |i| {
+            out[i] = a[i] + b[i];
+        }
+    });
+}
+
+pub fn main() !void {
+    var a = [_]f32{ 1, 2, 3 };
+    var b = [_]f32{ 4, 5, 6 };
+    var out: [3]f32 = undefined;
+    add_vectors(&a, &b, &out);
+    std.debug.print("{any}\n", .{out});
+}
+```
+
+#### Example 5: Debugging with GDB
+
+Compile with debug symbols:
+```bash
+zig build-exe main.zig -ODebug
+gdb ./main
+(gdb) break main
+(gdb) run
+(gdb) print variable
+(gdb) continue
+```
+
+Because Zig emits standard DWARF, GDB and LLDB work seamlessly. Use `zig build-exe -fno-emit-bin -femit-asm` to inspect the generated assembly and see where safety checks are inserted.
+
+---
+
+### 9. Summary & Exercises
+
+**Summary**
+
+- Zig provides four build modes (`Debug`, `ReleaseSafe`, `ReleaseFast`, `ReleaseSmall`) that control both optimization level and runtime safety checks.
+- Runtime safety catches out‑of‑bounds, overflow, invalid casts, null unwraps, and more by inserting conditional panics.
+- `@setRuntimeSafety` gives you per‑block or per‑function control to disable safety where you have proven invariants.
+- `std.log` offers structured, level‑based logging; `std.debug.print` is for quick‑and‑dirty output.
+- GDB/LLDB work out of the box due to standard DWARF debug info.
+- Common mistakes include leaving safety on in production incorrectly, misusing `std.debug.assert` with side effects, and benchmarking with Debug mode.
+
+**Exercises**
+
+1. **Integer Overflow Observer**
+   Write a function `fn multiplyChecked(a: u8, b: u8) u8` that performs multiplication. In Debug mode, observe the panic when overflow occurs. Then modify the function to use `@mulWithOverflow` and return `!u8` (error on overflow). Compare the assembly output (`-femit-asm`) between the version with safety enabled, the version with `@setRuntimeSafety(false)`, and the version using `@mulWithOverflow`.
+
+2. **Structured JSON Logger**
+   Extend `std.log` to output JSON lines instead of plain text. Create a custom log backend that implements the `std.log.Writer` interface. Each log entry should be a JSON object with fields: `timestamp`, `level`, `scope`, `message`, and `data` (formatted arguments). Use `@setRuntimeSafety(false)` inside the hot formatting path, but ensure the final JSON is valid.
+
+3. **Bounds Check Micro‑benchmark**
+   Write a benchmark that sums a large slice (10 million elements) in three variations:
+   a) With full safety (ReleaseSafe).
+   b) With `@setRuntimeSafety(false)` around the loop after a single `std.debug.assert` on lengths.
+   c) With the loop written using pointer arithmetic (`@ptrCast([*]u32, slice.ptr)`) and no safety.
+   Use `std.time.Timer` to measure each variant. Explain the performance differences and discuss when the pointer arithmetic version would be justified.
+
+4. **Assert with No Side Effects**
+   Refactor the following code to remove the side effect from `std.debug.assert`:
+   ```zig
+   var counter: u32 = 0;
+   std.debug.assert(acquireResource(&counter) == true);
+   ```
+   Write a version that works correctly in both Debug and ReleaseFast modes.
+
+5. **Custom Panic Handler**
+   Implement a custom panic handler using `@panic` (or `std.builtin.panic`) that logs the error message to a file before aborting. Ensure your handler works in ReleaseSafe mode and does not allocate memory (since panics may happen in an inconsistent state). Test it by triggering a bounds violation.
+
+These exercises will solidify your understanding of how to wield Zig’s safety features without sacrificing performance or debuggability.

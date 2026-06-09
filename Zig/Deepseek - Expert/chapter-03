@@ -1,0 +1,219 @@
+# Chapter 3: Your First Zig Program
+
+The first program in a new language is rarely just a ritual. In Zig, even the smallest “hello world” exposes the core contract: explicit error handling, compile-time module resolution, and an entry point that owns its entire environment. This chapter dissects that first program, then expands it to a real tool, revealing why Zig code feels both raw and deliberately controllable from the very first line.
+
+---
+
+## 1. Basic Usage
+
+Create a file named `hello.zig`:
+
+```zig
+const std = @import("std");
+
+pub fn main() !void {
+    const stdout = std.io.getStdOut().writer();
+    try stdout.print("Hello, Zig!\n", .{});
+}
+```
+
+Compile and run:
+
+```
+$ zig run hello.zig
+Hello, Zig!
+```
+
+Or compile an executable:
+
+```
+$ zig build-exe hello.zig
+$ ./hello
+Hello, Zig!
+```
+
+Everything flows from three keywords:
+
+- `@import("std")` brings the entire standard library into the compilation unit. The import happens at compile time – there is no runtime module loader.
+- `pub fn main() !void` is the entry point. The `!void` means the function returns either nothing (`void`) or an error. Zig’s runtime will translate a returned error into a non‑zero exit code and print the error to stderr.
+- `try stdout.print(...)` forwards the error union from `print`. If the write fails (e.g., a broken pipe), the error propagates out of `main`, the program stops, and the OS receives an exit code of 1. There is no hidden exception unwinding or panic.
+
+The standard library’s `std.io.getStdOut().writer()` returns a buffered writer. The format string `"Hello, {s}!\n"` uses a compile‑time checked placeholder; the arguments are passed as a tuple (`{}` for none). Zig’s `print` family never allocates heap memory – formatting writes directly into the output buffer.
+
+---
+
+## 2. Under the Hood
+
+When you run `zig build-exe hello.zig`, the compiler frontend:
+
+1. Parses `hello.zig` and encounters `@import("std")`. The compiler locates the standard library root file (e.g., `<zig>/lib/std/std.zig`) and parses it. The entire module graph is built at comptime – no header files, no forward declarations, no separate compilation model.
+2. Type‑checks the AST and evaluates all comptime expressions. The `@import` result becomes a struct namespace that holds every public declaration from the imported module.
+3. Generates LLVM IR (or native code via the self‑hosted backend) for the translation unit.
+4. Links in the startup code (`crt0` equivalent) that calls `main`. In Zig, the startup lives in `std.start` and is customizable. The default startup calls your `pub fn main` and handles the error union:
+
+   - If `main` returns `void` (success), the process exits cleanly.
+   - If `main` returns an error, the startup prints the error name and optional message (via `std.debug.print`) to stderr and calls `std.process.exit(1)`.
+
+   This behaviour is part of the standard library, not baked into the language. You could replace `std.start` entirely – a direct hint that Zig gives you the keys to every layer.
+
+The error union `!void` is actually an `anyerror!void`, a variant type that at runtime holds either `void` (a zero‑bit payload) or an error code (a small integer). The `try` expression becomes a branch on that tag, jumping to the error return path on failure. Because the compiler sees the entire call graph at compile time, it can optimise these branches aggressively, often eliminating them entirely when error cases are unreachable or the hardware branch predictor handles them well.
+
+---
+
+## 3. Why This Design?
+
+Zig’s entry point contract encodes the language’s three pillars in a single signature:
+
+**No Hidden Control Flow.**
+`pub fn main() !void` announces that this function may fail. The callers (the startup code) must handle that possibility. There is no exception that can unwind silently across stack frames, no `atexit` handlers registered without the programmer’s knowledge, and no runtime‑defined finalisers. If you want cleanup, you write `defer` explicitly.
+
+**Explicit Is Better Than Implicit.**
+Error handling is visible in the signature and at the call site. `try` is a single keyword that means “if this fails, return the error immediately”. You can’t accidentally ignore a fallible call – the compiler rejects code that discards an error union. This eliminates the class of bugs where C code forgets to check `errno` or a returned `-1`.
+
+**Comptime Over Runtime Magic.**
+`@import` resolves at compile time. The entire program’s dependency graph is known and optimisable before a single instruction runs. There are no dynamic libraries to load at startup (unless you explicitly link them), no reflection that depends on runtime metadata, no classloader walking a classpath. The result is a binary that starts instantly and contains only the code you actually use – a feeling of total ownership that seasoned engineers immediately recognise.
+
+The “raw and controllable” sensation comes from the fact that `main` receives nothing that it didn’t ask for. There is no background GC thread, no async runtime scheduler, no hidden heap allocation. The stack is yours. If you need an allocator, you create one and pass it down. If you need threads, you spawn them with `std.Thread`. The language provides tools, not a framework.
+
+---
+
+## 4. Competing Approaches
+
+### C
+C’s `int main(int argc, char *argv[])` provides raw arguments but no error semantics. The return value is an integer that *may* be interpreted as an exit code; the language does not enforce checking of fallible operations. Error handling relies on convention (`errno`, return codes) and is easily bypassed. Zig’s `!void` makes the error path explicit and mandatory, eliminating an entire category of “forgot to check” bugs.
+
+### Rust
+Rust’s `fn main() -> Result<(), Box<dyn Error>>` looks similar but carries hidden control flow. `panic!` triggers unwinding that runs destructors (drop) in an invisible order. The runtime may catch panics and exit, but the unwind mechanism is complex and can be disabled (`panic = "abort"`). Zig has no equivalent of unwinding; all errors are values returned up the stack. If you want cleanup on error, you write `errdefer`.
+
+### Go
+Go’s `func main()` runs inside a runtime that starts a garbage collector, a scheduler, and background goroutines before the first line executes. Error handling uses multiple return values that can be ignored. Zig’s entry point gives you a bare process: no scheduler, no GC, no goroutines unless you explicitly create them. The trade‑off is control for convenience; Zig chooses control.
+
+### C++
+C++ `int main()` lives inside a runtime that initialises global objects (with constructors) and destroys them (with destructors) on exit. Exceptions can propagate out of `main` and be caught by the runtime. Zig’s startup is inert by comparison: no global constructors, no hidden destructors, no exception machinery. You get exactly the binary you asked for.
+
+---
+
+## 5. Common Mistakes
+
+**Forgetting `try` on a fallible call.**
+The compiler will error with “error union used where non‑error value expected.” This is by design. Resolve it by adding `try`, catching with `catch`, or using `if` to branch on the error.
+
+**Expecting `main` to receive arguments natively.**
+Zig does not pass `argc`/`argv` to `main`. Instead, use `std.process.argsAlloc(allocator)` to obtain an owned slice of argument strings. This allocates, so you must free the result later – typically with a `defer` in `main`.
+
+**Mistaking `@import` for a runtime include.**
+`@import` is strictly compile time. If the imported file is missing, the build fails immediately. You cannot conditionally import based on runtime state; use `@import` inside comptime branches to conditionally compile modules.
+
+**Using `std.debug.print` in production output.**
+`std.debug.print` writes to stderr and is intended for development. For normal stdout output, obtain a writer from `std.io.getStdOut()`. Both require handling their error unions.
+
+**Assuming the default error printing is always sufficient.**
+When an error leaks from `main`, the startup code prints the error name and exits with code 1. If you need a custom error message, a specific exit code, or a graceful shutdown, catch the error in `main` yourself.
+
+---
+
+## 6. Performance Considerations
+
+- **Error union returns**: `try` is a conditional branch on an integer tag. Modern CPUs predict the success path perfectly. In tight loops, the compiler often removes the branch entirely if it can prove a function cannot fail (comptime‑known error sets).
+- **`@import`**: Zero runtime cost. All resolution and type checking happen during compilation.
+- **Buffered output**: `std.io.getStdOut().writer()` defaults to a buffered writer with a buffer size chosen for good throughput. If you need unbuffered writes (e.g., for line‑buffered terminal interaction), you can pass a `std.io.bufferedWriter` with a custom size or use `writeAll` on the underlying unbuffered file descriptor. Zig never makes hidden buffering decisions; everything is visible.
+- **Startup**: The binary’s `_start` entry (before `main`) does minimal work: initialise the stack, set up the error return handler, and call `main`. No dynamic linker, no global constructor traversal, no type‑info tables. First instruction to `main` is nearly instantaneous.
+
+---
+
+## 7. Best Practices
+
+- **Always declare `main` as `pub fn main() !void`.** Even if you think the program cannot fail, the signature documents your intent and future‑proofs against changes. A program that never fails is rare in practice.
+- **Keep `main` small.** Delegate work to functions that accept an allocator and return error unions. The top‑level `main` should parse arguments, initialise an allocator, and call the core logic, cleaning up with `defer`.
+- **Use `const` for the standard library import.** `const std = @import("std");` is idiomatic and communicates that the import is immutable.
+- **Obtain arguments via `std.process.argsAlloc`** and free them with `defer allocator.free(args)`. This respects the explicit memory management model and avoids dangling pointers.
+- **Prefer `try` for errors that should propagate to the runtime.** Reserve `catch` for cases where you can handle the error locally (e.g., a missing file that has a default fallback). This keeps the error path explicit and avoids swallowing errors accidentally.
+- **For quick prototypes, `zig run` is fine.** For anything you ship, use `zig build-exe` or a full `build.zig` to control optimisation modes and target triples explicitly.
+
+---
+
+## 8. Examples
+
+### 8.1 A Program That Greets a Name from the Command Line
+
+This program demonstrates argument handling, error propagation, and a custom error set:
+
+```zig
+const std = @import("std");
+
+pub fn main() !void {
+    // General purpose allocator for argument allocation
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Obtain owned argument slice
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+
+    const name = if (args.len > 1) args[1] else "World";
+    const stdout = std.io.getStdOut().writer();
+    try stdout.print("Hello, {s}!\n", .{name});
+}
+```
+
+Compile and run:
+
+```
+$ zig build-exe greet.zig
+$ ./greet Alice
+Hello, Alice!
+$ ./greet
+Hello, World!
+```
+
+Every allocation is paired with a `defer`; the error from `argsAlloc` propagates cleanly. The allocator’s lifetime is scoped to `main`.
+
+### 8.2 Custom Error Handling at the Boundary
+
+Sometimes you want to catch the error inside `main` and set a specific exit code or message:
+
+```zig
+const std = @import("std");
+
+pub fn main() u8 {
+    // Return an exit code directly (0 for success, non-zero for failure)
+    if (doWork()) {
+        return 0;
+    } else |err| {
+        std.debug.print("error: {}\n", .{err});
+        return 1;
+    }
+}
+
+fn doWork() !void {
+    // Simulate a fallible operation
+    return error.SomethingWentWrong;
+}
+```
+
+Here `main` returns `u8` – an explicit exit code. This bypasses the default error printing and gives full control. Notice that `doWork` still returns `!void`, keeping the error path explicit throughout the call chain.
+
+---
+
+## 9. Summary & Exercises
+
+**Summary**
+
+- The entry point is `pub fn main() !void`. It signals that the program may fail, and the default runtime translates errors into non‑zero exit codes.
+- `@import` resolves modules at compile time, building the entire program graph without headers or dynamic loading.
+- Error handling via `try` and `catch` is mandatory; the compiler rejects code that ignores error unions.
+- Zig gives you a raw process: no background threads, no GC, no hidden allocations. You request every resource explicitly.
+
+**Exercises**
+
+1. **Print the Process ID.**
+   Write a program that prints its own PID using `std.os.getpid()`. Format the output with `std.io.getStdOut().writer().print` and handle the write error. Observe that there is no special “process” object – the OS interface is a simple function call.
+
+2. **File Size from Command Line.**
+   Write a program that takes a file path as its first argument, opens the file with `std.fs.cwd().openFile`, reads its size via `file.getEndPos()`, and prints the size. Let all errors (missing argument, file not found, I/O failure) propagate to `main` and be handled by the runtime. This will expose you to real error unions in action without writing any `catch`.
+
+3. **Custom Exit Codes Based on Error Kind.**
+   Modify the file‑size program so that `main` catches the error from the core logic and returns an exit code that distinguishes between “file not found” (exit 2) and “permission denied” (exit 3), falling back to 1 for any other error. Use a `switch` on the error to implement this. This forces you to think about error discrimination at the boundary where Zig’s automatic handling ends.
+
+Armed with these fundamentals, every subsequent chapter will build on the pattern: explicit imports, fallible entry points, and the absolute ownership of runtime resources that defines Zig’s character.

@@ -1,0 +1,95 @@
+## Appendix C: Zig Language Evolution
+### Async History, Key Proposals, and the Roadmap to 1.0
+
+Zig’s evolution is a testament to the principle that it is better to remove a half‑baked feature than to paper over its flaws. The language has deliberately shed constructs that other systems languages treat as essential, and in doing so has arrived at a simpler, more predictable core. This appendix traces the major inflection points of Zig’s development, dissects the rise and fall of its built‑in async I/O, surveys the pivotal proposals that shaped the language, and outlines the path to the 1.0 milestone.
+
+---
+
+#### The Async Experiment: From First‑Class Coroutines to Library‑Side Concurrency
+
+In its early days (circa 0.6–0.10), Zig shipped an ambitious async/await model integrated directly into the language. The vision was to provide zero‑cost stackful coroutines with a built‑in event loop (`std.event.Loop`). An async function could `suspend` and be resumed later, while `await` on a future‑like object would yield control without blocking the thread. The runtime held a pool of worker threads, and the `async` keyword spawned a new frame. This was supposed to be Zig’s answer to Go’s goroutines and Rust’s `async/.await` – but without hidden allocations or a garbage collector.
+
+The design placed the event loop inside the standard library, so the language itself could remain minimal. However, even that abstraction proved problematic. Four major pain points emerged:
+
+1. **Function Coloring**
+   Just as in C# or Python, marking a function `async` changed its call signature. An async function could not be called from a synchronous context without bridging machinery, and vice versa. This split the ecosystem into two worlds – a classic violation of “no hidden control flow”. A call to `foo()` might either return immediately or yield the thread, but the caller could not tell from the type alone because `async` was a property of the function, not the return type. Error propagation across these boundaries compounded the complexity.
+
+2. **Hidden Allocations and Frame Sizes**
+   The compiler required every async function to allocate a coroutine frame large enough to hold its locals and the chain of potential suspensions. While Zig’s explicit‑allocation culture demanded that users supply an allocator for the frame, the syntax was awkward: `async<allocator> foo()`. Many developers resorted to `catch unreachable` on frame allocation, creating a false sense of safety. The frame size was opaque, making it hard to reason about stack memory usage in embedded or real‑time contexts.
+
+3. **Implementation Complexity**
+   The LLVM‑based coroutine support (swift async CC, `llvm.coro`) was never fully stable across all targets. The self‑hosted compiler would have needed to implement its own coroutine lowering, adding enormous engineering burden. Bugs in code generation, unwinding, and debug info were frequent and delayed progress on other fronts.
+
+4. **Minimal Adoption and Maintainer Burnout**
+   In practice, the community built few large‑scale systems with the built‑in async. The standard library itself used threads for its HTTP server and other IO. The async machinery became a maintenance sink that consumed a disproportionate share of core team time. Andrew Kelley’s public reflections made it clear: the feature was a distraction from Zig’s core mission of being a robust general‑purpose systems language.
+
+The turning point came in **Zig 0.11.0 (2023)**, when the language announced the removal of `async`, `await`, `suspend`, and `resume`. The event loop moved out of the standard library entirely. The `std.event.Loop` was deleted. In its place, the language doubled down on **explicit threads** (`std.Thread`) and **asynchronous I/O as a library concern**. This aligns perfectly with Zig’s “no hidden control flow” pillar: if you want non‑blocking I/O, you compose primitives (event loops, coroutine libraries) using standard control structures, exactly as you would in C with `libuv` or `libevent`, but with Zig’s type safety and comptime power. Library authors can offer ergonomic APIs – `libxev`, for example, provides a high‑performance event loop and a `coro` abstraction without any language support. The compiler stays small; the ecosystem innovates.
+
+**Comparison with Rust, Go, and C++**
+- **Go** makes goroutines a first‑class language feature; the runtime manages stacks and scheduling, hiding that complexity from the programmer. This is antithetical to Zig’s explicit‑cost philosophy.
+- **Rust** uses `async/.await` and `Future` traits, requiring an external executor (e.g., `tokio`). While this is more library‑oriented than Go, Rust still bakes the concept of `async` into the type system and the borrow checker, creating a significant mental model – and the famous “async in traits” difficulties. Zig avoids the problem entirely by not special‑casing async at the language level.
+- **C++** with `co_await` and C++20 coroutines follows a similar path to Rust, but with even more hidden heap allocations and a complex customization mechanism. Zig’s decision to drop the feature before 1.0 prevented a comparable trap.
+
+The async story is the most dramatic example of Zig’s willingness to **retreat from a dead end**, but it is far from the only one.
+
+---
+
+#### Key Proposals and Language Pivots
+
+Zig’s evolution is guided by an informal RFC process (GitHub issues on the main repository), with final decisions made by Andrew Kelley as BDFL. The following proposals have left a lasting mark.
+
+**Error Handling Refinements**
+Early Zig had `%%` and `try` as syntactic sugar for error propagation. Over time, the language coalesced around the `!T` error union. A crucial proposal was to **make error unions a distinct type** (not just a shorthand for `anyerror!T`) and to allow inferring the error set from the function body. This eliminated the need for global error enums and made error handling truly zero‑cost: the compiler tracks the exact error set of every function, so `switch` on errors can be exhaustive without runtime overhead. The `catch` / `try` / `if (err)` vocabulary became the sole mechanism, reinforcing errors‑as‑values.
+
+**Removal of `var` on Error Union Payloads**
+In old Zig, one could write `var x: error{OutOfMemory}!u32` and mutate `x` directly, leading to confusing semantics when the value was in an error state. The language now requires unwrapping with `try` or `catch` to access the payload, treating the error union as a pure sum type. This eliminated a source of silent logic bugs.
+
+**Packed Structs and Unions**
+The `packed struct` syntax originally required all fields to be integers or packed structs; the compiler would pack them bit‑by‑bit and provide bit‑level access. A significant proposal refined **packed unions** to allow discriminants that could be overlaid with the same bits, enabling zero‑cost protocol parsing. Later changes made `packed struct` layout even more predictable, with explicit `@bitSizeOf` and ordering guarantees, critical for binary network protocols. The community also debated `extern union` vs. `packed union` semantics and arrived at a model where `extern` gives C ABI compatibility while `packed` gives bit‑precise manual control.
+
+**Compile‑Time Reflection Overhaul**
+`@typeInfo` and `@Type` were once separate from `@fieldParentPtr` and `@field`. A monumental proposal unified type reflection into a single `std.builtin.TypeInfo` union that can be inspected and constructed at comptime. This allowed creating types from descriptions and generating code by iterating over struct fields, union variants, and enum values. The result is a comptime metaprogramming system that outclasses C++ template metaprogramming without a separate macro language.
+
+**`anytype` and Comptime Duck Typing**
+Before `anytype` was stabilized, generic functions were written by passing `type` parameters and building up a return type with `@Type`. The introduction of `anytype` allowed function parameters to be generically typed without explicitly enumerating type parameters – the compiler deduces the concrete type at each call site and monomorphizes. This was a pragmatic compromise: it made simple generics (like `std.debug.print`) concise, while still exposing the full power of comptime reflection for advanced cases. The key design decision: `anytype` parameters are **not** trait‑bounded; instead, the function body uses `@hasDecl` and `@hasField` to check capabilities at compile time, emitting clear errors for missing functions. This is explicit duck typing, not hidden interfaces.
+
+**Build System as Code (`build.zig`)**
+Zig’s build system migrated from a declarative `build.zig` format to a fully imperative model where the build script is a Zig program running on the host. This change allowed custom build steps that can invoke system commands, parse files, or perform comptime code generation. The `LazyPath` abstraction decoupled file references from physical locations, enabling incremental compilation and hermetic builds. This design directly competes with CMake’s turing‑complete but opaque language, and aligns with Zig’s philosophy of using one language for everything.
+
+**Stage2 and the Self‑Hosted Compiler**
+The most audacious engineering effort in Zig’s history is the self‑hosted compiler, often called Stage2. The original bootstrap compiler was written in C++ and depended on LLVM. Stage2 is written entirely in Zig, targeting multiple backends: initially LLVM (via C++ bindings), then a native x86_64 backend, and eventually WebAssembly and ARM. The self‑hosted compiler shares the same frontend as the C++ one but provides faster compilation, better error messages, and the ability to run the compiler in the browser (wasm). Stage2 also enables incremental compilation and a future language server (ZLS) that uses the same parser/AST. The removal of a C++ dependency is not merely aesthetic; it makes cross‑compilation of the compiler itself trivial, and allows Zig to be maintained by a single community using Zig, without requiring C++ expertise.
+
+---
+
+#### The Roadmap to 1.0
+
+As of 2026, Zig has not yet reached 1.0, but the destination is clear. Andrew Kelley has repeatedly stated that Zig will hit 1.0 when **the language no longer requires breaking changes** and the standard library is sufficiently complete. The roadmap is less a feature list and more a set of stabilizing constraints.
+
+**Language Freeze**
+The core language features considered fundamental – comptime, error unions, `defer`/`errdefer`, allocators, slices, packed/extern layouts, the type system – are now in their final form. There are no plans to add new major constructs (no async, no exceptions, no trait system). The focus is on fixing corner‑case bugs in the compiler, ensuring consistent semantics across all targets, and refining the existing feature set. One area still open to minor adjustment is the **build system**, where ergonomic improvements (e.g., package fetching, better dependency resolution) continue.
+
+**Standard Library Maturation**
+The standard library must provide robust, well‑documented APIs for common systems tasks: networking (TCP/UDP, HTTP/1.1, TLS), file system operations, data structures (hash maps, B‑trees, priority queues), Unicode processing, and serialization. The `std.http` module is already capable, but TLS support relies on external libraries (boringssl/openssl) via C interop, and a pure‑Zig implementation is not a priority. The path to 1.0 includes polishing these modules, eliminating all uses of `catch unreachable`, and adding fuzz testing infrastructure.
+
+**Self‑Hosted Backend Performance**
+The native x86_64 backend must generate code that is competitive with LLVM‑optimized builds, at least for typical workloads. It currently compiles faster but produces slower code; closing that gap is critical for Zig to be a viable “compile‑fast, run‑fast” tool. The backend also needs to support more architectures (ARM64 is in progress) and eventually replace the LLVM dependency for release builds, making the entire toolchain self‑contained.
+
+**Documentation and Learning Resources**
+A key criterion for 1.0 is a comprehensive language reference that leaves no syntax or builtin unexplained. The community has already produced excellent guides (zig.guide, ziglings), but the official documentation must be a single source of truth, generated from the source code where possible (`-femit-docs`). The goal is that a seasoned engineer can answer any question about the language by consulting the official reference, without resorting to reading compiler source code.
+
+**Tooling Ecosystem Stability**
+The Zig Language Server (ZLS) must reach a point where it supports the majority of IDE features (completion, go‑to‑definition, diagnostics) without frequent regressions. The package manager (`build.zig.zon`) needs a stable registry or a clear decentralized resolution strategy. `zig fmt` must be considered final, with no further formatting options added. The debugger experience (LLDB/GDB integration) should be smooth, with proper rendering of Zig’s structures and error unions.
+
+**No Editions or Feature Gates**
+Unlike Rust, Zig will not adopt an “edition” system. There will be a single Zig language version: 1.0. After that, any new feature or breaking change would require a 2.0, which the project hopes to avoid for a very long time. The philosophy is to **ship a language that is finished**, not a language that evolves forever. This places enormous pressure on the pre‑1.0 decisions, but it is consistent with Zig’s role as a stable foundation for long‑lived systems.
+
+**Potential Future Directions (Post‑1.0)**
+Once 1.0 is released, attention may turn to formal verification support, better debugging of comptime code, a CTFE interpreter that runs in the browser for playgrounds, and improved C++ interop. But the language itself will be set in stone. The community will build frameworks, game engines, and operating systems on top of that unchanging base, without fear of being broken by a language update.
+
+---
+
+#### The Philosophy of Zig’s Evolution
+
+Zig’s journey reveals a pattern: **aggressive experimentation followed by ruthless simplification**. Every feature that survived into the current language earned its place by proving it could be implemented with zero hidden cost, zero hidden control flow, and zero ambiguity. The async removal was not a failure but a victory for that philosophy. The language did not regress; it shed dead weight and became more honest.
+
+The roadmap to 1.0 is not a list of thrilling new features. It is a list of promises that the features we have now will work correctly, efficiently, and transparently on every target that matters. For the seasoned engineer, that is far more valuable than another async syntax. Zig is not trying to be the most expressive language; it is trying to be the most predictable one. Its evolution is the story of how it got there.

@@ -1,0 +1,473 @@
+## Chapter 29: Building a Zig Library for C Consumers (Bidirectional FFI)
+
+Zig’s seamless C interoperability is often framed as “call C from Zig,” but the reverse direction—exposing Zig libraries to C (and, by extension, to Python, Node.js, Ruby, and any language with a C FFI)—is where Zig’s philosophy of **no hidden control flow** and **explicit over implicit** pays dividends in cross-language boundaries. This chapter covers everything you need to design a safe, stable, high-performance C API from Zig, handle errors in a C-compatible way, generate headers, produce shared libraries, and version your ABI. We’ll close with a real-world case study of wrapping a high-performance Zig parser so it can be consumed from Python and Node.js without a garbage collector sneaking in.
+
+### 1. Basic Usage: Exporting Symbols and Call Conventions
+
+At the simplest level, exposing a Zig function to C means decorating it with `export` and specifying the C calling convention.
+
+```zig
+// mylib.zig
+const std = @import("std");
+
+// A trivial function that C can call.
+export fn add(a: i32, b: i32) callconv(.C) i32 {
+    return a + b;
+}
+```
+
+Compile this into a shared library:
+
+```sh
+zig build-lib mylib.zig -dynamic -target native
+```
+
+On Linux you’ll get `libmylib.so`; on macOS `libmylib.dylib`; on Windows `mylib.dll`. The exported symbol `add` will be visible. You can verify with `nm` or `dumpbin`.
+
+For more control, you build it via `build.zig`:
+
+```zig
+// build.zig
+const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    const lib = b.addSharedLibrary(.{
+        .name = "mylib",
+        .root_source_file = b.path("src/mylib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    b.installArtifact(lib);
+}
+```
+
+Calling from C:
+
+```c
+#include "mylib.h"
+int main(void) {
+    int result = add(3, 5);
+    return 0;
+}
+```
+
+But where does `mylib.h` come from? Zig can auto-generate a header with `-femit-h`:
+
+```sh
+zig build-lib mylib.zig -dynamic -femit-h=mylib.h
+```
+
+However, this header will contain *every* public declaration in the Zig module, including comptime types that don’t map to C. For a clean C API, you should keep the public interface intentionally minimal and separate from internal Zig types. We’ll cover header generation in depth later.
+
+**Structs and pointers.** To pass data back and forth, you define `extern struct` (guaranteed to follow C layout rules) and use `?*` for nullable pointers.
+
+```zig
+export const Vector3 = extern struct {
+    x: f32,
+    y: f32,
+    z: f32,
+};
+
+export fn vec3_add(a: *const Vector3, b: *const Vector3) callconv(.C) Vector3 {
+    return .{ .x = a.x + b.x, .y = a.y + b.y, .z = a.z + b.z };
+}
+```
+
+Zig’s ABI for `extern struct` matches the target’s C ABI exactly. Arrays as function parameters decay to pointers, just like C. Use `[*c]T` for C-style null-terminated arrays, and `[*]T` for explicit lengths.
+
+---
+
+### 2. Under the Hood: Symbol Visibility, Sections, and the Compiler’s View
+
+When you mark a function `export`, the compiler:
+
+- Emits an object-file symbol with default visibility (non-hidden).
+- Forces the function to use the specified calling convention (`.C` is the default for `extern`).
+- Prevents the function from being inlined across library boundaries unless LTO is active.
+- Generates a trampoline when the C ABI differs from Zig’s internal convention (e.g., struct returning is handled by a hidden first parameter on some targets).
+
+The linker then places the symbol in the dynamic symbol table. Zig’s self-hosted backend produces ELF/MachO/COFF directly, respecting `-fvisibility=default` etc., but the `export` keyword is the canonical way.
+
+**Memory model:** Zig’s memory model for exported functions is identical to C. No hidden allocations occur; if you return a pointer, it must point to memory managed by the caller or the library (with a clear ownership contract). No RAII, no destructors run at scope exit unless you use `defer` — but `defer` inside an exported function still runs before the function returns; there’s no “object goes out of scope” beyond the function’s own frame. So the interface is predictable.
+
+**Name mangling:** Exporting a Zig function gives it the exact name you specify. No name mangling is applied (unlike C++ or Rust). This means you must avoid clashes with C reserved identifiers or other libraries manually.
+
+**Struct return:** For small structs, the C ABI may return via registers; for large ones, a hidden pointer is used. Zig handles this automatically when you specify `callconv(.C)`. You don’t need to write the sret dance yourself.
+
+---
+
+### 3. Why This Design?: Zig’s Philosophy Meets the C Interface
+
+Zig’s approach to building C libraries is an extension of its core values:
+
+- **No hidden control flow:** C callers expect a flat callstack. An exported Zig function must not trigger hidden allocations, background threads, or unexpected panics. Zig’s error unions aren’t C-compatible, so you must translate errors into explicit return codes. No invisible `errdefer` will run after return — you remain in control.
+- **Explicit is better than implicit:** Ownership semantics must be documented and enforced by function signatures. If your library returns a heap-allocated object, you provide `create`/`destroy` functions. This mirrors Zig’s allocator-passing pattern, but for C consumers, you bundle an allocator implicitly or expose a setter.
+- **Comptime over runtime magic:** Exporting a function that internally relies on comptime is fine as long as the comptime logic yields a monomorphized, runtime-efficient implementation. The C consumer sees none of that complexity; they just get a fast, stable symbol.
+
+Zig consciously rejects the idea of a “Zig runtime” that must be initialized. There is no garbage collector, no exception-handling personality routine, no vtable setup needed before `main`. The library is stateless until you call it. This makes Zig ideal for creating system libraries that are drop-in replacements for C.
+
+---
+
+### 4. Competing Approaches: C, Rust, Go, C++
+
+- **C:** Writing a C API in C is straightforward but burdensome regarding safety and maintainability. Zig offers the same zero-cost extern interface but with memory safety checks in debug builds, comptime-generated header-free iteration, and less UB.
+- **Rust:** Rust’s `extern "C"` and `#[no_mangle]` are similar in spirit, but Rust’s commitment to safety means you often need to work with `unsafe` blocks in the C-facing layer, and the borrow checker doesn’t cross the FFI boundary. Zig’s safety model is opt-in; your exported functions can use normal Zig idioms internally, and `ReleaseSafe` still catches UB. Rust’s `cbindgen` generates headers, much like Zig’s `-femit-h`.
+- **Go:** Go can export functions via `//export` and build a C-shared library with `cgo`, but the Go runtime remains active (goroutines, GC) and can cause contention. Zig imposes no background runtime, which is preferable for embedded or latency-sensitive callers.
+- **C++:** Exposing a C++ class to C requires a wrapper that flattens vtables and uses opaque pointers. Zig’s lack of classes means you design the C API directly and cleanly without impedance mismatch. Comptime generics replace templates without header bloat.
+
+---
+
+### 5. Common Mistakes: The Painful Lessons
+
+1. **Assuming error unions can cross the boundary:** A function returning `!i32` cannot be exported. The compiler will error. You must convert errors to an error code (e.g., `int` or an enum) and possibly an out-pointer for payloads. Remember: the C caller has no concept of Zig’s error set.
+
+2. **Returning pointers to stack memory:** In a exported function, any `var` local’s address becomes invalid after return. This is the same as in C, but Rust developers accustomed to borrow checking may accidentally do this because they expect a lifetime error.
+
+3. **Forgetting `callconv(.C)`:** If omitted, Zig uses its internal convention (undefined ABI for export). The result may work on some platforms but will break on others. Always use `callconv(.C)`.
+
+4. **Exposing Zig types with non-C layout:** A plain `struct` (not `extern`) has undefined layout. Passing it to C will cause ABI mismatches. Use `extern struct` for any type shared across the boundary.
+
+5. **Leaking memory because the C consumer didn't call `destroy`:** Zig’s general-purpose allocator can detect leaks in tests, but C consumers won’t run Zig’s test runner. Provide explicit `create`/`destroy` and document ownership. Consider using an arena that can be reset if the lifecycle matches.
+
+6. **Header-generation mismanagement:** If you auto-generate a header with `-femit-h`, it includes every exported declaration, even internal helpers. This pollutes the namespace and forces you to expose implementation details. Better to maintain a manually crafted header (or a filtered generation step).
+
+---
+
+### 6. Performance Considerations: Zero-Cost Interop
+
+A function call across the shared library boundary has the same cost as any C-to-C call: a `call` instruction and possibly PLT indirection (if not statically linked). Zig’s exported functions, when compiled with `ReleaseFast`, inline internal helpers aggressively and produce assembly indistinguishable from hand-written C. There are no extra checks (like Rust’s unwinding or Go’s runtime checks) unless you explicitly enable them.
+
+- **Struct passing:** Small `extern struct`s (up to a certain size) are passed in registers; Zig respects the target ABI. Use `byval` on certain platforms? No need — it’s automatic.
+- **Memory allocation:** The biggest perf decision is whether your library allocates internally. A well-designed Zig library accepts a memory allocation callback from C (like SQLite’s `malloc`/`free` replacement). This lets the consumer use a custom allocator (arena, stack, etc.) without crossing back to the system allocator.
+- **SIMD:** You can export functions that use `@Vector`; the C caller sees them as arrays or structs, but Zig’s vectorization remains intact. For performance-sensitive paths, vectorization across FFI is fully preserved.
+
+---
+
+### 7. Best Practices: The Zen of a C-Friendly Zig Library
+
+- **Opaque handles:** Never expose internal struct layout to C unless necessary. Use an opaque pointer:
+
+  ```zig
+  pub const MyLibHandle = opaque {};
+  export fn mylib_init() callconv(.C) ?*MyLibHandle { ... }
+  export fn mylib_process(h: *MyLibHandle, data: [*]const u8, len: usize) callconv(.C) void { ... }
+  export fn mylib_deinit(h: *MyLibHandle) callconv(.C) void { ... }
+  ```
+
+  The C header only declares `typedef struct MyLibHandle MyLibHandle;`. This enables ABI stability: you can change the internal layout without recompiling consumers.
+
+- **Error-handling convention:** Choose a unified approach. Common patterns:
+  - Return `int` with 0 for success, negative for errors (like POSIX).
+  - Return an error code enum, and an out-pointer for the result.
+  - For complex errors, provide a `mylib_error_message` function to retrieve a human-readable string (like OpenSSL).
+  - **Never panic** across the boundary. Use `catch` to translate unreachable Zig errors into a stable error code.
+
+- **Memory management contract:** Document who owns each returned buffer. Options:
+  - Caller provides a buffer and a length (`mylib_format(ctx, buf, len)`), Zig writes into it.
+  - Library allocates; caller must call `mylib_free`.
+  - Provide a `mylib_set_allocator` that accepts `malloc`/`free` function pointers.
+
+- **Header handcrafting:** Auto-generated headers are useful for starting, but a stable C API deserves a hand-maintained `.h` file that is versioned and sanitized. Keep it minimal; use `extern` declarations matching the Zig exports.
+
+- **Versioning:** Embed a version number (major.minor.patch) as exported constants or a function. Use symbol versioning (on Linux) to avoid breaking old binaries if you must change ABI.
+
+- **Thread safety:** If your library uses global state, document whether it’s thread-safe. Zig’s `std.Thread.Mutex` can be used internally; ensure it’s initialized once (e.g., via `pthread_once` or an explicit init). Prefer per-handle state to avoid global locks.
+
+---
+
+### 8. Examples: From Simple to Production-Ready
+
+#### Example 8.1: A Base64 Encoder/Decoder Library
+
+We’ll build a small C-callable library that encodes and decodes base64. This illustrates error translation, buffer ownership, and opaque contexts.
+
+**Zig source (`src/base64zig.zig`):**
+
+```zig
+const std = @import("std");
+
+const Base64Error = error{
+    InvalidCharacter,
+    InvalidPadding,
+    OutputBufferTooSmall,
+};
+
+// Opaque handle for stateful decoder (if streaming were needed). Here it's empty.
+pub const Base64Ctx = opaque {};
+
+const ERR_OK: c_int = 0;
+const ERR_INVALID_INPUT: c_int = -1;
+const ERR_BUFFER_TOO_SMALL: c_int = -2;
+
+fn translateErr(err: anyerror) c_int {
+    return switch (err) {
+        error.InvalidCharacter, error.InvalidPadding => ERR_INVALID_INPUT,
+        error.OutputBufferTooSmall => ERR_BUFFER_TOO_SMALL,
+        else => -99, // unexpected
+    };
+}
+
+export fn b64_encode(
+    src: [*]const u8,
+    src_len: usize,
+    dst: [*]u8,
+    dst_len: usize,
+    out_written: *usize,
+) callconv(.C) c_int {
+    const input = src[0..src_len];
+    const output = dst[0..dst_len];
+    const encoder = std.base64.standard.Encoder;
+    const encoded = encoder.encode(input, output) catch |err| {
+        return translateErr(err);
+    };
+    out_written.* = encoded.len;
+    return ERR_OK;
+}
+
+export fn b64_decode(
+    src: [*]const u8,
+    src_len: usize,
+    dst: [*]u8,
+    dst_len: usize,
+    out_written: *usize,
+) callconv(.C) c_int {
+    const input = src[0..src_len];
+    const output = dst[0..dst_len];
+    const decoder = std.base64.standard.Decoder;
+    const decoded = decoder.decode(output, input) catch |err| {
+        return translateErr(err);
+    };
+    out_written.* = decoded.len;
+    return ERR_OK;
+}
+
+// Helper to compute required output buffer size.
+export fn b64_encode_length(input_len: usize) callconv(.C) usize {
+    return std.base64.standard.Encoder.calcSize(input_len);
+}
+
+export fn b64_decode_length(input_len: usize) callconv(.C) usize {
+    return std.base64.standard.Decoder.calcSizeForSlice(input_len) catch {
+        // If input_len is invalid, return 0, letting caller know.
+        return 0;
+    };
+}
+```
+
+**Handcrafted header (`base64zig.h`):**
+
+```c
+#ifndef BASE64ZIG_H
+#define BASE64ZIG_H
+
+#include <stddef.h>
+
+#define B64ZIG_OK 0
+#define B64ZIG_ERR_INVALID_INPUT (-1)
+#define B64ZIG_ERR_BUFFER_TOO_SMALL (-2)
+
+int b64_encode(const unsigned char *src, size_t src_len,
+               unsigned char *dst, size_t dst_len,
+               size_t *out_written);
+
+int b64_decode(const unsigned char *src, size_t src_len,
+               unsigned char *dst, size_t dst_len,
+               size_t *out_written);
+
+size_t b64_encode_length(size_t input_len);
+size_t b64_decode_length(size_t input_len);
+
+#endif
+```
+
+**Build script snippet:**
+
+```zig
+const lib = b.addSharedLibrary(.{
+    .name = "base64zig",
+    .root_source_file = b.path("src/base64zig.zig"),
+    .target = target,
+    .optimize = optimize,
+});
+lib.installHeadersDirectory(b.path("include"), "", .{ .include_extensions = &.{".h"} });
+b.installArtifact(lib);
+```
+
+This installs both the shared library and the header. A C consumer includes the header, links `-lbase64zig`, and never sees Zig.
+
+#### Example 8.2: Providing Custom Allocator to C Callers
+
+Sometimes your library needs to allocate memory (e.g., returning strings). Instead of assuming `malloc`, you can let the C consumer inject an allocator.
+
+**Zig side:**
+
+```zig
+const std = @import("std");
+
+var gpa_instance: ?std.heap.GeneralPurposeAllocator(.{}) = null;
+var allocator: std.mem.Allocator = undefined;
+
+// Must be called before any other function.
+export fn mylib_set_allocator(
+    alloc_fn: ?*const fn (usize) callconv(.C) ?*anyopaque,
+    free_fn: ?*const fn (?*anyopaque) callconv(.C) void,
+) callconv(.C) void {
+    if (gpa_instance != null) {
+        gpa_instance.?.deinit();
+    }
+    if (alloc_fn == null or free_fn == null) {
+        // Fallback to libc allocator
+        gpa_instance = null;
+        allocator = std.heap.c_allocator;
+    } else {
+        const wrapper = std.heap.CustomAllocator{
+            .allocFn = @ptrCast(alloc_fn),
+            .freeFn = @ptrCast(free_fn),
+        };
+        allocator = wrapper.allocator();
+    }
+}
+```
+
+This pattern keeps Zig’s allocator abstraction intact while obeying C’s flat function pointer interface.
+
+#### Example 8.3: Error Messages for Debugging
+
+For complex operations, provide a function to retrieve the last error as a string.
+
+```zig
+var last_error: ?[:0]const u8 = null;
+
+export fn mylib_last_error() callconv(.C) ?[*:0]const u8 {
+    return if (last_error) |msg| msg.ptr else null;
+}
+```
+
+On the C side, you get a read-only null-terminated string. The memory can be owned by a static buffer or a thread-local arena.
+
+---
+
+### 9. Case Study: Wrapping a High-Performance Zig Parser for Python/Node.js via C
+
+Let’s walk through a real scenario: you’ve written a CSV parser in Zig that uses comptime-generated state machines and SIMD-accelerated field splitting. It’s fast — orders of magnitude faster than Python’s `csv` module. You want to expose it as a Python package and an npm module. The path: Zig → shared library → C headers → Python ctypes/cffi or Node.js `ffi-napi`.
+
+**Step 1: Design the C API.**
+
+We’ll provide an opaque `CsvParser` handle. The caller creates a parser, feeds chunks of data, retrieves parsed rows, and destroys the parser.
+
+```zig
+// csv_parser.zig
+const std = @import("std");
+const CsvParser = @import("internal.zig").Parser; // your internal impl
+
+pub const CsvHandle = opaque {};
+
+export fn csv_parser_create(delim: u8) callconv(.C) ?*CsvHandle {
+    const alloc = std.heap.c_allocator;
+    const parser = alloc.create(CsvParser) catch return null;
+    parser.* = CsvParser.init(alloc, delim) catch {
+        alloc.destroy(parser);
+        return null;
+    };
+    return @ptrCast(parser);
+}
+
+export fn csv_parser_feed(handle: *CsvHandle, data: [*]const u8, len: usize) callconv(.C) c_int {
+    const parser: *CsvParser = @ptrCast(@alignCast(handle));
+    parser.feed(data[0..len]) catch |err| {
+        // store error in parser for retrieval
+        parser.last_error = err;
+        return -1;
+    };
+    return 0;
+}
+
+export fn csv_parser_next_row(handle: *CsvHandle, out_num_fields: *usize) callconv(.C) ?*const [*]const u8 {
+    const parser: *CsvParser = @ptrCast(@alignCast(handle));
+    if (parser.nextRow()) |row| {
+        out_num_fields.* = row.fields.len;
+        return @ptrCast(row.fields.ptr);
+    }
+    return null;
+}
+
+export fn csv_parser_destroy(handle: *CsvHandle) callconv(.C) void {
+    const parser: *CsvParser = @ptrCast(@alignCast(handle));
+    parser.deinit();
+    const alloc = parser.allocator;
+    alloc.destroy(parser);
+}
+```
+
+**Step 2: Memory ownership.** The row fields returned by `csv_parser_next_row` are pointers into an internal buffer that remains valid until the next call to `feed` or `destroy`. We document that clearly. The C/Python/Node.js side must not free those pointers.
+
+**Step 3: Build system.** We modify `build.zig` to output a shared library and install headers.
+
+```zig
+const lib = b.addSharedLibrary(.{
+    .name = "csvzig",
+    .root_source_file = b.path("src/csv_parser.zig"),
+    .target = target,
+    .optimize = optimize,
+});
+// Copy header manually
+const install_header = b.addInstallFile(b.path("include/csvzig.h"), "include/csvzig.h");
+b.getInstallStep().dependOn(&install_header.step);
+b.installArtifact(lib);
+```
+
+**Step 4: Python binding via ctypes.** Write a thin Python module:
+
+```python
+import ctypes, sys
+lib = ctypes.CDLL("./libcsvzig.so")  # or appropriate platform name
+lib.csv_parser_create.argtypes = [ctypes.c_ubyte]
+lib.csv_parser_create.restype = ctypes.c_void_p
+...
+class CsvParser:
+    def __init__(self, delim=b','):
+        self.handle = lib.csv_parser_create(delim[0])
+    def feed(self, data: bytes):
+        ret = lib.csv_parser_feed(self.handle, data, len(data))
+        if ret != 0:
+            raise RuntimeError("feed failed")
+    ...
+```
+
+**Step 5: Node.js via `ffi-napi`.** Similarly, a minimal wrapper. Both bindings avoid data copying; the parsed fields are passed as pointer+length, which can be sliced as `Buffer` in Node or `bytes` in Python, directly into Zig’s internal memory. Zero-copy FTW.
+
+**ABI stability:** The opaque handle hides all details. Future versions can change the internal `CsvParser` struct entirely without breaking bindings. We provide version constants:
+
+```zig
+export fn csv_zig_version_major() callconv(.C) c_int { return 1; }
+export fn csv_zig_version_minor() callconv(.C) c_int { return 0; }
+```
+
+Consumers can check compatibility before using.
+
+**Performance:** The Zig parser is already fast. The FFI overhead is a few nanoseconds per call. The overall speedup compared to pure Python is typically 50–200x, making the C shim a negligible cost.
+
+---
+
+### Summary & Exercises
+
+**Summary:**
+- Exposing Zig as a C library is straightforward: use `export fn` with `callconv(.C)`, and opaque types to hide internals.
+- Translate error unions into integer return codes or out-pointers; never let Zig errors propagate into C.
+- Header generation is possible with `-femit-h`, but manual headers give a cleaner, more stable interface.
+- Design the API around explicit create/destroy pairs and clear ownership semantics to honor Zig’s “no hidden control flow” even across language boundaries.
+- Zig’s lack of a runtime, combined with `extern struct` ABI compatibility, makes it an ideal candidate for writing system libraries that outperform and outlive their C counterparts.
+
+**Exercises:**
+
+1. **Allocator injection API:** Extend the base64 example to accept custom allocation callbacks (like `mylib_set_allocator`). Then write a C test program that provides a tracking allocator and ensures no leaks.
+
+2. **Error message retrieval with thread safety:** Implement `mylib_last_error` using thread-local storage (via Zig’s `std.Thread.LocalVariable`) so that concurrent C threads see their own error state. Verify with a C program that spawns multiple threads.
+
+3. **ABI versioning with symbol versioning on Linux:** Create a library that exports versioned symbols using a linker script and Zig’s `export` with explicit `@export` options. Write a C consumer that links against the older ABI and still runs with the new library. Document the steps.
+
+4. **High-performance binding:** Take the CSV parser case study and build the full Python wheel distribution using `zig build` to cross-compile for multiple platforms (macOS, Linux, Windows). Provide a `setup.py` or `pyproject.toml` that automatically downloads the correct shared library. Consider using Zig’s build system as the backend for building Python packages.

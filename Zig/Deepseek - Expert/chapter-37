@@ -1,0 +1,633 @@
+## Chapter 37. Architecture & Project Structure
+
+> *"The architecture of a Zig project is the architecture of its data flow, made explicit. Not the architecture of a framework."*
+
+Seasoned engineers know that the structure of a codebase can accelerate or strangle a project. Zig’s minimalism gives you a fresh canvas: no imposed project layout, no package manager dictating folder hierarchies, no hidden wiring. But with that freedom comes responsibility. This chapter explores how to organise Zig code for long‑term maintainability, how to manage dependencies with `build.zig.zon`, why dependency injection in Zig is done with function parameters instead of a framework, and when too much structure becomes ceremony.
+
+We’ll move from the everyday mechanics of a multi‑module project (Basic Usage) to the compile‑time machinery that resolves `@import` (Under the Hood), then to the philosophical “why” behind Zig’s choices, comparisons with C, Rust, Go, and C++, common traps, performance implications, best practices, a complete example, and finally exercises that test your architectural instincts.
+
+---
+
+### 1. Basic Usage
+
+At its simplest, a Zig project is a collection of `.zig` files that `@import` each other. There are no header files, no `namespace` keywords, and no package manifest *inside* the source. The build system, `build.zig`, declares how those files become libraries, executables, or tests. Dependencies are versioned and retrieved using a `build.zig.zon` file.
+
+#### A Minimal Multi‑File Project
+
+Let’s build a tiny CLI that prints a UUID. We’ll have a library module, a main executable, and a dependency on a community UUID package.
+
+```
+my_project/
+  build.zig
+  build.zig.zon
+  src/
+    main.zig
+    lib.zig
+  tests/
+    test_lib.zig
+```
+
+- **`src/lib.zig`** – the reusable library.
+- **`src/main.zig`** – the entry point that uses the library.
+- **`tests/test_lib.zig`** – separate test file.
+
+##### `src/lib.zig`
+
+```zig
+const std = @import("std");
+const uuid = @import("uuid"); // from a dependency
+
+pub fn generate_id(allocator: std.mem.Allocator) ![]const u8 {
+    // Acquire 16 random bytes from the OS
+    var bytes: [16]u8 = undefined;
+    std.crypto.random.bytes(&bytes);
+
+    // Format as UUID string (the dependency's function)
+    return uuid.format(allocator, bytes);
+}
+```
+
+##### `src/main.zig`
+
+```zig
+const std = @import("std");
+const lib = @import("lib.zig");
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const id = try lib.generate_id(allocator);
+    defer allocator.free(id);
+
+    const stdout = std.io.getStdOut().writer();
+    try stdout.print("{s}\n", .{id});
+}
+```
+
+##### `tests/test_lib.zig`
+
+```zig
+const std = @import("std");
+const lib = @import("../src/lib.zig");
+
+test "generate_id returns valid UUID format" {
+    const allocator = std.testing.allocator;
+    const id = try lib.generate_id(allocator);
+    defer allocator.free(id);
+
+    // UUIDs have 36 characters (8-4-4-4-12)
+    try std.testing.expectEqual(@as(usize, 36), id.len);
+}
+```
+
+#### The Build System (`build.zig` and `build.zig.zon`)
+
+The `build.zig.zon` file specifies dependencies with their URLs and content hashes. Zig’s package manager uses this to fetch and verify the code.
+
+```zon
+.{
+    .name = "my_project",
+    .version = "0.1.0",
+    .dependencies = .{
+        .uuid = .{
+            .url = "https://github.com/Hejsil/zig-uuid/archive/refs/tags/v0.1.0.tar.gz",
+            .hash = "1220f6f...", // sha256 truncated
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "tests",
+    },
+}
+```
+
+Now `build.zig` wires everything together. We’ll create an executable that depends on the library, and a test step that runs our test file.
+
+```zig
+const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    // Fetch the UUID dependency declared in build.zig.zon
+    const uuid_dep = b.dependency("uuid", .{});
+
+    // Create a shared module for our library
+    const lib_mod = b.createModule(.{
+        .root_source_file = b.path("src/lib.zig"),
+        .imports = &.{
+            .{ .name = "uuid", .module = uuid_dep.module("uuid") },
+        },
+    });
+
+    // Build the executable
+    const exe = b.addExecutable(.{
+        .name = "my_project",
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    exe.root_module.addImport("lib.zig", lib_mod);
+    // The executable also needs the uuid import, because lib.zig re‑exports it.
+    // We add the same dependency to the executable module.
+    exe.root_module.addImport("uuid", uuid_dep.module("uuid"));
+    b.installArtifact(exe);
+
+    // Tests: compile the test file and include lib_mod
+    const tests = b.addTest(.{
+        .root_source_file = b.path("tests/test_lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    tests.root_module.addImport("uuid", uuid_dep.module("uuid"));
+    // Note: test_lib.zig imports "../src/lib.zig" directly, so we don't need to add the lib module.
+    const run_tests = b.addRunArtifact(tests);
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&run_tests.step);
+}
+```
+
+Now `zig build run` runs the executable; `zig build test` runs the test.
+
+This small example demonstrates the core architecture patterns:
+- **Files are modules** – import by relative path.
+- **Explicit dependency passing** – `allocator` is handed to every function that needs to allocate.
+- **No hidden globals** – no log singleton, no global allocator.
+- **Build system as code** – the structure is scripted, not convention‑driven.
+
+---
+
+### 2. Under the Hood
+
+Understanding what happens when Zig encounters `@import` clarifies why the project structure works the way it does.
+
+#### Module Resolution Is Comptime and File‑Based
+
+Every `@import("path")` is evaluated at compile time. Zig treats each imported file as a separate *module* (a `struct` representation of the file’s public declarations). There are no separate `mod.zig` or `package.zig` markers; the file itself is the namespace. The compiler walks the import graph starting from the root source file, parsing and semantically analysing each module exactly once (lazy loading is used internally, but the full import graph is known before codegen).
+
+This means:
+- Circular imports are forbidden – the compiler detects them and emits a clear error. You cannot have `a.zig` importing `b.zig` that imports `a.zig`. This forces a directed acyclic graph of dependencies, which simplifies reasoning about code.
+- Import paths are relative to the importing file. There is no global module path. This keeps projects self‑contained; moving a file just requires adjusting relative imports, exactly like C’s `#include` but without the textual inclusion nightmare.
+
+#### The Role of `build.zig` and Packages
+
+While raw `@import` works with relative file paths, the build system extends this with *packages*. A package is a named collection of modules (often a single root module) that can be imported by other code via a symbolic name rather than a relative path. The mapping from symbolic name to actual module is set up in `build.zig` using `addImport` or `createModule`.
+
+When you write `const uuid = @import("uuid");`, the compiler doesn’t search a global package registry. Instead, the build script injected an import named `"uuid"` that points to the pre‑compiled module from the dependency. This is fundamentally different from Cargo or npm: there is no runtime component, and the mapping is explicit in the build graph, not inferred from a directory structure.
+
+#### Compilation Units and Incremental Builds
+
+Zig compiles the entire program (or library) as a single compilation unit by default. All modules are merged and then translated to LLVM IR (or the self‑hosted backend). This enables whole‑program optimisation and comptime evaluation across module boundaries. However, the build system can also create separate compilation units (e.g., static libraries) and link them. The `b.addStaticLibrary` or `b.addObject` steps produce objects that the linker glues together.
+
+This has performance implications: changing one file recompiles the entire dependent graph, but because Zig’s compiler is fast and the intermediate representation is cached, incremental builds are typically snappy even for large projects. For enormous codebases, splitting into separate libraries that rarely change can speed up iteration, but the cost is lost optimisation opportunities. The Zig build system does not yet support fine‑grained incremental compilation at the module level (like Rust’s query system), but the single‑unit model simplifies the implementation and avoids the need for a complex incremental computation engine.
+
+#### Dependency Resolution and Reproducibility
+
+`build.zig.zon` records the exact content hash of each dependency. The package manager fetches the tarball, verifies the hash, and stores it in the global cache (`~/.cache/zig`). Multiple projects can share the same cached dependency. The hash pins a specific version, guaranteeing that builds are reproducible. There is no `Cargo.lock` file; the `build.zig.zon` serves as both manifest and lockfile.
+
+---
+
+### 3. Why This Design?
+
+Zig’s project architecture philosophy is an extension of its core tenets: **no hidden control flow**, **explicit is better than implicit**, and **comptime over runtime magic**.
+
+#### Why File‑Based Modules Without Packages?
+
+In C, modules are emulated with header files and a separate linking step. In Rust, modules are organised into a hierarchy with `mod` declarations and `Cargo.toml`. Zig chooses the simplest possible abstraction: *a file is a module*. There is no need for a `pub mod foo;` statement because the file’s public declarations define the API. This eliminates a layer of indirection and makes refactoring trivial. You rename a file, you change the import string. The compiler tells you immediately if something breaks.
+
+When a project grows, you can group related files into a directory and use a `mod.zig` (a common convention, not a language requirement) that re‑exports public symbols from sibling files. But that convention is just another `.zig` file, not a special manifest. This is an explicit, visible control flow for how symbols are exposed. Nothing is hidden.
+
+#### Why Dependency Injection via Parameters, Not Frameworks?
+
+Zig has no built‑in concept of a “DI container” or service locator. The preferred pattern is to pass dependencies as function parameters or bundle them into a context struct. For instance, every function that allocates takes an `std.mem.Allocator` argument. If a module needs logging, it receives a logger (a simple struct with a `log` method) as a parameter, not a global.
+
+This is not just a style choice; it is a direct consequence of “no hidden control flow”. A framework that auto‑wires constructors or scans for annotations introduces implicit runtime behaviour. In Zig, the data flow is visible in the call graph. When you read a function signature, you see everything it needs. Testing becomes trivial: you pass a test allocator, a test logger, and a mock output. There is no magic to tear down.
+
+#### Hexagonal Architecture in Zig? Only When It Pays Off
+
+Ports and adapters (hexagonal architecture) aim to isolate business logic from infrastructure. Zig’s module system and explicit parameters make it easy to achieve that isolation without a heavyweight framework. You can define an `interface` as a set of function pointers (or a `usingnamespace` trick), but often a simple context struct suffices:
+
+```zig
+const DbInterface = struct {
+    getUser: *const fn (id: u64) anyerror!User,
+    saveUser: *const fn (user: User) anyerror!void,
+};
+```
+
+Your business logic depends on a `DbInterface` instance. In `main.zig` you provide a real PostgreSQL adapter; in tests, a mock. There is no container wiring, no XML configuration – just plain Zig structs passed around.
+
+Zig encourages you to ask: *“Do I need the flexibility of swapping adapters at runtime, or can I use comptime to specialise the code?”* For many systems, the database backend is fixed for a given build target. Using comptime parameters, you can eliminate the virtual call overhead entirely. Hexagonal architecture at runtime adds indirection and complexity. Zig’s comptime lets you have the architectural separation *at compile time*, producing a final binary without dynamic dispatch when you don’t need it. That is a profoundly different trade‑off.
+
+#### When Structure Becomes Ceremony
+
+A common pitfall for engineers coming from Java or C# is to over‑structure a Zig project: interfaces for everything, repositories, factories, service locators. Zig’s philosophy is that code structure should mirror data flow, not a textbook pattern. If a function can be expressed as a pure computation that takes an allocator and returns a result, wrapping it in a “Service” struct with two methods adds cognitive load for no benefit. Ceremony is any code that exists to satisfy an architectural ideal rather than to solve a problem. Zig’s minimalism gently pushes you to recognise that ceremony and strip it away. The result is a codebase that is leaner, faster, and easier to reason about.
+
+---
+
+### 4. Competing Approaches
+
+#### C: Header Files and Manual Build Orchestration
+
+In C, project structure is defined by `#include` paths and a build system like Make or CMake that lists source files. There is no module system; the preprocessor literally copies headers. Zig eliminates header files entirely – the compiler understands imports and handles type checking across modules without text duplication. C’s approach often leads to fragile include ordering and macro leaks; Zig’s modules are hygienic and side‑effect‑free. For dependency management, C projects typically use system package managers or vendoring. Zig’s `build.zig.zon` provides reproducible, hash‑pinned dependencies without relying on the host system.
+
+#### Rust: Cargo Workspaces and Module Hierarchies
+
+Rust’s module system is tree‑structured: `mod` declarations create a hierarchy, and visibility is controlled with `pub(crate)`, `pub(super)`, etc. While this enforces encapsulation, it can also lead to deep nesting and re‑export chains. Zig’s flat file‑based imports are simpler: there’s no `mod` keyword, and visibility is per‑file (`pub` means visible to importers). Workspaces in Cargo allow multiple crates in a repository, with each crate having its own `Cargo.toml`. Zig has no equivalent of workspaces; you either keep everything in one package (monorepo) or split into separate packages imported via `build.zig.zon`. The lack of a workspace concept means there is no implicit inter‑crate dependency tracking; if you need to share code, you either use relative imports (within the same package) or publish a separate dependency. This may seem limiting, but it prevents the “workspace sprawl” where tiny internal crates multiply needlessly.
+
+For dependency injection, Rust relies heavily on traits and generics, often leading to intricate type machinery. Zig uses comptime duck typing and function pointers, yielding less boilerplate at the cost of weaker compile‑time interface checks (though `@typeInfo` can enforce contracts at comptime if needed).
+
+#### Go: Package Paths and Implicit Interfaces
+
+Go organises code into packages identified by import paths (e.g., `"github.com/user/repo/foo"`). There is no module hierarchy inside a package; all `.go` files in the same directory belong to the same package. Zig’s granularity is per‑file: each `.zig` file is its own namespace. This gives finer control: you can have many small, independent modules in a single directory without name collisions. Go’s package system is tied to the directory structure, which can make refactoring harder when you want to split a package. Zig’s relative imports are resilient to file moves as long as import strings are updated.
+
+Go’s approach to dependencies is to pass interfaces implicitly. Zig requires explicit struct/function pointer passing, which makes dependencies visible in the call tree – no surprise `io.Reader` being satisfied by some unknown type.
+
+#### C++: Headers, Namespaces, and Build‑System Complexity
+
+C++ projects struggle with the header‑source separation, `#include` cycles, and complex build system configurations (CMake). Modules (C++20) attempt to fix this but adoption is slow. Zig’s unified model where `.zig` files serve as both interface and implementation is a breath of fresh air. Namespaces in C++ serve both organisational and versioning purposes, but they can be misused to create deeply nested hierarchies. Zig has no namespace keyword; `@import` returns a struct, so you can simulate namespaces by importing into a variable and using `ns.someFunc()`, but the idiomatic way is to keep the module flat and use descriptive function names. This reduces the need for “using namespace” and the associated ambiguities.
+
+---
+
+### 5. Common Mistakes
+
+#### Over‑Abstracting with OOP‑Style Interfaces
+
+Newcomers from Java/C++ often try to replicate class hierarchies by defining vtables and “abstract” structs. For example:
+
+```zig
+const Parser = struct {
+    vtable: *const VTable,
+    // ...
+};
+```
+
+While this is sometimes necessary (e.g., for runtime polymorphism), in many cases a tagged union with a `switch` is clearer and faster. Prematurely introducing vtables adds indirection, allocation, and ceremony. Zig’s tagged unions are the idiomatic way to model open‑choice types. Only reach for a vtable when the set of implementations is truly open and determined at runtime (like a plugin system). Even then, consider whether comptime can specialise the code path based on a known type.
+
+#### Misusing `catch unreachable` as an Architectural Crutch
+
+When structuring error handling across module boundaries, it’s tempting to use `catch unreachable` to silence errors that “can’t happen”. But the whole point of Zig’s explicit error unions is to propagate errors. Using `catch unreachable` in library code robs the caller of the ability to decide. It also hides bugs. If your architecture leads to many `catch unreachable` calls, it’s a sign that your error handling strategy needs to be redesigned – likely by threading error returns all the way up.
+
+#### Premature Splitting into Separate Packages
+
+Before `build.zig.zon` matures, it might be tempting to extract every utility function into a separate Git repository and declare it as a dependency. This introduces version‑management overhead, network dependencies for fresh builds, and friction during development. For code that is tightly coupled and evolves together, a monorepo with relative imports is simpler and faster. Split into separate packages only when a module is genuinely reusable across unrelated projects and has a stable API.
+
+#### Forgetting That `@import` Is Cached and Eager
+
+Because imports are processed at compile time, importing a large module that performs heavy comptime work (e.g., generating lookup tables) will slow down every file that imports it. The comptime execution is not shared across importers if they are separate compilation units, but within the same compilation unit the import is evaluated once. Still, be mindful of putting expensive comptime logic in a library module that is widely used. Consider lazy evaluation patterns or moving the heavy work into a dedicated build step.
+
+#### Using a Global Allocator
+
+A typical C/C++ mistake is a global `malloc` replacement. Zig makes it easy to pass allocators, but some developers still create a global `var gpa = ...` and use it everywhere. This destroys thread safety, testability, and memory tracking. Always pass an allocator. If you must have a default, use a parameter with a default value that the caller can override – but even then, the caller is forced to see that an allocation might happen.
+
+---
+
+### 6. Performance Considerations
+
+#### Compilation Time and Module Granularity
+
+Zig’s compiler is fast, but project structure affects compilation time. A single monolithic file forces the compiler to process everything whenever any part changes. Many small files allow the build system (in theory) to re‑use cached analysis, but as of Zig 0.13 the compiler still re‑compiles the entire dependent graph. However, there is a psychological benefit: small, focused modules reduce the cognitive load and make it easier to reason about parallelism. In the future, finer‑grained incremental compilation may leverage module boundaries.
+
+The real performance trap is excessive comptime work at module scope. For example:
+
+```zig
+const precomputed = comptime blk: {
+    // heavy computation
+};
+```
+
+This runs every time the module is compiled, which is every time a dependent module changes (within the same compilation unit). If the result is large, it bloats the binary and slows compilation. If the table is constant, consider generating it in a build step and embedding it as a static array.
+
+#### Runtime Cost of Architectural Abstraction
+
+Every layer of indirection has a cost. A virtual call (function pointer) prevents inlining and can stall the pipeline. A context struct passed by pointer adds a dereference. Zig’s comptime allows many abstractions to be zero‑cost. For example, instead of a runtime `DbInterface`, you can parameterise your business logic with a comptime type:
+
+```zig
+fn processUser(comptime Db: type, db: Db, id: u64) !void {
+    // Db must have a getUser method, enforced by comptime duck‑typing
+    const user = try db.getUser(id);
+    // ...
+}
+```
+
+At the call site, you instantiate with the concrete type, and the compiler monomorphises the code, inlining the `getUser` call if possible. There is no vtable, no pointer chase. This is a powerful alternative to hexagonal architecture at runtime; it gives you separation of concerns at source level with performance of direct calls.
+
+#### Cache Locality and Data‑Oriented Design
+
+Project structure influences how easy it is to adopt data‑oriented design. A flat module hierarchy encourages grouping data structures and algorithms by their access patterns, not by conceptual layers. Zig’s `MultiArrayList` and packed structs thrive when the codebase isn’t fragmented into tiny, disconnected modules that spread related logic across the codebase. Keep logic close to the data it manipulates. This is sometimes in tension with “clean architecture,” but performance‑sensitive systems often benefit from a more data‑centric layout.
+
+---
+
+### 7. Best Practices
+
+#### Start Flat, Add Depth Only When Needed
+
+Begin with a single `src` directory containing a few files. As the project grows, you might group files into subdirectories: `src/db/`, `src/api/`, `src/cli/`. Each subdirectory may have a `mod.zig` that re‑exports the public API of that component, but it’s not mandatory. This convention mirrors the standard library’s own structure (e.g., `std/mem.zig`, `std/math.zig`). The key is to let the structure emerge from the needs of the project, not from a preconceived layered architecture.
+
+#### Explicit Dependency Passing
+
+Follow the “allocator, writer, logger” pattern: if a function needs external services, receive them as arguments. For functions with many dependencies, bundle them into a context struct:
+
+```zig
+const Context = struct {
+    allocator: std.mem.Allocator,
+    logger: Logger,
+    db: *Database,
+};
+
+fn doWork(ctx: Context, input: []const u8) !Result {
+    // use ctx.allocator, ctx.logger, ctx.db
+}
+```
+
+This makes dependencies visible at the call site and simplifies testing – you can pass mock dependencies without any framework.
+
+#### Use a Monorepo for Tightly Coupled Projects
+
+If your application consists of a library, a CLI, and a GUI that share a common core, keep them in one repository. They can be separate executables or libraries in the same `build.zig`:
+
+```zig
+const lib = b.addStaticLibrary(.{ ... });
+const cli = b.addExecutable(.{ ... });
+cli.linkLibrary(lib);
+```
+
+This avoids version skew and lets you refactor across the entire codebase atomically. Only split into separate packages when the API is stable and the component is reused by external consumers.
+
+#### Dependency Management with `build.zig.zon`
+
+- Pin exact hashes.
+- Avoid importing dependencies from local paths for reproducible builds (use that only during development of the dependency itself).
+- Specify minimal required fields; `build.zig.zon` supports `dependencies`, `paths`, `name`, `version`.
+
+#### Model Architecture with Comptime When Possible
+
+Before reaching for runtime polymorphism (vtables, function pointers), ask if the variation can be resolved at compile time. Use comptime parameters or `@typeInfo` to switch implementations. This yields monomorphic, inlineable code with no performance penalty. Only fall back to dynamic dispatch when the set of implementations is truly unknown at compile time or must be loaded at runtime (e.g., plugins).
+
+#### Directory Layout Convention (Zig Standard Library Style)
+
+The standard library is a good reference: top‑level files are major categories (`mem.zig`, `math.zig`). Submodules (e.g., `mem.Allocator`) are inside those files. If a file becomes too large, split it into a directory with a `mod.zig` that re‑exports the public interface. Example:
+
+```
+src/
+  net/
+    mod.zig        // pub usingnamespace @import("tcp.zig"); ...
+    tcp.zig
+    udp.zig
+```
+
+Consumers simply do `const net = @import("net/mod.zig");` and use `net.TcpStream`.
+
+---
+
+### 8. Examples
+
+Let’s build a more complete, buildable example that demonstrates a modest project structure with a library, an executable, tests, and dependency injection. We’ll simulate a simple “user service” that sends a welcome email. The email sender is abstracted behind an interface.
+
+#### Project Structure
+
+```
+welcome_app/
+  build.zig
+  build.zig.zon
+  src/
+    main.zig
+    lib.zig
+    email/
+      mod.zig
+      interface.zig
+      smtp_sender.zig
+    user_service.zig
+  tests/
+    test_user_service.zig
+```
+
+##### `src/email/interface.zig`
+
+Defines the EmailSender interface as a struct of function pointers.
+
+```zig
+const std = @import("std");
+
+pub const Email = struct {
+    to: []const u8,
+    subject: []const u8,
+    body: []const u8,
+};
+
+pub const EmailSender = struct {
+    ptr: *anyopaque,
+    sendFn: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, email: Email) anyerror!void,
+
+    pub fn send(self: EmailSender, allocator: std.mem.Allocator, email: Email) !void {
+        return self.sendFn(self.ptr, allocator, email);
+    }
+};
+```
+
+##### `src/email/smtp_sender.zig`
+
+A concrete implementation that (pretends to) deliver emails via SMTP.
+
+```zig
+const std = @import("std");
+const iface = @import("interface.zig");
+
+pub const SmtpSender = struct {
+    server: []const u8,
+    port: u16,
+
+    pub fn init(server: []const u8, port: u16) SmtpSender {
+        return .{ .server = server, .port = port };
+    }
+
+    fn sendImpl(ptr: *anyopaque, allocator: std.mem.Allocator, email: iface.Email) anyerror!void {
+        const self: *SmtpSender = @ptrCast(@alignCast(ptr));
+        _ = allocator; // would be used to format SMTP commands
+        _ = self;
+        // Simulate sending
+        std.debug.print("Sending email to {s} via {s}:{d}\n", .{ email.to, self.server, self.port });
+    }
+
+    pub fn sender(self: *SmtpSender) iface.EmailSender {
+        return .{
+            .ptr = self,
+            .sendFn = sendImpl,
+        };
+    }
+};
+```
+
+##### `src/email/mod.zig`
+
+Re‑exports the public interface.
+
+```zig
+pub const interface = @import("interface.zig");
+pub const smtp_sender = @import("smtp_sender.zig");
+```
+
+##### `src/user_service.zig`
+
+Contains business logic that depends on an `EmailSender`.
+
+```zig
+const std = @import("std");
+const email = @import("email/mod.zig");
+
+pub fn sendWelcomeEmail(
+    allocator: std.mem.Allocator,
+    sender: email.interface.EmailSender,
+    user_email: []const u8,
+) !void {
+    const welcome = email.interface.Email{
+        .to = user_email,
+        .subject = "Welcome!",
+        .body = "Thank you for joining.",
+    };
+    try sender.send(allocator, welcome);
+}
+```
+
+##### `src/lib.zig`
+
+Simply re‑exports the public API of the library.
+
+```zig
+pub const user_service = @import("user_service.zig");
+pub const email = @import("email/mod.zig");
+```
+
+##### `src/main.zig`
+
+Wires everything together: creates the SMTP sender and calls the service.
+
+```zig
+const std = @import("std");
+const lib = @import("lib.zig");
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var smtp = lib.email.smtp_sender.SmtpSender.init("smtp.example.com", 587);
+    const sender = smtp.sender();
+
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+    if (args.len < 2) {
+        std.debug.print("Usage: welcome_app <email>\n", .{});
+        return error.MissingArgument;
+    }
+
+    try lib.user_service.sendWelcomeEmail(allocator, sender, args[1]);
+}
+```
+
+##### `tests/test_user_service.zig`
+
+Tests the user service with a mock sender.
+
+```zig
+const std = @import("std");
+const lib = @import("../src/lib.zig");
+
+const MockSender = struct {
+    sent_count: u32 = 0,
+
+    fn sendImpl(ptr: *anyopaque, allocator: std.mem.Allocator, email: lib.email.interface.Email) anyerror!void {
+        const self: *MockSender = @ptrCast(@alignCast(ptr));
+        _ = allocator;
+        _ = email;
+        self.sent_count += 1;
+    }
+
+    fn sender(self: *MockSender) lib.email.interface.EmailSender {
+        return .{
+            .ptr = self,
+            .sendFn = sendImpl,
+        };
+    }
+};
+
+test "sendWelcomeEmail calls sender once" {
+    const allocator = std.testing.allocator;
+    var mock = MockSender{};
+    const sender = mock.sender();
+
+    try lib.user_service.sendWelcomeEmail(allocator, sender, "test@example.com");
+    try std.testing.expectEqual(@as(u32, 1), mock.sent_count);
+}
+```
+
+##### `build.zig`
+
+```zig
+const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    const exe = b.addExecutable(.{
+        .name = "welcome_app",
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    b.installArtifact(exe);
+
+    const tests = b.addTest(.{
+        .root_source_file = b.path("tests/test_user_service.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const run_tests = b.addRunArtifact(tests);
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&run_tests.step);
+}
+```
+
+##### `build.zig.zon` (no external dependencies)
+
+```zon
+.{
+    .name = "welcome_app",
+    .version = "0.1.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "tests",
+    },
+}
+```
+
+This example demonstrates:
+- Layered architecture with email interface and concrete sender.
+- Dependency injection via a simple vtable interface (function pointers).
+- Clear separation of business logic (`user_service`) and infrastructure (`email/smtp_sender`).
+- Testing with a mock implementation that doesn’t require any framework.
+- No hidden globals, no magic wiring.
+
+---
+
+### 9. Summary & Exercises
+
+Zig’s approach to project architecture is an extension of its core values: make dependencies explicit, avoid hidden control flow, and leverage compile‑time execution to eliminate runtime overhead. File‑based modules and a scripted build system give you complete control. Dependency injection is achieved through ordinary parameters and context structs, not frameworks. Over‑architecture is a real danger – Zig encourages you to start simple and add complexity only when the problem demands it. When you do need separation of concerns, comptime polymorphism often yields a faster, leaner result than runtime polymorphism.
+
+#### Exercises
+
+1. **Refactor a spaghetti program**
+   Take a single‑file Zig program that does everything in `main` (allocates, reads files, processes data, writes output). Split it into a library module for the core logic, a CLI module for argument parsing, and a file I/O module. Ensure all allocations use a passed‑in allocator. Provide a test file that verifies the core logic independently of I/O. The result should build with `zig build` and run tests with `zig build test`.
+
+2. **Design a multi‑platform library structure**
+   You’re building a library that must work on desktop (Linux/macOS/Windows), WebAssembly (browser and WASI), and a bare‑metal embedded target. Using Zig’s build system and comptime conditional compilation, design the project layout and `build.zig` that exposes a unified API but selects platform‑specific backends (e.g., a random number generator using OS entropy vs. hardware RNG vs. a simple LCG for WASI). Write the build script and stub modules that demonstrate how to switch implementations at compile time without runtime dispatch. Explain why you chose monorepo vs. separate packages.
+
+3. **Implement a plugin system with comptime dispatch**
+   Create a tiny application that loads “plugins” – but instead of dynamic loading, you want to compile plugins into the binary and select which one to use at runtime via a command‑line flag. However, the hot path must have zero dispatch overhead. Design a compile‑time registry that, given a list of plugin types at build time, generates a jump table or a switch dispatch that monomorphises the critical loop. Your solution should show how Zig’s comptime can replace a traditional vtable‑based plugin architecture, yielding better performance and simpler code.

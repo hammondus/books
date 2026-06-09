@@ -1,0 +1,546 @@
+## Chapter 33: File & OS Operations
+
+File and operating system interaction is the bread and butter of systems programming. In Zig, `std.fs` provides a cohesive, cross-platform API that exposes the real capabilities of the underlying OS without burying them under layers of abstraction. This chapter covers file I/O, directory manipulation, path handling, environment variables, and process spawning. By the end, you will not only understand the `std.fs` module but also be able to build robust command-line tools that feel like first-class citizens on any platform.
+
+---
+
+### 1. Basic Usage
+
+Every file operation starts with a **directory handle**, represented by `std.fs.Dir`. The most common starting points are `std.fs.cwd()` for the current working directory, and `std.fs.openDirAbsolute` (or `cwd().openDir`) for navigating to other directories.
+
+#### Opening and Creating Files
+
+```zig
+const std = @import("std");
+
+pub fn main() !void {
+    const allocator = std.heap.page_allocator;
+
+    // Open for reading
+    const file = try std.fs.cwd().openFile("input.txt", .{});
+    defer file.close();
+
+    // Open for writing (create or truncate)
+    const out_file = try std.fs.cwd().createFile("output.txt", .{ .read = false });
+    defer out_file.close();
+
+    // Read entire file into allocated buffer
+    const contents = try file.readToEndAlloc(allocator, 1024 * 1024 * 100); // 100 MB limit
+    defer allocator.free(contents);
+    _ = contents;
+
+    // Write bytes
+    try out_file.writeAll("Hello, Zig!\n");
+}
+```
+
+The `.{}` flags argument to `openFile` and `createFile` uses default permissions and exclusive access if not specified. Use `.{}` for a read‑only open; for write‑only, you often want `.{}` as well (but `createFile` is write‑only by default). More sophisticated modes like `openFile` with `.mode = .read_write` are available. Under Windows, `createFile` can take `share_mode` flags; on Unix, the default mode is `0o666` modified by `umask`, but you can pass `.mode` to set it explicitly.
+
+#### Reading Line by Line
+
+Zig’s buffered I/O is opt‑in. To read a text file line by line, wrap the file’s `reader()` in a `std.io.BufferedReader` and use a `std.io.fixedBufferStream`:
+
+```zig
+pub fn readLines(allocator: std.mem.Allocator, path: []const u8) !void {
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+
+    var buf_reader = std.io.bufferedReader(file.reader());
+    const reader = buf_reader.reader();
+    var line_buf: [4096]u8 = undefined;
+
+    while (try reader.readUntilDelimiterOrEof(&line_buf, '\n')) |line| {
+        // line is a slice into line_buf; copy it if you need ownership
+        const owned = try allocator.dupe(u8, line);
+        defer allocator.free(owned);
+        // process line...
+        _ = owned;
+    }
+}
+```
+
+For the common case of reading all lines into an `ArrayList` of strings, you can use `readUntilDelimiterAlloc` or write a small helper.
+
+#### Directory Traversal
+
+`std.fs.Dir` exposes an **iterator** that yields `std.fs.Dir.Entry` structs, containing the entry’s name (a slice into a provided buffer) and its `Kind` (file, directory, symlink, etc.).
+
+```zig
+pub fn listDir(path: []const u8) !void {
+    var dir = try std.fs.cwd().openDir(path, .{ .iterate = true });
+    defer dir.close();
+
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        std.debug.print("{s}: {s}\n", .{ @tagName(entry.kind), entry.name });
+    }
+}
+```
+
+The iterator reuses an internal buffer, so no allocation occurs unless you copy the name. If you need to store names, `dupe` them with an allocator.
+
+#### Path Manipulation
+
+The `std.fs.path` namespace provides functions that work with raw `[]const u8` slices, never allocating (except for `join` variants that need an allocator). It is fully cross‑platform:
+
+```zig
+const base = "/home/user";
+const file = "docs/readme.txt";
+const full = try std.fs.path.join(allocator, &.{ base, file });
+defer allocator.free(full);
+// full is "/home/user/docs/readme.txt" on Unix, "C:\home\user\docs\readme.txt" on Windows
+```
+
+Other important functions:
+- `std.fs.path.dirname` and `basename`
+- `std.fs.path.extension`
+- `std.fs.path.isAbsolute`
+- `std.fs.path.resolve` (allocates)
+- `std.fs.path.sep` (platform‑appropriate separator)
+
+#### Environment Variables and Process Spawning
+
+Access environment variables with `std.process.getEnvVarOwned` (allocating) or `std.os.getenv` (returns null‑terminated pointer, can fail).
+
+```zig
+const home = try std.process.getEnvVarOwned(allocator, "HOME");
+defer allocator.free(home);
+```
+
+Spawning a child process is done with `std.process.Child`. This struct allows setting the executable, arguments, environment, working directory, and I/O redirection.
+
+```zig
+pub fn runCommand(allocator: std.mem.Allocator, argv: []const []const u8) !void {
+    var child = std.process.Child.init(argv, allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    try child.spawn();
+
+    const stdout = child.stdout.?.reader().readAllAlloc(allocator, 1024 * 1024);
+    const stderr = child.stderr.?.reader().readAllAlloc(allocator, 1024 * 1024);
+    defer allocator.free(stdout);
+    defer allocator.free(stderr);
+
+    const term = try child.wait();
+    std.debug.print("Exit code: {d}\nstdout: {s}\nstderr: {s}\n", .{ term.ExitCode, stdout, stderr });
+}
+```
+
+The `init` function takes a slice of arguments where `argv[0]` is the executable path; `allocator` is used only for the environment block if needed.
+
+---
+
+### 2. Under the Hood
+
+Zig’s `std.fs` is a **thin, zero‑cost abstraction** over operating system syscalls. The implementation lives primarily in `std.os` (and platform‑specific backends like `std.os.linux`, `std.os.windows`, `std.os.darwin`, etc.). Each `std.fs.Dir` wraps an **OS file descriptor** (or a `HANDLE` on Windows) and a `kind` (e.g., `.absolute`, `.cwd`, `.relative`). The `File` struct similarly wraps a descriptor.
+
+#### How `openFile` Becomes a Syscall
+
+When you call `std.fs.Dir.openFile`, the Zig runtime eventually calls `std.os.openat` (on Unix) or `std.os.windows.CreateFileW` (on Windows). The `Dir` holds the base descriptor for `openat`, enabling safe relative opens. The flags you provide (`.mode`, `.read`, `.write`, etc.) are translated into `O_RDONLY`, `O_CREAT`, `O_TRUNC`, or `GENERIC_READ` etc., depending on the platform. If `libc` is available, the syscall may go through the C library; for freestanding targets, Zig does direct inline syscalls using `syscall` instructions, guaranteeing no hidden libc overhead.
+
+#### Path Handling and UTF‑8
+
+Zig stores all paths as simple `[]const u8` slices, assuming valid UTF‑8. This is a deliberate design choice that avoids the `wchar_t`/`Path`/`PathBuf` complexity seen in other languages.
+
+- On **Unix**, the kernel treats paths as opaque byte sequences (though most systems assume UTF‑8). Zig just passes the bytes through.
+- On **Windows**, the native filesystem API uses UTF‑16 with `WCHAR` strings. Zig automatically converts to `WTF-8` (a superset of UTF‑8 that can encode ill‑formed UTF‑16 surrogates) behind the scenes. The standard library contains a transcoder that avoids allocation when possible by using a stack buffer and falling back to a heap allocation only if the path is unusually long or contains surrogate pairs. The conversion is transparent; you always pass `[]const u8` and get `[]const u8` back.
+
+The `std.fs.path` functions are purely arithmetic on slices; they never touch the OS.
+
+#### Memory and Resource Model
+
+`Dir` and `File` are **non‑copyable** but safe to move. They implement a “close on free” semantic only if you use `defer`; the Zig language itself does not invoke destructors. The file descriptor is closed explicitly via `close()`, which can return an error (e.g., `error.InputOutput` when flushing fails). That’s why ignoring the return value of `close` is dangerous—you might miss a write error. Zig’s standard library encourages `defer file.close()` but also makes the `close` call explicit so you can handle errors if you need to (most applications simply `defer` and accept that errors during close may be lost; that’s an acceptable trade‑off in many cases, but be aware).
+
+#### Iterators
+
+The `Dir.iterate()` method returns a `Dir.Iterator` that internally uses a fixed‑size buffer (often 4 KB) for directory entry data. On each call to `next()`, it fills the buffer with the raw bytes returned by `getdents64` (Linux) or `GetFileInformationByHandleEx` (Windows) and parses them into `Entry` values. The `name` field points directly into that buffer, so it remains valid until the next `next()` call. This design ensures zero allocations for directory traversal.
+
+---
+
+### 3. Why This Design?
+
+Zig’s file and OS layer is built on three principles: **explicitness**, **no hidden control flow**, and **platform awareness without compromise**.
+
+#### Explicitness Over Convenience
+
+Many languages offer high‑level convenience functions like `read_to_string()` that allocate memory and return a string object. Zig deliberately avoids this. Reading a whole file requires you to choose:
+- An allocator.
+- A maximum size (or `readAllAlloc` / `readAllArrayList` with potential unlimited growth).
+- Whether to use buffering.
+- Error handling for each step.
+
+This might feel verbose, but it means:
+- **No hidden allocations** – memory usage is always visible in the call stack.
+- **No hidden I/O** – every function that does I/O is apparent from its return type (`!void` with possible `error.InputOutput`).
+- **Control over buffer sizes** – critical for embedded or high‑performance applications.
+
+Consider the simple act of copying a file. In Zig, you would write a loop with a fixed buffer, explicitly calling `read` and `write`. This gives you complete control over the buffer size, progress reporting, and cancellation. No magic `copy` function hides these decisions.
+
+#### Paths Are Slices, Not Objects
+
+Instead of a `Path` type, Zig uses `[]const u8`. This reflects the Unix philosophy that paths are just strings, but it also works on Windows thanks to transparent transcoding. The advantage is that path manipulation becomes pure slice arithmetic, easily done at compile time, and you can freely mix `std.fs.path` functions with any string processing. You never have to convert between `Path` and `&str` or `String`; everything is a slice of bytes.
+
+This choice also means that **path handling is allocation‑free** except when you join paths and need a new buffer. Functions like `std.fs.path.dirname` simply return a sub‑slice without any heap involvement.
+
+#### OS‑Aware but Not OS‑Agony
+
+Zig gives you direct access to platform‑specific features when you need them (e.g., `std.os.linux.fadvise`, `std.os.windows.DeviceIoControl`), but the common API (`std.fs`) is designed to work identically across platforms for the 90% use case. The `Dir` and `File` abstractions do not hide the OS; they just translate Zig’s idioms to the right syscalls. For instance, `file.stat()` returns a `std.fs.File.Stat` that contains fields like `size`, `mtime`, `mode`, and `kind`, but they are all present regardless of platform (with platform‑specific values zeroed where not applicable). This eliminates the need for `#[cfg(unix)]` scattering.
+
+#### Error Handling Mirrors the OS
+
+Every operation can fail, and the error set includes precise OS errors like `error.FileNotFound`, `error.AccessDenied`, `error.NameTooLong`, and `error.Unexpected`. Zig’s error unions make it impossible to forget to handle these failures. There is no global `errno` to check; the error is part of the return value.
+
+---
+
+### 4. Competing Approaches
+
+#### C: Raw, Global State, and Manual Cleanup
+
+C’s `fopen`/`fread`/`fwrite` uses `FILE*` with a default buffer, and errors are reported via `ferror` and `errno`. The `open`/`read`/`write` syscall interface is closer to Zig’s, but requires manual casting and size handling. Paths are `char*`, and on Windows there’s a wide‑character parallel universe (`_wfopen`). Cross‑platform code often becomes a maze of `#ifdef` blocks. Zig’s `std.fs` eliminates the need for such branching; a single `openFile` works everywhere.
+
+#### Rust: `std::fs` with `Result`, but Hidden Allocation
+
+Rust’s `std::fs` is ergonomic and safe, using `Path` and `PathBuf` for strong typing. However, functions like `std::fs::read_to_string` allocate a `String` implicitly. Iterators over directory entries return `io::Result<DirEntry>`, and calling `entry.file_name()` returns an `OsString` that may require conversion. While the borrow checker ensures file handles are dropped, drop is a hidden control flow. Zig’s approach forces the programmer to manage the resource with `defer`, making the lifetime visually explicit.
+
+#### Go: Garbage‑Collected Handles and Convenience
+
+Go’s `os` package provides `os.Open`, `os.Create`, and higher‑level functions like `os.ReadFile`. File handles are garbage‑collected; finalizers close them if you forget, which is convenient but unpredictable for resource‑constrained systems. The `io/ioutil` package (deprecated in favor of `os`) offered `ReadAll` that allocates a `[]byte`, but you can’t easily cap the allocation without a `io.LimitedReader`. Zig’s `readAllAlloc` always requires a maximum size or you can use an `ArrayList` for dynamic growth, which makes the trade‑offs explicit.
+
+#### C++: Streams and RAII
+
+C++ iostreams (`std::ifstream`) use RAII to close files automatically, but they also introduce hidden buffering and formatting overhead. The `<filesystem>` library offers `path` objects and operations like `copy`, but they can throw exceptions, which is hidden control flow. Zig’s `defer` and error unions give deterministic cleanup without exceptions.
+
+#### Python/Java: Exceptions and Heap‑Heavy Abstractions
+
+These languages abstract the filesystem behind rich class hierarchies (`java.io.File`, `java.nio.file.Path`; Python’s `pathlib`). They rely on garbage collection and exceptions, making them unsuitable for systems programming where you need to understand every allocation and every possible failure. Zig’s model is closer to the metal, yet still safe.
+
+---
+
+### 5. Common Mistakes
+
+#### 1. Forgetting `defer file.close()` (or ignoring its error)
+
+```zig
+const file = try std.fs.cwd().openFile("data.bin", .{});
+// ... use file, but no defer file.close(); -> leak if early return
+```
+
+Always write `defer file.close()` immediately after a successful open. If you need to handle the error from `close`, call it explicitly before the end of scope, but this is rarely necessary unless you require write‑flush guarantees. For writes, if you cannot tolerate a silent write failure during close, call `file.sync()` first and then `close` manually.
+
+#### 2. Using `readAllAlloc` Without a Size Limit
+
+```zig
+const data = try file.reader().readAllAlloc(allocator, std.math.maxInt(usize));
+```
+
+This can exhaust memory if the file is huge. Always set a reasonable `max_size` based on your application’s constraints.
+
+#### 3. Building Paths Manually with Slash
+
+```zig
+const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, file });
+```
+
+On Windows, this produces a path with forward slashes, which may not work for all APIs (though modern Windows does accept them). Better to use `std.fs.path.join` which inserts `\` on Windows and avoids doubling separators.
+
+#### 4. Assuming `cwd()` Is Stable
+
+The current working directory can change during program execution (by another thread or signal). For security‑sensitive operations, open the target directory once and use relative operations from that `Dir`. Avoid repeatedly calling `cwd()`.
+
+#### 5. Ignoring Error on `file.stat()`
+
+`stat` can fail because the file might not exist (race condition) or permissions change. Always handle the error, especially when checking if a path is a file or directory before acting on it—use the result of `stat` instead of a separate `exists` check to avoid TOCTOU.
+
+#### 6. Using `std.os.getenv` Instead of `std.process.getEnvVarOwned`
+
+`std.os.getenv` returns a pointer to a null‑terminated string that might be modified or freed if the environment changes. Prefer `getEnvVarOwned` which returns an allocated copy, or use `getenv` with caution and copy it if you need to keep it.
+
+#### 7. Not Closing Files in Error Paths
+
+```zig
+const file = try std.fs.cwd().createFile("out.txt", .{});
+try file.writeAll("header\n");
+// if an error occurs here, file is not closed because defer not yet set.
+```
+
+Set `defer file.close()` right after `createFile`. Note that `errdefer` is not enough because you want to close on success as well.
+
+#### 8. Holding Slices from `Dir.Iterator` Across Iterations
+
+The `name` field is valid only until the next `next()` call. If you need to store names, `dupe` them immediately.
+
+---
+
+### 6. Performance Considerations
+
+#### Buffered vs. Unbuffered I/O
+
+The `File.reader()` and `File.writer()` interfaces are **unbuffered**; each call translates directly to a `read`/`write` syscall. For sequential I/O, this can be disastrously slow (one syscall per byte!). Always wrap readers/writers in a `BufferedReader` / `BufferedWriter` with an appropriate buffer size (4 KB to 64 KB is typical, but test with your workload). The standard library provides `std.io.bufferedReader`, `bufferedWriter`, and `fixedBufferStream`.
+
+```zig
+var buf_reader = std.io.bufferedReader(file.reader());
+const reader = buf_reader.reader();
+// use reader for efficient reads
+```
+
+#### Memory‑Mapped Files
+
+For large, random‑access files, memory mapping (`std.fs.File.mmap`) can eliminate explicit read/write calls and leverage the OS page cache. However, mapping has overhead and can cause `SIGBUS` if the file is truncated. Zig’s `std.io.Reader` and `Writer` can be built atop a mapped buffer using `std.io.fixedBufferStream`.
+
+```zig
+const stat = try file.stat();
+const mapped = try file.mmap(std.heap.page_allocator, .{}, stat.size, null, 0);
+defer std.fs.File.unmap(mapped);
+// mapped.ptr and mapped.len are now a slice
+```
+
+#### Directory Traversal
+
+The iterator reuses a single stack buffer, so millions of entries cause zero heap allocations. To speed up recursive traversal, open each subdirectory as you encounter it, rather than building full paths with `join` for every leaf. You can even use a `WalkDir` (community library) or write your own that maintains a stack of directory handles.
+
+#### Process Spawning
+
+`std.process.Child.spawn` uses `fork`/`exec` on Unix and `CreateProcess` on Windows. On Unix, `fork` can be expensive for large processes due to copy‑on‑write page tables. If you spawn many children, consider using `posix_spawn` (available via `std.process.Child` with `use_posix_spawn` option) which avoids `fork` entirely. For I/O redirection, set `stdin_behavior`, `stdout_behavior`, and `stderr_behavior` to `.Pipe` and read/write the pipes concurrently to avoid deadlocks.
+
+#### Avoiding Double Buffering
+
+When copying from one file to another, be cautious: if you use `BufferedReader` on the source and `BufferedWriter` on the destination, you may copy data from kernel buffer to user buffer, then into another user buffer, then to kernel. Instead, read into a single large buffer and write it directly with `writeAll`. For maximum performance, use `sendfile` (Linux) or `CopyFileEx` (Windows) via `std.os` or a platform‑specific path.
+
+#### Path Manipulation Overhead
+
+Functions like `std.fs.path.join` allocate because they need to create a new buffer. In tight loops, you can pre‑allocate a `std.ArrayList(u8)` and reuse it as a buffer for building paths, clearing it between iterations. Alternatively, use `std.fmt.bufPrint` with a fixed buffer if the maximum path length is known.
+
+---
+
+### 7. Best Practices
+
+- **Use `defer` for cleanup immediately after resource acquisition.** For files: `defer file.close()`. For directories: `defer dir.close()`. For memory: `defer allocator.free(buf)`.
+- **Prefer `Dir` operations over absolute paths.** Open a `Dir` once and use its methods (`openFile`, `createFile`, `openDir`) for all subsequent work in that tree. This avoids TOCTOU race conditions and simplifies path logic.
+- **Set a maximum size when reading whole files.** Use `reader().readAllAlloc(allocator, max_size)` or read into a `std.ArrayList(u8)` with `readUntilDelimiterAlloc` etc. Explicitly check if the file is larger than expected.
+- **Use `std.fs.path` for all path operations.** Even if you know the platform, `join`, `dirname`, `extension` handle edge cases (like trailing slashes) correctly.
+- **Test with temporary directories.** Use `std.testing.tmpDir` to create isolated test environments that are automatically cleaned up. This ensures tests don’t interfere with the real filesystem.
+- **Handle `error.FileNotFound` explicitly when appropriate.** For configuration files, you might provide a default; for required data, propagate the error.
+- **For process spawning, prefer `init` over `run`.** `std.process.Child.run` allocates and collects output, which can be heavy. Use `spawn` and manage pipes yourself for fine‑grained control.
+- **Use `errdefer` for error‑path cleanup of partial writes.** If you open a file and start writing, but a later write fails, `errdefer` can delete the partially written file.
+
+```zig
+const file = try dir.createFile("data.tmp", .{});
+errdefer dir.deleteFile("data.tmp") catch {}; // best effort
+defer file.close();
+try file.writeAll(header);
+try file.writeAll(body);
+// if body fails, the temp file is removed
+```
+
+- **On Windows, be aware of path length limits.** The canonical limit is 260 characters, but you can bypass it by using the `\\?\` prefix. `std.fs.path` does not automatically add this; consider doing so for long paths if you target Windows. Zig’s standard library uses the extended‑length syntax internally when needed (e.g., for `openDirAbsolute` with long paths).
+- **Log errors from `close` when it matters.** In a server, you can wrap `close` in a function that logs errors rather than silently discarding them.
+
+---
+
+### 8. Examples
+
+Let’s build a complete command‑line tool: **`zfind`** – a simple file finder that recursively searches for filenames containing a pattern, with an optional minimum file size filter. This example demonstrates file operations, directory recursion, command‑line argument parsing, and error handling in a real‑world style.
+
+```zig
+const std = @import("std");
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+
+    if (args.len < 3) {
+        std.debug.print("Usage: {s} <dir> <pattern> [min_size_bytes]\n", .{args[0]});
+        return error.InvalidArgs;
+    }
+
+    const dir_path = args[1];
+    const pattern = args[2];
+    const min_size: u64 = if (args.len > 3) try std.fmt.parseInt(u64, args[3], 10) else 0;
+
+    var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
+    defer dir.close();
+
+    // Use a recursive function that carries an allocator for path joining
+    try searchDir(allocator, dir, pattern, min_size, dir_path);
+}
+
+fn searchDir(
+    allocator: std.mem.Allocator,
+    dir: std.fs.Dir,
+    pattern: []const u8,
+    min_size: u64,
+    base_path: []const u8,
+) !void {
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
+
+        const full_path = try std.fs.path.join(allocator, &.{ base_path, entry.name });
+        defer allocator.free(full_path);
+
+        switch (entry.kind) {
+            .file => {
+                // Skip if filename doesn't contain pattern
+                if (std.mem.indexOf(u8, entry.name, pattern) == null) continue;
+
+                // Check size if min_size > 0
+                if (min_size > 0) {
+                    const stat = try dir.statFile(entry.name);
+                    if (stat.size < min_size) continue;
+                }
+                std.debug.print("{s}\n", .{full_path});
+            },
+            .directory => {
+                var sub_dir = try dir.openDir(entry.name, .{ .iterate = true });
+                defer sub_dir.close();
+                try searchDir(allocator, sub_dir, pattern, min_size, full_path);
+            },
+            else => {}, // ignore symlinks, pipes, etc.
+        }
+    }
+}
+```
+
+You can compile with `zig build-exe zfind.zig` and run:
+
+```
+$ zfind . "zig" 1024
+./src/main.zig
+./lib/ziglib.zig
+```
+
+#### Testing the Tool
+
+We can write a test that creates a temporary directory, populates it, runs the search logic programmatically, and checks the output.
+
+```zig
+test "zfind finds matching files" {
+    const tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Create test structure
+    const dir = tmp.dir;
+    try dir.writeFile("readme.txt", "hello");
+    try dir.writeFile("src/main.zig", "content");
+    {
+        var sub = try dir.makeOpenPath("subdir", .{});
+        defer sub.close();
+        try sub.writeFile("lib.zig", "code");
+    }
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // We'll capture printed output by redirecting std.debug
+    var buf = std.ArrayList(u8).init(allocator);
+    defer buf.deinit();
+
+    // Temporarily override std.debug writer (simplified for test)
+    // Instead, we'll just call a test‑specific function that collects results.
+    var results = std.ArrayList([]const u8).init(allocator);
+    defer results.deinit();
+
+    // Use our search logic but with a callback
+    const Ctx = struct {
+        results: *std.ArrayList([]const u8),
+        allocator: std.mem.Allocator,
+        fn add(ctx: @This(), path: []const u8) !void {
+            const owned = try ctx.allocator.dupe(u8, path);
+            try ctx.results.append(owned);
+        }
+    };
+    var ctx = Ctx{ .results = &results, .allocator = allocator };
+
+    try searchDirTest(allocator, dir, "zig", 0, ".", ctx);
+
+    // Verify we found both zig files
+    try std.testing.expectEqual(@as(usize, 2), results.items.len);
+}
+
+// searchDirTest is like searchDir but calls ctx.add instead of printing
+fn searchDirTest(
+    allocator: std.mem.Allocator,
+    dir: std.fs.Dir,
+    pattern: []const u8,
+    min_size: u64,
+    base_path: []const u8,
+    ctx: anytype,
+) !void {
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
+        const full_path = try std.fs.path.join(allocator, &.{ base_path, entry.name });
+        defer allocator.free(full_path);
+
+        switch (entry.kind) {
+            .file => {
+                if (std.mem.indexOf(u8, entry.name, pattern) != null) {
+                    if (min_size > 0) {
+                        const stat = try dir.statFile(entry.name);
+                        if (stat.size < min_size) continue;
+                    }
+                    try ctx.add(full_path);
+                }
+            },
+            .directory => {
+                var sub = try dir.openDir(entry.name, .{ .iterate = true });
+                defer sub.close();
+                try searchDirTest(allocator, sub, pattern, min_size, full_path, ctx);
+            },
+            else => {},
+        }
+    }
+}
+```
+
+This test uses the standard library’s `std.testing.tmpDir`, which automatically cleans up after the test.
+
+---
+
+### 9. Summary & Exercises
+
+In this chapter, we explored Zig’s file and OS operations through `std.fs`, `std.fs.path`, `std.process`, and related modules. Key takeaways:
+
+- **All I/O goes through `Dir` and `File`, which wrap OS descriptors.** Operations are explicit, with no hidden buffering or allocation.
+- **Paths are simple `[]const u8` slices**, and cross‑platform handling is automatic.
+- **Error handling is exhaustive**, forcing you to deal with `FileNotFound`, `AccessDenied`, and other real‑world failures.
+- **Directory iteration is allocation‑free**, and process spawning gives you full control over streams and environment.
+- **Performance hinges on explicit buffering choices**; Zig never makes them for you.
+
+Now it’s your turn to apply these concepts.
+
+#### Exercise 1: Line Counter
+
+Write a program `zlines` that recursively counts the total number of lines in all files with a given extension (e.g., `.zig`) in a directory tree. It should skip directories named `node_modules` or `.git`. Use `std.fs.Dir.iterate` and count lines by reading files with a buffered reader. Print the total.
+
+*Hints:*
+- `std.io.bufferedReader`
+- `std.mem.count` on the contents is faster if you read whole files (but mind size).
+- Use `std.fs.path.extension` to check the extension.
+
+#### Exercise 2: Custom `cat`
+
+Implement a `cat`‑like tool that reads from multiple files (or stdin if no files are given) and writes to stdout. Add an option `-n` to number output lines. Ensure it handles binary data gracefully (not altering it) by using buffered reads and writes. Test it with the temporary directory.
+
+*Hints:*
+- Use `std.process.argsAlloc` to get filenames.
+- For stdin, use `std.io.getStdIn().reader()`.
+- For output, `std.io.getStdOut().writer()`.
+- Numbering lines requires tracking newline characters.
+
+#### Exercise 3: File Watcher with Action
+
+Use `std.fs.Watch` (available on Linux, macOS, Windows) to monitor a directory for changes. When a change is detected, print the changed path and optionally run a command (e.g., `zig build`). Handle the fact that many editors generate multiple events for a single save (debounce logic). The watcher should keep running until interrupted.
+
+*Hints:*
+- `std.fs.Watch.init` and `waitEvent`.
+- Use `std.process.Child` to run the command asynchronously.
+- Implement a simple debounce timer using `std.time.sleep` and a hash map of paths.
+
+These exercises force you to think about resource management, error paths, and performance in the context of real filesystem interaction—skills that define a seasoned Zig systems engineer.

@@ -1,0 +1,562 @@
+# Chapter 8: Advanced Comptime Metaprogramming
+
+Comptime is Zig’s secret weapon. Where other languages force you to step outside the language—into preprocessors, external code generators, or arcane template metaprogramming—Zig gives you the entire language, at compile time, with the same syntax, the same type system, and the same tools you already know. This chapter moves beyond simple comptime expressions into the realm of data structures built entirely during compilation, domain-specific languages that emit high-performance runtime code, and deep reflection that can generate entire API layers from a single `@typeInfo` call.
+
+We’ll treat comptime not as a special mode but as a first-class design space. By the end, you’ll understand how to architect systems that leverage compile-time computation to eliminate boilerplate, enforce invariants, and produce runtime code that knows exactly what it needs to do—no more, no less.
+
+## 1. Basic Usage
+
+Advanced metaprogramming begins with the same building blocks you learned in Chapter 7: `comptime` expressions, parameters, and `@typeInfo`. To set the stage, we’ll walk through two patterns that form the foundation of everything that follows: generating code from type structure and building compile‑time lookup tables that carry zero runtime overhead.
+
+### 1.1 Deep Reflection with `@typeInfo`
+
+Suppose you want to serialize any struct to a human‑readable string. Without comptime, you might write a format function for each struct. With comptime, you can write it once:
+
+```zig
+const std = @import("std");
+
+pub fn formatStruct(
+    comptime T: type,
+    value: T,
+    writer: anytype,
+) !void {
+    const info = @typeInfo(T).Struct;
+    try writer.writeAll(T ++ "{\n");
+    inline for (info.fields) |field| {
+        try writer.print("  .{s} = {},\n", .{
+            field.name,
+            @field(value, field.name),
+        });
+    }
+    try writer.writeAll("}");
+}
+
+const Point = struct {
+    x: i32,
+    y: i32,
+};
+
+test "formatStruct" {
+    const pt = Point{ .x = 10, .y = 20 };
+    var buf: [256]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buf);
+    try formatStruct(Point, pt, stream.writer());
+    try std.testing.expectEqualStrings(
+        \\Point{
+        \\  .x = 10,
+        \\  .y = 20,
+        \\}
+    , stream.getWritten());
+}
+```
+
+The `inline for` unrolls the field iteration at comptime. The compiler generates a distinct `writer.print` for each field, knowing the exact name and type. No runtime reflection, no vtable dispatch—just straight‑line code.
+
+### 1.2 Compile‑Time Lookup with `std.StaticStringMap`
+
+Often you need to map a set of compile‑time‑known strings to values. Zig 0.13+ provides `std.StaticStringMap`, a comptime‑constructed map that uses perfect hashing to produce O(1) runtime lookups with no heap allocation.
+
+```zig
+const std = @import("std");
+
+const Command = enum { run, build, test };
+
+const command_map = std.StaticStringMap(Command).initComptime(.{
+    .{ "run", .run },
+    .{ "build", .build },
+    .{ "test", .test },
+});
+
+pub fn parseCommand(name: []const u8) ?Command {
+    return command_map.get(name);
+}
+```
+
+`initComptime` runs a perfect‑hash algorithm during compilation to construct a minimal lookup structure. At runtime, `get` performs a single hash and a couple of comparisons. This is the template for building comptime data structures: do the hard work once, at compile time, and ship a lean, fixed‑size structure in the binary.
+
+## 2. Under the Hood
+
+To master advanced comptime, you need a mental model of how Zig evaluates code at compile time. The compiler is not “cheating” by running a separate interpreter with different semantics; it’s executing the exact same Zig code in a special evaluator embedded inside the build pipeline.
+
+### 2.1 The Comptime Interpreter
+
+The Zig self‑hosted compiler (stage2) contains a bytecode interpreter dedicated to comptime evaluation. During semantic analysis, whenever the compiler encounters a `comptime` expression or a function called with comptime‑known arguments, it pauses normal compilation, spins up the interpreter, and runs the code.
+
+- **Separate memory space:** Comptime variables live in the interpreter’s memory, completely isolated from the final binary’s address space. You can allocate slices, build hash maps, and even perform file I/O—all inside the interpreter—and none of that runtime machinery leaks into the compiled output.
+- **Mutation and re‑evaluation:** The interpreter can mutate variables, but it respects a strict operational budget (the “analysis limit”). If a comptime loop runs too long, the compiler halts with `reached the maximum number of comptime branches`.
+- **Allocator:** Comptime allocations use an internal allocator that you never see directly. When you call `std.ArrayList` or concatenate slices, memory is drawn from the compile‑time heap and automatically freed when evaluation finishes.
+
+### 2.2 The Halting Problem and the Analysis Limit
+
+Zig cannot solve the halting problem, so it draws a line: it gives every comptime evaluation a generous but finite number of backward branches (roughly 10 million by default). This quota prevents infinite loops from freezing your build. If you legitimately need more cycles (for example, brute‑forcing a perfect hash), you can raise the limit with `@setEvalBranchQuota`:
+
+```zig
+@setEvalBranchQuota(100_000_000);
+// ... expensive comptime search
+```
+
+The limit applies per top‑level comptime evaluation, so a single `@import` or comptime block gets its own budget.
+
+### 2.3 Incremental Compilation and Caching
+
+Comptime results are cached by the compilation unit (`Zcu`). If you change a function body but not its comptime inputs, the cached result is reused. However, any side effect that depends on mutable global state can break this caching. That’s why the idiomatic practice is to treat comptime functions as pure: they should produce the same output for the same input, regardless of when they are evaluated.
+
+### 2.4 The Comptime → Runtime Boundary
+
+Everything that survives comptime evaluation becomes a constant in the final binary. A struct built at comptime is embedded directly into the data section. A generated function is machine code emitted just like any hand‑written function. The boundary is seamless because comptime code is just code that ran earlier.
+
+## 3. Why This Design?
+
+Zig’s approach to metaprogramming is a deliberate rejection of the “separate macro language” tradition. The reasoning is rooted in the three pillars of Zig: no hidden control flow, explicit over implicit, and comptime over runtime magic.
+
+### 3.1 One Language, One Mindset
+
+When you write a comptime function, you’re writing ordinary Zig. You can call standard library functions, use `defer`, throw error unions, and even run existing unit tests at compile time. There’s no new syntax for quoting/unquoting, no AST node types to learn, no separate language with different evaluation rules. This collapses the cognitive distance between “normal” code and “meta” code. You debug comptime logic with `@compileLog` just like you would with `std.debug.print` at runtime.
+
+### 3.2 No Hidden Control Flow
+
+C macros, C++ template instantiation, and Rust procedural macros all execute code that is invisible to casual readers of the source. A simple `MAX(x,y)` in C might evaluate its arguments twice. A C++ template can trigger an unbounded cascade of instantiations. Zig makes comptime control flow explicit: you see the `comptime` keyword, you see the loops, you see the branching. If something is expensive, it’s right there on the screen.
+
+### 3.3 Explicitness Enables Reasoning About Cost
+
+Because comptime code is visible, you can reason about compile‑time cost. A nested `inline for` over 1000 elements will visibly blow up compile times. The analysis limit gives you a safety net. In languages where metaprogramming is hidden behind syntactic sugar, you can accidentally compile a multi‑hour build without understanding why.
+
+### 3.4 Compile Time Over Runtime Magic
+
+Many languages defer metaprogramming to runtime reflection (Java, Go, Python). That costs memory, time, and predictability. Zig moves the work to compile time, where it belongs. The runtime binary contains only the answers, never the questions.
+
+## 4. Competing Approaches
+
+Understanding Zig’s metaprogramming in context helps clarify its trade‑offs.
+
+### 4.1 C: The Preprocessor
+
+C’s preprocessor (`#define`, `#ifdef`) is a text‑substitution system with no understanding of types, scope, or control flow. It is Turing‑complete only through extremely painful token‑pasting tricks. Zig’s comptime replaces all of that: type‑generic functions, conditional compilation (`if (comptime condition) { ... }`), and code generation are all expressed in the source language itself. No `#define MAX(a,b) ((a)>(b)?(a):(b))` double‑evaluation bugs.
+
+### 4.2 C++: Templates and `constexpr`
+
+C++ templates are a functional language embedded in C++’s type system. They are powerful but notoriously opaque, with error messages that span hundreds of lines. `constexpr` has progressively improved, but it remains a subset of C++ with many restrictions (no dynamic allocation, limited `new` until C++20, restricted exception handling). Zig’s comptime is not a subset; it’s the whole language. You can call `malloc` at compile time. You can spawn coroutines. The interpreter imposes no artificial limitations—only the branch quota.
+
+### 4.3 Rust: Procedural Macros and Const Generics
+
+Rust splits metaprogramming into three worlds: declarative macros (`macro_rules!`), procedural macros (`proc_macro` crates), and const generics. Procedural macros operate on token streams and require a separate crate, adding build complexity. Const generics allow limited compile‑time values, but they cannot perform complex type reflection. Zig unifies all of these under `comptime`. A single `comptime` block can branch on types, iterate over struct fields, and generate functions—no separate crate, no token munging.
+
+### 4.4 Go: Code Generation
+
+Go has no metaprogramming in the compiler. The community relies on `go generate` to run external tools that read source code and produce new `.go` files. This works but creates a disjointed workflow: you edit a template, regenerate, commit the generated code, and hope nobody edits it manually. Zig’s comptime keeps generation inside the compiler, so there is never a chance for generated code to drift from its source.
+
+### 4.5 Python: Runtime Metaclasses and Decorators
+
+Python metaclasses and decorators execute at import time or runtime, allowing powerful dynamic behavior. That flexibility comes at a runtime performance cost and opens the door to behaviors that are impossible to statically analyze. Zig’s comptime is purely compile‑time; the dynamic behavior exists only until the binary is emitted. After that, it’s as static as any C program.
+
+## 5. Common Mistakes
+
+Comptime’s power is seductive, and seasoned engineers arriving from other ecosystems often stumble in predictable ways.
+
+### 5.1 Expecting Runtime Values at Comptime
+
+The most frequent error is trying to use a runtime argument in a context that requires comptime knowledge:
+
+```zig
+fn badGeneric(comptime T: type, value: T) void {
+    // Error: 'value' is runtime-known, cannot be used in 'comptime'
+    const size = comptime @sizeOf(@TypeOf(value));
+}
+```
+
+Comptime parameters must be known at call site. If the call site passes a runtime value, the parameter cannot be `comptime`. Use a two‑stage approach: a comptime function that returns a type or function specialized for runtime use.
+
+### 5.2 Exploding Compile Times
+
+Unbounded comptime loops can turn a 2‑second build into a 20‑minute nightmare. Common culprits:
+- Generating all permutations of a set.
+- Nested `inline for` over large arrays (O(n²) codegen).
+- Recursive comptime calls that don’t cache results.
+
+Always ask: “Is the compile‑time cost linear in the size of my input, and is that input bounded?” If the answer is no, find a way to compute a summary at compile time and leave the rest to runtime.
+
+### 5.3 Mutable Global State at Comptime
+
+Zig’s comptime interpreter tracks mutable variables, but they are local to the evaluation context. You cannot share mutable state across modules through global variables in the way you might expect:
+
+```zig
+// module_a.zig
+pub var counter: usize = 0;
+
+// module_b.zig
+comptime {
+    @import("module_a").counter += 1; // Might not persist as you hope
+}
+```
+
+Because evaluation order is not guaranteed across files, reliance on mutable comptime globals leads to brittle, cache‑dependent behavior. Prefer pure functions.
+
+### 5.4 `@compileLog` as a Debugging Crutch
+
+`@compileLog` only prints during compilation. It’s easy to sprinkle `@compileLog` everywhere, but that doesn’t help with runtime behavior. Use comptime unit tests (Section 8) to verify correctness instead of leaving leftover log statements that nobody will see again.
+
+### 5.5 Forgetting `inline` for Type‑Dependent Code
+
+Without `inline for` or `inline while`, a loop over struct fields will fail because each field may have a different type and cannot be handled uniformly at runtime. You’ll see “values of type `...` must be comptime‑known.” Always use `inline` when iterating over type lists or struct fields.
+
+## 6. Performance Considerations
+
+Comptime metaprogramming shifts work from runtime to compile time. This section dissects the performance profile of that trade‑off.
+
+### 6.1 Runtime Benefit
+
+The primary win is the elimination of runtime overhead:
+- **Lookup tables** built at compile time replace hash maps with perfect hashes or sorted arrays, reducing CPU cycles and memory allocation.
+- **Loop unrolling** through `inline for` removes branch mispredictions and enables further optimization by the backend.
+- **Type specialization** (comptime parameters) generates monomorphized copies of functions tailored to specific types, just like C++ templates. The runtime gets code that has no type‑erasure overhead.
+
+### 6.2 Compile‑Time Cost
+
+Every `comptime` evaluation burns build time. The cost grows with:
+- The size of the comptime data structures you manipulate.
+- The number of `inline` expansions (which multiply codegen work).
+- The complexity of algorithms run at compile time (sorting, hashing, searching).
+
+Large‑scale metaprogramming can push a project beyond acceptable edit‑rebuild latencies. Mitigation strategies:
+- **Memoization:** If a comptime function is called multiple times with the same inputs, cache the result in a comptime global array. Example: compute a complex type layout once and store it.
+- **Separate compilation:** Split your project so that heavy comptime work lives in its own module. Changes to other parts of the project won’t trigger its re‑evaluation (as long as the module’s comptime inputs don’t change).
+- **Use `@setEvalBranchQuota` sparingly:** A higher quota only masks an algorithmic problem. Prefer to reduce computational complexity.
+
+### 6.3 Binary Size
+
+Generated code can bloat the binary. A function that is `inline`‑generated for 50 different structs will produce 50 copies of nearly identical machine code. The Zig compiler is good at deduplication, but there are limits. When the set of types is large (e.g., dozens of similar structs), consider whether you can write a single generic function that uses a comptime‑generated vtable or an `enum` to dispatch at runtime, rather than monomorphizing.
+
+```zig
+// Instead of 50 specialized functions, generate a single dispatch table.
+const Serializer = struct {
+    dispatch: fn (value: *const anyopaque, writer: anytype) anyerror!void,
+};
+
+fn makeSerializer(comptime T: type) Serializer {
+    return .{
+        .dispatch = struct {
+            fn do(ptr: *const anyopaque, writer: anytype) anyerror!void {
+                const self: *const T = @ptrCast(@alignCast(ptr));
+                try writer.print("{}", .{self});
+            }
+        }.do,
+    };
+}
+```
+
+Here, you store a function pointer for each type but avoid duplicating the entire serialization logic. The trade‑off is a small indirection cost versus binary size.
+
+## 7. Best Practices
+
+Idiomatic advanced comptime code is readable, maintainable, and fast to compile. These guidelines emerge from the Zig standard library and the community’s collective experience.
+
+### 7.1 Separate Comptime Logic from Runtime Logic
+
+Place comptime generation code in functions clearly marked as returning a type or a constant. Avoid mixing runtime branches with comptime code gen; it makes it harder to see what runs when.
+
+```zig
+fn TypeErasedHandler(comptime Impl: type) type {
+    return struct {
+        const vtable = comptime generateVtable(Impl);
+        // ... runtime methods
+    };
+}
+```
+
+The `comptime` block builds the vtable; the rest is plain runtime code.
+
+### 7.2 Use `@compileError` for Validation
+
+When a function requires comptime constraints (e.g., “T must be a struct”), enforce them with `@compileError` so the user gets a clear message, not a cryptic crash deep in the compiler.
+
+```zig
+fn serialize(comptime T: type) type {
+    if (@typeInfo(T) != .Struct) {
+        @compileError("serialize expects a struct type, got " ++ @typeName(T));
+    }
+    // ...
+}
+```
+
+### 7.3 Keep Comptime Functions Pure
+
+A function that reads the file system or relies on global state will cause build reproducibility issues and cache misses. Limit side effects to `@compileLog` for temporary debugging. The compiler’s caching relies on input determinism.
+
+### 7.4 Test Comptime Code Thoroughly
+
+Because comptime is just Zig, you can write `test` blocks that force comptime evaluation:
+
+```zig
+test "comptime vector operations" {
+    comptime {
+        const result = addVectors(.{ 1, 2 }, .{ 3, 4 });
+        try std.testing.expectEqual(@as(@Vector(2, i32), .{ 4, 6 }), result);
+    }
+}
+```
+
+This catches logic errors early without any runtime overhead.
+
+### 7.5 Prefer `std.StaticStringMap` and `std.enums`
+
+The standard library already solves many comptime lookup problems. Before building a custom perfect hash, see if `std.StaticStringMap` or `std.enums.nameCast` covers your use case.
+
+### 7.6 Document Comptime Requirements
+
+If a function takes a `comptime` parameter, state it clearly in the doc comment. Explain what the caller must provide at compile time and why.
+
+## 8. Examples
+
+The following examples are complete, compilable programs that demonstrate advanced patterns. Each can be built with `zig build-exe <file>.zig` (or `zig test` for test‑only code).
+
+### 8.1 A Compile‑Time State Machine DSL
+
+This example accepts a state machine description as a comptime array and generates a fast, type‑safe transition function with zero runtime overhead per event.
+
+```zig
+const std = @import("std");
+
+const Event = enum {
+    start,
+    stop,
+    reset,
+};
+
+const State = enum {
+    idle,
+    running,
+    stopped,
+};
+
+// Comptime DSL: a slice of transitions
+const Transition = struct {
+    from: State,
+    event: Event,
+    to: State,
+};
+
+fn StateMachine(comptime transitions: []const Transition) type {
+    // Validate at compile time: no duplicate (state, event) pairs
+    comptime {
+        for (transitions, 0..) |t, i| {
+            for (transitions[i + 1 ..]) |other| {
+                if (t.from == other.from and t.event == other.event) {
+                    @compileError("Duplicate transition from " ++ @tagName(t.from) ++ " on " ++ @tagName(t.event));
+                }
+            }
+        }
+    }
+
+    return struct {
+        state: State = .idle,
+
+        pub fn apply(self: *@This(), event: Event) void {
+            // Comptime-generated perfect dispatch
+            switch (self.state) {
+                inline else => |s| {
+                    const dest = comptime blk: {
+                        for (transitions) |t| {
+                            if (t.from == s and t.event == event) {
+                                break :blk t.to;
+                            }
+                        }
+                        break :blk null; // no transition → stay
+                    };
+                    if (dest) |d| {
+                        self.state = d;
+                    }
+                },
+            }
+        }
+    };
+}
+
+const my_transitions = [_]Transition{
+    .{ .from = .idle, .event = .start, .to = .running },
+    .{ .from = .running, .event = .stop, .to = .stopped },
+    .{ .from = .stopped, .event = .reset, .to = .idle },
+};
+
+const MyFsm = StateMachine(&my_transitions);
+
+test "state machine transitions" {
+    var fsm = MyFsm{};
+    try std.testing.expectEqual(State.idle, fsm.state);
+
+    fsm.apply(.start);
+    try std.testing.expectEqual(State.running, fsm.state);
+
+    fsm.apply(.stop);
+    try std.testing.expectEqual(State.stopped, fsm.state);
+
+    fsm.apply(.reset);
+    try std.testing.expectEqual(State.idle, fsm.state);
+
+    // Unknown event does nothing
+    fsm.apply(.stop);
+    try std.testing.expectEqual(State.idle, fsm.state);
+}
+```
+
+Key points:
+- The `comptime` block validates the DSL for duplicate transitions.
+- The `switch` with `inline else` unrolls per state, and the inner comptime loop computes the destination at compile time.
+- The resulting `apply` method contains only direct assignments to `self.state`; no lookup tables at runtime.
+
+### 8.2 Generating an API Layer from `@typeInfo`
+
+Imagine you have a set of handler functions and want to generate a dispatch table that maps string names to functions, with compile‑time validation of signatures. This pattern is common for command‑line tools or RPC systems.
+
+```zig
+const std = @import("std");
+
+fn Handler(comptime name: []const u8, comptime func: anytype) type {
+    const FuncType = @TypeOf(func);
+    const info = @typeInfo(FuncType).Fn;
+    if (info.params.len != 1) {
+        @compileError("Handler " ++ name ++ " must accept exactly one argument");
+    }
+    const ArgType = info.params[0].type.?;
+    const ReturnType = info.return_type.?;
+
+    return struct {
+        pub const handler_name = name;
+        pub const handler_func = func;
+        pub const arg_type = ArgType;
+        pub const return_type = ReturnType;
+
+        pub fn call(self: @This(), arg: ArgType) ReturnType {
+            return self.handler_func(arg);
+        }
+    };
+}
+
+fn doEcho(msg: []const u8) []const u8 {
+    return msg;
+}
+
+fn doAdd(args: struct { a: i32, b: i32 }) i32 {
+    return args.a + args.b;
+}
+
+const all_handlers = comptime blk: {
+    var handlers: [2]type = undefined;
+    handlers[0] = Handler("echo", doEcho);
+    handlers[1] = Handler("add", doAdd);
+    break :blk handlers;
+};
+
+pub fn dispatch(name: []const u8, arg_reader: anytype) !void {
+    inline for (all_handlers) |H| {
+        if (std.mem.eql(u8, H.handler_name, name)) {
+            const arg = try arg_reader.readArg(H.arg_type);
+            const result = H.call(arg);
+            _ = result; // use result
+            return;
+        }
+    }
+    return error.UnknownCommand;
+}
+```
+
+Here, `Handler` is a comptime function that returns a unique struct type for each registered function. It validates the signature at compile time. The `dispatch` function iterates the list of handler types (known at comptime) and uses `inline for` to generate a separate `if` branch for each handler. The runtime overhead is a string comparison and an indirect function call—no heap allocations, no reflection.
+
+### 8.3 Compile‑Time Perfect Hash for String Keys
+
+For a fixed set of strings known at compile time, you can compute a minimal perfect hash that maps each string to a unique small integer. This allows a dense array lookup instead of a hash table.
+
+```zig
+const std = @import("std");
+
+/// Tries to find a seed that produces a perfect hash for `keys`.
+fn tryPerfectHash(comptime keys: []const []const u8) ?u32 {
+    @setEvalBranchQuota(10_000_000);
+    var seed: u32 = 0;
+    while (seed < std.math.maxInt(u32)) : (seed += 1) {
+        var occupied: [keys.len]bool = [_]bool{false} ** keys.len;
+        var ok = true;
+        for (keys) |key| {
+            const h = std.hash.Murmur2_32.hash(key, seed) % keys.len;
+            if (occupied[h]) {
+                ok = false;
+                break;
+            }
+            occupied[h] = true;
+        }
+        if (ok) return seed;
+    }
+    return null; // no perfect hash found (unlikely for small sets)
+}
+
+/// Returns a struct that maps keys to their indices.
+fn PerfectHashMap(comptime keys: []const []const u8) type {
+    const seed = tryPerfectHash(keys) orelse
+        @compileError("Could not find perfect hash for given keys");
+    return struct {
+        const Self = @This();
+        const Key = []const u8;
+
+        pub fn index(self: Self, key: Key) ?usize {
+            const h = std.hash.Murmur2_32.hash(key, seed) % keys.len;
+            // Verify it's the right key (one comparison)
+            if (std.mem.eql(u8, keys[h], key)) return h;
+            return null;
+        }
+
+        pub fn get(self: Self, key: Key) ?Key {
+            const i = self.index(key) orelse return null;
+            return keys[i];
+        }
+    };
+}
+
+const command_keys = [_][]const u8{ "run", "build", "test", "fmt" };
+const CommandMap = PerfectHashMap(&command_keys);
+
+test "perfect hash lookup" {
+    const map = CommandMap{};
+    try std.testing.expectEqual(@as(?usize, 0), map.index("run"));
+    try std.testing.expectEqual(@as(?usize, 2), map.index("test"));
+    try std.testing.expect(map.index("not_exist") == null);
+}
+```
+
+The comptime function `tryPerfectHash` searches for a seed that avoids collisions. Once found, the generated struct `CommandMap` uses a single `Murmur2_32` hash, a modulo, and one string comparison per lookup. This rivals the speed of a perfect switch statement.
+
+### 8.4 Compile‑Time Unit Testing of Comptime Functions
+
+Ensure your comptime code is correct by embedding tests that run during `zig test`. The `comptime` block forces evaluation even if the function would be unused.
+
+```zig
+fn factorial(comptime n: u32) u32 {
+    return if (n == 0) 1 else n * factorial(n - 1);
+}
+
+test "comptime factorial" {
+    comptime {
+        try std.testing.expectEqual(@as(u32, 120), factorial(5));
+        try std.testing.expectEqual(@as(u32, 1), factorial(0));
+    }
+}
+```
+
+If `factorial` had a bug, `zig test` would catch it before any runtime test ever runs.
+
+## 9. Summary & Exercises
+
+Advanced comptime metaprogramming turns the compiler into a trusted co‑developer. You can build data structures that disappear before the binary is born, generate entire API surfaces from a single source of truth, and validate intricate domain constraints without runtime overhead.
+
+**Recap:**
+- Comptime data structures (hash maps, perfect hashes) are built with standard Zig algorithms, using `@setEvalBranchQuota` to give the interpreter enough time.
+- `@typeInfo` deep dives allow generation of type‑aware serialization, dispatching, and validation logic.
+- Domain‑specific languages in Zig are simply comptime functions that accept a description (array of structs, tuples) and return a type with specialized methods.
+- Testing at compile time is seamless: wrap assertions in `comptime { ... }`.
+- Mitigate compile‑time explosion by memoizing results, using `inline` only where necessary, and separating heavy comptime work into dedicated modules.
+
+**Exercises:**
+
+1. **Compile‑time JSON schema validator:** Write a function `validate(comptime Schema: type, json: anytype) bool` that uses `@typeInfo` to check that a runtime JSON‑like value (represented as nested `std.json.Value` trees) conforms to a struct type’s shape and types. The validation logic must be generated entirely at compile time. Prove it with `test` blocks that run at compile time.
+
+2. **Memoized compile‑time type layout cache:** Write a comptime function `layout(comptime T: type)` that computes and returns a struct containing `size`, `alignment`, and a sorted list of field offsets. Ensure that calling `layout` multiple times with the same `T` does not recompute; store results in a comptime global array. Measure the compile‑time impact with `std.time.milliTimestamp` (available at comptime via `@import("builtin").os.tag` != .freestanding ?) or simply verify that the function’s body executes only once per type.
+
+3. **Compile‑time perfect hash function for arbitrary keys:** Extend the `PerfectHashMap` example to store not only strings but an arbitrary value type (using `comptime T: type`). Use the map to build a static dispatch table that, given a command name, directly returns a function pointer without any runtime branching (hint: use the perfect hash index to index an array of function pointers generated via `inline for`). Ensure the compiler can inline the call.

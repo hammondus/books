@@ -1,0 +1,382 @@
+## Chapter 5: Functions
+
+Functions in Zig are the primary unit of abstraction and control flow. Unlike many systems languages, Zig’s function design emphasizes **explicitness** at every level: return types are mandatory, error handling is encoded in the type system, and even the calling convention can be specified. This chapter covers the mechanics, philosophy, and performance implications of Zig’s function model.
+
+---
+
+### 5.1 Basic Usage
+
+A Zig function is declared with the `fn` keyword, followed by a name, parameters, a return type (or `void`), and a body. Type inference for parameters and return values is **not** allowed – Zig requires explicit types.
+
+```zig
+// Basic function: no error, no magic
+fn add(a: i32, b: i32) i32 {
+    return a + b;
+}
+
+// Public function (visible across module boundaries)
+pub fn greet(name: []const u8) void {
+    // Write to stdout (simplified – error handling omitted)
+    std.debug.print("Hello, {s}!\n", .{name});
+}
+
+// Optional return type: use ?T (optional)
+fn findPositive(data: []const i32) ?i32 {
+    for (data) |value| {
+        if (value > 0) return value;
+    }
+    return null;
+}
+
+// Error union return: !T (error or T)
+fn readNumber(reader: anytype) !i32 {
+    var buf: [16]u8 = undefined;
+    const line = try reader.readUntilDelimiterOrEof(&buf, '\n');
+    return std.fmt.parseInt(i32, line orelse return error.EndOfStream, 10);
+}
+
+// Main with error union – Zig allows main to return !void
+pub fn main() !void {
+    const sum = add(5, 7);
+    std.debug.print("Sum: {}\n", .{sum});
+}
+```
+
+**Variadic functions** are supported but require `@call` for safety and require a sentinel value or explicit length for termination:
+
+```zig
+// Variadic with sentinel (last argument must be null)
+fn max(comptime T: type, first: T, args: ...T) T {
+    var result = first;
+    var idx: usize = 0;
+    while (@call(.auto, args, .{idx})) |arg| : (idx += 1) {
+        if (arg > result) result = arg;
+    }
+    return result;
+}
+// This is rarely used – prefer passing slices instead.
+```
+
+**`@call`** is the builtin that invokes a function with a specified calling convention and arguments packed into a tuple or struct, enabling meta-programming:
+
+```zig
+const result = @call(.auto, add, .{3, 4}); // result = 7
+```
+
+---
+
+### 5.2 Under the Hood
+
+Zig functions compile to native machine code via LLVM (or the self-hosted backend). The compiler’s decisions about calling conventions, inlining, and stack layout are explicit or inferred from the function’s properties.
+
+**Calling conventions** default to `unspecified` (Zig picks an efficient C ABI–compatible convention). You can override:
+
+```zig
+fn fastMath(a: f32, b: f32) callconv(.Fast) f32 { return a * b + a; }
+```
+
+Conventions include `.C`, `.Stdcall`, `.SysV`, `.Naked`, `.Interrupt`, `.Async`, and `.Cold`. Each changes prologue/epilogue code, register usage, and how parameters are passed.
+
+**Parameter passing**: Small values (<= 16 bytes, alignment <= 8) are passed in registers or on the stack depending on convention. Zig guarantees that **no copy is made for values passed to functions** unless the parameter type is a pointer? Actually Zig passes parameters by value (copy) unless you use pointers. But the compiler may elide copies for read‑only large values via internal references. For example, passing a `[1024]u8` array copies 1 KiB onto the stack; passing a `*[1024]u8` passes a pointer (8 bytes). Zig does **not** perform implicit pass‑by‑reference for large structs – you must ask for it.
+
+**Return values**: For types smaller than or equal to 2 registers, the return value is placed in `rax`/`xmm0` etc. Large return values are returned via a hidden `sret` (structure return) pointer passed as the first argument. Zig makes this invisible, but it has performance implications: returning a 4‑KiB struct from a function involves a memcpy.
+
+**Inline functions**: Use `inline` keyword to force the compiler to inline at the call site. This eliminates call overhead and enables `comptime` parameters to remain alive across the call boundary. Unlike C, `inline` is a command, not a hint:
+
+```zig
+inline fn double(x: i32) i32 { return x * 2; }
+```
+
+Conversely, `noinline` prevents inlining even when beneficial.
+
+**Comptime parameters**: A function can have `comptime` parameters, which are evaluated at compile time. The compiler generates a specialized copy for each unique set of comptime values passed. This is how Zig implements generics:
+
+```zig
+fn Pair(comptime T: type) type {
+    return struct { a: T, b: T };
+}
+var p = Pair(i32){ .a = 1, .b = 2 };
+```
+
+Under the hood, `Pair` is not a function that returns a type at runtime – it is executed at compile time, and its result (the struct type) is baked into the binary. The function itself disappears after compilation.
+
+**Recursion**: Zig supports both runtime and comptime recursion. Recursive functions must have a termination condition that can be proven or else risk stack overflow. Tail call optimization is **not guaranteed**; you must use `@call(.never_inline, ...)` and hope, or restructure iteratively.
+
+---
+
+### 5.3 Why This Design?
+
+Zig’s function design prioritises **no hidden control flow** and **explicit error propagation** over convenience.
+
+**Why mandatory return types?**
+Haskell‑style type inference for return types (like in Rust, Go, or C++ `auto`) can obscure the API surface. Zig demands that you, as the caller, know exactly what type a function returns without reading its body. This eliminates surprise type changes from refactoring and forces documentation at the declaration site.
+
+**Why error unions (`!T`) instead of exceptions or multiple return values (Go‑style)?**
+Exceptions hide error paths – any call might throw, but the language does not encode that possibility in the signature. Zig’s `!T` forces the caller to acknowledge that a function can fail, and the compiler prevents you from ignoring the error without `catch`, `try`, or an explicit `if`.
+
+Go uses `(val, err)` multiple returns, which are easier to ignore accidentally (`v, _ := foo()`). Zig’s `try` keyword makes propagation explicit and concise, while the compiler ensures you cannot forget to handle an error union unless you deliberately `catch unreachable` (a code smell).
+
+**Why `void` instead of unit type as expression?**
+Functions that return `void` cannot produce a value. This avoids the C++/Rust wart where `void` functions can be used in comma operators or `?:` with surprising results. In Zig, `void` is a type with exactly one value (also called `void`), but you cannot create that value implicitly – only `return {}` or `return .{}` in a `void` function yields the unit value. This prevents accidental use of a side‑effecting function in a pure expression context.
+
+**Why no default parameters?**
+Default arguments hide control flow and allocation. Zig prefers explicit overloads or a single function that accepts an options struct with `null` fields. This forces the caller to see what values are being supplied, reducing subtle bugs when default values change.
+
+---
+
+### 5.4 Competing Approaches
+
+| Language | Parameter Passing | Error Handling | Defaults / Overloading | Inlining Control |
+|----------|------------------|----------------|------------------------|------------------|
+| **Zig** | Explicit copy or pointer, no implicit reference | Error unions (`!T`), `try`/`catch` | No defaults, no overloading (use `comptime` instead) | `inline` (command) |
+| **C** | Pass by value only (array decay to pointer) | Return code or `errno` | No | `inline` (hint) |
+| **Rust** | Move semantics, references with lifetimes | `Result<T, E>` with `?` operator | Yes (defaults, generics, overloading via traits) | `#[inline(always)]` (hint) |
+| **Go** | Pass by value, but maps/slices/channels are reference types | Multiple return `(val, err)` | No defaults, no overloading | Automatic, cannot force |
+| **C++** | Pass by value or reference (choose in signature) | Exceptions or `std::optional`/`std::expected` | Yes (defaults, overloading) | `inline` / `__forceinline` |
+
+**Key Zig differentiators**:
+
+- **No implicit borrowing** (unlike Rust): Zig does not have a borrow checker. Passing a slice or pointer is always explicit; the callee does not assume ownership unless documented. This reduces mental overhead at the cost of potential use‑after‑free (which tools like Valgrind catch).
+- **No exception unwinding**: Error unions are just values. The compiler does not generate landing pads or runtime type information for exceptions. This produces smaller binaries and predictable performance – `try` is a simple conditional jump.
+- **Comptime over templates/macros**: C++ templates and Rust generics are type‑level languages separate from runtime code. Zig’s `comptime` uses the same language, reducing cognitive load. However, error messages for `comptime` failures can be cryptic (though improving).
+
+---
+
+### 5.5 Common Mistakes
+
+1. **Forgetting to handle error unions**
+   ```zig
+   fn dangerous() !i32 { return error.Failed; }
+   const x = dangerous(); // error: ignored error union
+   ```
+   Zig rejects this. You must write `const x = try dangerous();` or `const x = dangerous() catch 0;`.
+
+2. **`catch unreachable` as a habit**
+   Using `catch unreachable` for an error that “should never happen” hides a future logic bug. Prefer `catch |err| std.log.err("unexpected: {}", .{err})` or restructure the function to prove the error cannot occur (e.g., via `comptime` checks).
+
+3. **Assuming pass‑by‑reference for large structs**
+   ```zig
+   const Big = struct { data: [4096]u8 };
+   fn process(b: Big) void { ... } // copies 4KiB on each call
+   ```
+   Pass `*const Big` or `[]u8` instead. Zig does not magically optimise this – the copy is explicit in the type.
+
+4. **Mutable parameters without `*`**
+   Zig parameters are immutable unless you pass a pointer. This is good: mutation is visible at the call site via `&` (or `var` argument? Actually Zig does not have `var` parameters; you must pass `*T`).
+   ```zig
+   fn increment(x: i32) void { x += 1; } // error: cannot assign to parameter
+   fn increment_ptr(x: *i32) void { x.* += 1; } // works
+   ```
+
+5. **Recursion without stack limit**
+   Unlike Go, Zig does not have growable stacks. A deep recursive function will overflow the fixed stack (default ~8 MiB). Prefer iteration or use `@call(.never_inline, ...)` to tail‑call, but verify code generation.
+
+6. **Variadic misuse**
+   Variadic functions in Zig are cumbersome and error‑prone. Beginners often try to implement `printf`‑style functions. Instead, accept a slice of `std.meta.Tuple` or use `std.fmt.format` which uses comptime‑known arguments.
+
+---
+
+### 5.6 Performance Considerations
+
+- **Function call overhead**: Inlining (`inline fn`) eliminates call cost but increases binary size. For tiny functions (e.g., accessors, simple math), inlining is a win. For large functions called from many sites, it is a loss. Measure with `-Ofast` and `--gc-sections`.
+
+- **Error union representation**: `!T` is stored as a pair: (error code, payload). For types where the payload has no unused bits (e.g., `u32`), Zig uses a “packed” representation where the error code lives in the same word if the payload cannot be all‑bits‑1. This avoids memory overhead. For example, `!u32` is 8 bytes on 64‑bit systems: 4 bytes for the value, 4 bytes for error code, aligned. For optional error unions (`?!T`) the size can grow.
+
+- **Return value optimisation (RVO)**: Zig guarantees that when you return a local struct from a function, no copy occurs if you return the variable directly (named RVO). However, returning an expression like `Big{ .data = ... }` may involve a copy. Prefer:
+  ```zig
+  fn makeBig() Big {
+      var result: Big = undefined;
+      result.data[0] = 42;
+      return result; // RVO applied
+  }
+  ```
+
+- **Comptime parameter specialisation**: A function with a `comptime` parameter (e.g., `fn foo(comptime T: type, x: T)`) generates a separate copy for each distinct `T` used. This can cause code bloat. Consider passing a `type` as a runtime value if you only need `@sizeOf(T)` or similar – but then you lose type safety. Trade‑off.
+
+- **`callconv(.Cold)`**: Mark functions that are rarely executed (error handlers, rarely‑taken branches) to tell the optimizer to move them away from hot code, improving icache usage.
+
+- **Inlining and debug info**: Inlining makes stack traces less accurate. For debug builds, Zig respects `noinline` but may ignore `inline`. Use `-O Release` modes for performance.
+
+**Benchmark example** (conceptual):
+A function that validates a 64‑byte struct with 10 fields, returning `!void`. The cost of `try` propagation inside loops is ~2 instructions per call (compare error flag, branch). Exceptions in C++ would cost ~15–30 cycles for setup and landing pad lookup, even when no exception is thrown.
+
+---
+
+### 5.7 Best Practices
+
+- **Prefer `!void` over `bool` for success/failure**
+  ```zig
+  fn writeConfig(allocator: Allocator) !void { ... }
+  // Caller: try writeConfig(gpa);
+  ```
+  This forces the caller to handle the error case. Returning `bool` would invite ignoring the result.
+
+- **Use `anytype` for generic parameters with duck typing**
+  When you need a function that works with any type that supports a certain operation, use `anytype` + compile‑time checking:
+  ```zig
+  fn serialize(writer: anytype, value: anytype) !void {
+      const T = @TypeOf(value);
+      if (comptime T == u32) try writer.writeInt(value, .little);
+      else @compileError("unsupported type");
+  }
+  ```
+  This is more flexible than generics in Rust (no traits) but less safe – you must validate the interface manually.
+
+- **Accept allocators explicitly**
+  Any function that may allocate should take an `std.mem.Allocator` parameter. Never hard‑code `std.heap.page_allocator` inside a library function.
+
+- **Return `void` instead of `!void` when the function truly cannot fail**
+  Zig treats `!void` as a union; returning `!void` but never producing an error forces the caller to `try` or `catch` anyway, which is misleading.
+
+- **Name functions as verbs or short phrases** (snake_case)
+  ```zig
+  fn parse_header() !Header;  // good
+  fn header_parse() !Header;  // awkward
+  ```
+
+- **Use `errdefer` for cleanup on error paths**
+  Not strictly function‑specific, but common in functions that acquire resources. Prevents leaks.
+
+- **Limit parameter count to ≤ 6**
+  Beyond that, use a context struct:
+  ```zig
+  const Options = struct { timeout: u32, retries: u8, ... };
+  fn connect(addr: []const u8, opts: Options) !Connection;
+  ```
+
+- **Document error set**
+  For public functions, list which errors may be returned:
+  ```zig
+  /// Reads a line. Errors: `error.EndOfStream`, `error.StreamTooLong`.
+  fn readLine(reader: anytype) ![]u8;
+  ```
+
+- **Avoid `@call` for ordinary code** – use normal function call syntax. `@call` is for generic wrappers and meta‑programming only.
+
+---
+
+### 5.8 Examples
+
+#### Example 1: Generic max function with comptime
+
+```zig
+const std = @import("std");
+
+pub fn max(comptime T: type, a: T, b: T) T {
+    // comptime branch: if T supports >, use it; else compare bytes
+    return if (comptime @hasDecl(T, "gt")) a.gt(b) else if (a > b) a else b;
+}
+
+test "max with integers" {
+    try std.testing.expectEqual(@as(i32, 10), max(i32, 5, 10));
+}
+
+test "max with floats" {
+    try std.testing.expectEqual(@as(f64, 3.14), max(f64, 1.5, 3.14));
+}
+```
+
+#### Example 2: Function that accepts an allocator and returns an error union
+
+```zig
+const std = @import("std");
+
+fn readAndTrim(allocator: std.mem.Allocator, file_path: []const u8) ![]u8 {
+    const file = try std.fs.cwd().openFile(file_path, .{});
+    defer file.close();
+
+    const stat = try file.stat();
+    const raw = try file.readToEndAlloc(allocator, stat.size);
+    // Note: caller is responsible for freeing `raw`
+    errdefer allocator.free(raw);
+
+    // Trim whitespace
+    var trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    // Return a new allocation of the trimmed slice
+    const result = try allocator.dupe(u8, trimmed);
+    allocator.free(raw);
+    return result;
+}
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const content = try readAndTrim(gpa.allocator(), "data.txt");
+    defer gpa.allocator().free(content);
+    std.debug.print("Content: '{s}'\n", .{content});
+}
+```
+
+#### Example 3: Inline function for compile-time known arguments
+
+```zig
+inline fn saturatingAdd(a: u8, b: u8) u8 {
+    const sum = a +% b; // wrapping add
+    return if (sum < a or sum < b) 255 else sum;
+}
+
+test "saturatingAdd inlined" {
+    // The call is fully expanded at compile time
+    try std.testing.expectEqual(@as(u8, 255), saturatingAdd(200, 100));
+}
+```
+
+#### Example 4: Using `@call` to build a dynamic dispatch system
+
+```zig
+const std = @import("std");
+
+const Operation = enum { add, sub, mul };
+
+fn apply(op: Operation, a: i32, b: i32) i32 {
+    const impl = switch (op) {
+        .add => addFn,
+        .sub => subFn,
+        .mul => mulFn,
+    };
+    return @call(.auto, impl, .{a, b});
+}
+
+fn addFn(a: i32, b: i32) i32 { return a + b; }
+fn subFn(a: i32, b: i32) i32 { return a - b; }
+fn mulFn(a: i32, b: i32) i32 { return a * b; }
+
+test "@call dispatch" {
+    try std.testing.expectEqual(42, apply(.add, 30, 12));
+    try std.testing.expectEqual(18, apply(.sub, 30, 12));
+    try std.testing.expectEqual(360, apply(.mul, 30, 12));
+}
+```
+
+All examples compile with `zig test` or `zig build-exe` (add `pub fn main() !void` where needed).
+
+---
+
+### 5.9 Summary & Exercises
+
+**Summary**
+- Zig functions have **mandatory explicit types** for parameters and return values.
+- **Error unions** (`!T`) encode failure in the type system, forcing callers to handle or propagate errors with `try`/`catch`.
+- **`comptime` parameters** enable zero‑cost generics and static dispatch without a separate macro or template language.
+- **Calling conventions** and **inlining** are controllable at the declaration site.
+- **Variadic functions** exist but are rarely idiomatic – use slices or comptime‑length tuples instead.
+- Performance is predictable: error handling compiles to conditional branches, not unwinding; pass large structs by pointer; prefer iteration over recursion.
+
+**Exercises**
+
+1. **Write a generic `filter` function**
+   `fn filter(comptime T: type, allocator: Allocator, slice: []const T, predicate: fn (T) bool) ![]T`
+   It should allocate and return a new slice containing only elements for which `predicate` returns true. Use the `std.mem.Allocator` interface. Ensure the returned slice is correctly sized and aligned. Write tests with integers and custom structs.
+
+2. **Implement a `retry` helper**
+   `fn retry(comptime F: anytype, allocator: Allocator, max_attempts: usize, args: anytype) !@typeInfo(@TypeOf(F)).Fn.return_type`
+   `F` is a function (or closure) that returns `!T`. `retry` should call it up to `max_attempts` times, sleeping exponentially (use `std.time.sleep`) between attempts. If all attempts fail, return the last error. This requires reading the return type of `F` using `@typeInfo` and `@call` to invoke `F` with the given `args`.
+
+3. **Build a call‑graph analyzer at comptime**
+   Write a `comptime` function that takes a function name (as a string) and a module, then prints all functions it calls (directly) and the total number of instructions (estimated) in the called tree. Use `@typeInfo` and `@src` to locate functions. This is a deep metaprogramming exercise; limit to functions in the same file for simplicity.
+
+**Key Takeaways for the Seasoned Engineer**
+- Zig’s function model trades syntactic sugar for **predictability**. Every error path, memory access, and control flow is visible in source.
+- The absence of default arguments, overloading, and implicit conversions forces you to design clearer APIs.
+- `comptime` parameters are **not** a generics system – they are a compile‑time execution engine. Mastering them unlocks metaprogramming that would require code generation in C or macro magic in Rust.
+- When performance matters, remember: `inline` is a command, parameters are copied unless you use pointers, and `!T` is cheap but not free. Profile and inspect generated assembly (`zig build -femit-asm`).

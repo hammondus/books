@@ -1,0 +1,415 @@
+# Chapter 31: JSON & Serialization
+
+Data interchange is the lifeblood of networked systems. JSON remains the lingua franca despite its verbosity, and binary formats like Protocol Buffers or CBOR squeeze every cycle out of constrained links. Zig’s approach to serialization is a perfect microcosm of its philosophy: **no hidden allocations, no runtime reflection magic, and comptime-driven code generation that feels like a natural extension of the language rather than a separate DSL.** In this chapter, we will not merely learn `std.json`; we will dissect how Zig builds a zero‑surprise parser, a streaming tokenizer, and a compile‑time serializer that can target any format you dare to design.
+
+---
+
+### 1. Basic Usage
+
+#### DOM‑style Parsing
+
+The simplest way to read JSON is to parse the entire document into a tree of `std.json.Value` nodes. You provide an allocator because the tree may contain strings, arrays, and objects that require heap memory.
+
+```zig
+const std = @import("std");
+const json = std.json;
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const input =
+        \\{
+        \\  "name": "Zig",
+        \\  "version": 0.13,
+        \\  "tags": ["systems", "performance"]
+        \\}
+    ;
+
+    // parseFromSlice returns a Parsed wrapper that owns the tree.
+    var parsed = try json.parseFromSlice(
+        json.Value,
+        allocator,
+        input,
+        .{},
+    );
+    defer parsed.deinit();
+
+    // Access the root value.
+    const root = parsed.value; // json.Value
+
+    // Value is a tagged union; use a switch or direct field access with .object.
+    const name = root.object.get("name").?.string;
+    const version = root.object.get("version").?.float;
+    std.debug.print("{s} {d}\n", .{ name, @as(u8, @intFromFloat(version)) });
+}
+```
+
+Every `get` returns a `?Value`, forcing you to confront missing keys. The `.object` field is a `std.StringHashMapUnmanaged(Value)`, so iteration and lookup are explicit.
+
+#### Streaming (Token‑Based) Parsing
+
+When data size exceeds available memory, or when you want incremental processing, use `std.json.Scanner` to pull tokens from a `std.io.Reader`. This avoids constructing an intermediate DOM entirely.
+
+```zig
+const std = @import("std");
+const json = std.json;
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // A stream that yields JSON tokens.
+    const input = "[1, 2, 3]";
+    var stream = std.io.fixedBufferStream(input);
+    var scanner = json.Scanner.init(stream.reader(), .{});
+
+    // Iterate over tokens.
+    while (true) {
+        const token = try scanner.next();
+        switch (token) {
+            .array_begin => std.debug.print("array start\n", .{}),
+            .array_end   => break,
+            .number      => std.debug.print("number: {s}\n", .{token.number.slice}),
+            else => {},
+        }
+    }
+}
+```
+
+Tokens include `.object_begin`, `.string`, `.true`, `.null`, etc. You maintain your own state machine atop the scanner; the library does not coerce the stream into any particular data structure.
+
+#### Stringify (Serialization)
+
+Writing JSON is as straightforward as reading. Use `std.json.stringify` for one‑shot serialization of a known value, or `std.json.writeStream` to output to a `Writer`.
+
+```zig
+const std = @import("std");
+const json = std.json;
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const value = json.Value{
+        .object = json.ObjectMap.init(allocator),
+    };
+    // Fill the object (omitted for brevity).
+
+    var buf: [1024]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buf);
+    try json.stringify(value, .{}, stream.writer());
+    std.debug.print("{s}\n", .{stream.getWritten()});
+}
+```
+
+For custom types, you will implement `jsonStringify` (see Section 8).
+
+---
+
+### 2. Under the Hood
+
+`std.json` is not a monolithic black box. It’s a layered assembly of:
+
+- **`json.Scanner`** – a zero‑allocation tokenizer that reads bytes from any `std.io.Reader` and produces lightweight `Token` unions. The scanner buffers a small internal lookahead (a few bytes) and uses a hand‑written state machine that is both fast and predictable. Every token carries a slice into the original input (or a tiny internal buffer for escaped strings), so string values may point directly into the source without copying.
+
+- **`json.parseFromSlice` / `parseFromTokenSource`** – these build a `Value` tree (the DOM) by consuming tokens from a scanner. The parser uses a stack of `Value` nodes and pushes/pops as it encounters nested structures. Allocations happen inside an `std.heap.ArenaAllocator` hidden within the `Parsed` type; when you call `parsed.deinit()`, the entire tree is freed at once. The arena strategy provides excellent allocation performance and simplicity.
+
+- **`json.stringify` / `writeStream`** – they walk a `Value` tree or a user‑supplied type via a `json.WriteStream` state machine. For custom types, the function dispatches at **comptime** using `@typeInfo` to find a user‑defined `jsonStringify` method or falls back to a default implementation for arrays, structs, etc. The whole serialization path is fully inlined and specialized by the compiler, producing code that is as efficient as a hand‑written loop.
+
+- **Comptime Serialization Drivers** – when you call `json.stringify(value, options, writer)`, the compiler evaluates a comptime function `json.stringify` that is generic over the value’s type. It inspects the type’s fields, decides formatting, and emits calls to `writer.writeAll` or `writer.print`. There are no vtables, no runtime type info tags; everything is resolved statically.
+
+For parsing custom types, `std.json` provides `jsonParse` and `jsonParseFromValue`. The library uses the same comptime reflection: if your struct defines `pub fn jsonParse(allocator, source, options) !@This()`, the parser will invoke it. Otherwise, it will attempt to construct the type field‑by‑field from the parsed JSON object.
+
+The underlying `std.json` implementation uses only `std.io.Reader`/`Writer` abstractions, so it works equally well over files, sockets, or in‑memory buffers.
+
+---
+
+### 3. Why This Design?
+
+Zig’s JSON handling embodies the three pillars:
+
+1. **No Hidden Control Flow**
+   Calling `json.parseFromSlice` explicitly requires an allocator. If parsing fails, you get an error union, not a thrown exception. Stringify writes to a provided writer; it never allocates a string behind your back. There are no implicit conversions between JSON numbers and Zig integers – you decide if and when to truncate or saturate.
+
+2. **Explicit is Better Than Implicit**
+   The DOM parser’s `Parsed` return type makes ownership obvious. The scanner’s tokens are slices into the input; if you need them to outlive the source buffer, you must copy them yourself. This is a deliberate design choice that prevents mysterious dangling references after the original input is freed – a problem that plagues many C++ JSON libraries.
+
+3. **Comptime Over Runtime Magic**
+   Custom serialization is defined as ordinary Zig functions (`jsonStringify`, `jsonParse`) discovered at comptime via `@hasDecl` and `@typeInfo`. No macros, no code generation steps, no runtime reflection penalties. The result is a library that feels as though it was hand‑written for your specific types, yet requires no extra tooling.
+
+**Why not use a derive macro like Rust’s serde?**
+Zig avoids macros entirely. Comptime function discovery provides the same declarative convenience but with full access to the language’s ordinary control flow, error handling, and debugging. If you need to log during serialization, you just add a `std.log.info` call inside your `jsonStringify` – no need to learn a separate DSL.
+
+**Why a pull‑based scanner rather than a push‑based SAX model?**
+A pull model (reader) integrates naturally with Zig’s explicit control flow. You call `scanner.next()` when you are ready for the next token; no callbacks, no inversion of control. This makes it trivial to write parsers that, for example, skip an entire subtree when the token is an object you don’t care about.
+
+**Why doesn’t `std.json` automatically handle circular references or custom allocators per node?**
+Because JSON itself has no concept of object identity or references. Zig doesn’t pretend to add semantics that the format doesn’t support. If you need to handle repetitive structures with back‑pointers, you design a higher‑level protocol on top of JSON – and Zig gives you the building blocks to do so efficiently.
+
+---
+
+### 4. Competing Approaches
+
+**C**
+Most C projects use third‑party libraries like `cJSON`, `Jansson`, or `yyjson`. These are battle‑tested but operate on opaque `void*` or `cJSON*` pointers. Memory management is manual and error‑prone – you must remember to call `cJSON_Delete` on the root. Error reporting often relies on global error flags or null returns. No type‑safe binding exists unless you write a wrapper. Zig’s `@cImport` can bridge these, but the native `std.json` provides a safer, more idiomatic experience with error unions and explicit allocators.
+
+**C++**
+`nlohmann/json` is elegant but leans heavily on operator overloading and implicit conversions, violating Zig’s “no hidden control flow” principle. Template metaprogramming generates massive symbol tables and slow compile times. RAII manages memory but hides the allocation cost. `simdjson` offers incredible speed but at the cost of a complex API and platform‑specific intrinsics. Zig’s approach sits in the sweet spot: fast enough for most use cases, fully portable, and utterly transparent.
+
+**Rust**
+`serde` with `serde_json` is the gold standard for derive‑based serialization. It uses procedural macros (a separate language) to generate code at compile time. This works brilliantly for stable formats, but the macro system is opaque and carries a learning curve. Zig’s comptime duck‑typing achieves similar customizability with pure Zig functions, and the lack of a borrow checker means you can freely use arenas or stack buffers without lifetime annotations. Both languages offer excellent performance, but Zig’s implementation compiles more quickly and requires zero proc‑macro crate dependencies.
+
+**Go**
+`encoding/json` uses runtime reflection (`reflect` package) to marshal and unmarshal structs. This is convenient but imposes a speed penalty, generates garbage, and hides what is actually happening behind tags. Zig’s comptime serialization produces code that is as direct as a hand‑written loop, with no reflection overhead and no allocations unless you explicitly request them. Go’s `json.Decoder` provides a streaming API similar to `json.Scanner`, but Zig’s token‑driven design allows you to handle stream parsing without tying it to a decoder state machine – you are in control of the parse loop.
+
+**Python**
+`json.loads` returns native `dict`/`list` structures without any type safety. Large documents require careful streaming (`ijson`) to avoid memory blowout. Zig’s explicit `Value` tagged union and its streaming scanner map naturally to Python’s models, but with complete compile‑time type checking and no interpreter overhead.
+
+---
+
+### 5. Common Mistakes
+
+1. **Forgetting to `defer parsed.deinit()`**
+   The `parseFromSlice` family returns a `Parsed` value that owns an arena allocator. Failing to call `deinit()` leaks all memory associated with the JSON tree. Always place `defer parsed.deinit()` immediately after a successful parse, before any early returns.
+
+2. **Using `catch unreachable` on parse errors**
+   Malformed JSON is a common occurrence. Ignoring errors with `catch unreachable` will crash your program on the first non‑conformant input. Instead, propagate the error or handle it gracefully with a diagnostic message. Use `try` within a function that returns an error union, or match on the error explicitly.
+
+3. **Assuming string slices from DOM parsing are null‑terminated**
+   `json.Value.string` is a `[]const u8` slice, not a `[:0]const u8`. If you need a null‑terminated string (e.g., for C interop), you must allocate and copy.
+
+4. **Parsing untrusted input with `parseFromSlice` without size limits**
+   A malicious or enormous JSON payload can exhaust memory. Use streaming (`json.Scanner`) and cap the size of strings or depth of nesting in your parsing logic. The std lib provides `max_value_len` and other options in `json.ParseOptions` to mitigate this.
+
+5. **Modifying a `json.ObjectMap` while iterating**
+   The map is an `std.StringHashMapUnmanaged`. Insertions may invalidate iterators, just as in any hash map. Use a separate list of keys if you need to mutate during traversal.
+
+6. **Expecting `json.stringify` to allocate memory**
+   It does not. `stringify` writes directly to a `Writer`. If you need a string, you must first write to a `std.ArrayList(u8)` or a fixed buffer and then extract the slice. Beginners often mistakenly treat `stringify` as a function that returns a string.
+
+7. **Trying to serialize cyclic structures**
+   `std.json.stringify` will recurse indefinitely (or overflow the stack) if your data structure contains references to already‑visited nodes. Zig does not provide an automatic cycle detection mechanism because JSON does not support references. You must break cycles manually before serialization.
+
+---
+
+### 6. Performance Considerations
+
+`std.json` is engineered for throughput without sacrificing safety.
+
+- **Scanner efficiency:** The scanner reads one byte at a time from the underlying `Reader`. If the reader is buffered (e.g., `std.io.BufferedReader`), throughput can exceed 500 MB/s on modern hardware. For maximum speed, use `std.io.fixedBufferStream` with in‑memory data; the scanner will inline the read calls and run at memory bandwidth.
+
+- **DOM vs. streaming:** Building a full `Value` tree allocates an arena and copies string values (unless you use `parseFromSliceLeaky`, which avoids string copies but ties the lifetime to the input buffer – use with caution). For large arrays of homogeneous objects, streaming with `Scanner` can reduce peak memory by orders of magnitude because you process one element at a time and then discard it.
+
+- **String handling:** When a token contains a string, the scanner provides a slice that may point into the original input buffer (for simple strings) or into its internal small buffer (for strings with escape sequences). The DOM parser always duplicates strings into the arena to ensure owned memory. If your use case can tolerate borrowed slices, `parseFromSliceLeaky` avoids these allocations entirely.
+
+- **Custom serialization:** By implementing `jsonStringify` yourself, you can elide intermediate `Value` trees. For example, you can write directly to the writer from your internal representation (e.g., a packed binary structure) without constructing a temporary object map. The comptime dispatch ensures that your custom function is called with zero dynamic overhead.
+
+- **Memory reuse:** For high‑frequency parsing (e.g., processing a stream of JSON messages), you can reuse an arena by resetting it instead of creating a new `Parsed` every time. However, `std.json.Parsed` does not expose its internal arena; you would need to manage your own arena and use `parseFromTokenSource` with a custom allocator that points to a reusable arena.
+
+- **SIMD potential:** The current `std.json` scanner does not use SIMD. Libraries like `simdjson` exploit SSE/AVX to classify bytes in parallel. Zig’s inline assembly and `@Vector` make it possible to write a SIMD‑accelerated JSON parser in pure Zig, but that remains a specialized task. For typical workloads, the standard library’s performance is within a factor of 2–3 of SIMD libraries, which is often acceptable given the massive reduction in complexity.
+
+**Benchmark guidance:** Use `zig build-exe -Doptimize=ReleaseFast` for production JSON processing. The scanner’s tight loop benefits significantly from LLVM’s optimizations. If you parse many small JSON strings, consider reusing a single `GeneralPurposeAllocator` across parses to avoid repeated `mmap`/`munmap` calls.
+
+---
+
+### 7. Best Practices
+
+- **Accept an `Allocator` parameter in any function that parses JSON.** Never hard‑code `std.heap.page_allocator` or `std.testing.allocator`. Use the `gpa` pattern: callers pass their own allocator, enabling deterministic memory management in tests and production.
+
+- **Prefer streaming for large or unbounded inputs.** Use `json.Scanner` when processing network responses, log streams, or files larger than a few megabytes. Provide clear error messages for unexpected tokens or malformed input.
+
+- **Explicitly handle all JSON types in a `switch` on `Value`.** Avoid using `root.object` directly unless you are absolutely certain the root is an object. Use pattern matching to produce meaningful errors:
+
+  ```zig
+  const root = parsed.value;
+  switch (root) {
+      .object => |obj| { /* ... */ },
+      .array => |arr| { /* ... */ },
+      else => return error.UnexpectedJsonType,
+  }
+  ```
+
+- **Define `jsonStringify` and `jsonParse` for your domain types** instead of converting to/from `json.Value` everywhere. This centralizes serialization logic, reduces allocations, and ensures a consistent JSON representation across your codebase.
+
+- **Use `std.json.stringifyAlloc` only when you truly need an owned string.** Otherwise, write directly to a buffer or socket via `stringify` and a writer. If you must allocate, prefer `std.ArrayList(u8)` and then call `stringify` into its writer; this avoids a hidden allocation inside the library.
+
+- **Set `max_value_len` and `max_depth` in `ParseOptions` for untrusted input.** This prevents denial‑of‑service attacks that exploit deeply nested structures or enormous strings.
+
+- **Test your serialization round‑trip:** For any custom type that implements both `jsonParse` and `jsonStringify`, write a test that serializes, then parses, and compares the original value. Use `std.testing.expectEqual` or `std.testing.expectEqualDeep`.
+
+- **Keep serialization logic free of side effects.** Your `jsonStringify` should only write to the provided writer; it must not modify global state or perform I/O. This makes the function reusable in logging, network protocols, and debugging.
+
+---
+
+### 8. Examples
+
+#### Example 1: Parsing a Config File with Custom Types
+
+Suppose we have a configuration struct with a known schema.
+
+```zig
+const std = @import("std");
+const json = std.json;
+
+const Config = struct {
+    host: []const u8,
+    port: u16,
+    debug: bool = false,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: json.ParseOptions) !Config {
+        // Parse into a Value first, then convert.
+        var parsed = try json.parseFromTokenSource(json.Value, allocator, source, options);
+        defer parsed.deinit();
+        return jsonParseFromValue(allocator, parsed.value) catch |err| {
+            return err;
+        };
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, value: json.Value) !Config {
+        if (value != .object) return error.UnexpectedToken;
+        const obj = value.object;
+        const host = (obj.get("host") orelse return error.MissingField).string;
+        const port_value = (obj.get("port") orelse return error.MissingField).integer;
+        const debug = obj.get("debug");
+        return Config{
+            .host = try allocator.dupe(u8, host),
+            .port = @intCast(port_value),
+            .debug = if (debug) |d| d.bool else false,
+        };
+    }
+};
+```
+
+**Important:** The `jsonParse` method accepts a generic `source` (which can be a `Scanner` or a `Reader`). We parse to a `Value` first for simplicity, but for maximum performance you can parse directly from tokens. This design shows how Zig’s generic `anytype` enables flexibility.
+
+#### Example 2: Stringify with Custom Formatting
+
+We want to serialize a `Config` but omit the `debug` field if it’s `false`, and ensure the port is written as a number, not a string.
+
+```zig
+pub fn jsonStringify(self: Config, options: json.StringifyOptions, writer: anytype) !void {
+    try writer.writeAll("{");
+    try writer.print("\"host\":\"{s}\"", .{self.host});
+    try writer.print(",\"port\":{d}", .{self.port});
+    if (self.debug) {
+        try writer.writeAll(",\"debug\":true");
+    }
+    try writer.writeAll("}");
+}
+```
+
+No intermediate `Value`, no allocations, just direct writes.
+
+#### Example 3: Streaming a Large JSON Array
+
+Read a JSON array of objects from a file and compute an aggregate without ever holding the entire array in memory.
+
+```zig
+fn processLargeArray(allocator: std.mem.Allocator, reader: anytype) !void {
+    var scanner = json.Scanner.init(reader, .{});
+    // We expect: [ { ... }, { ... }, ... ]
+    const first = try scanner.next();
+    if (first != .array_begin) return error.UnexpectedToken;
+
+    while (true) {
+        const token = try scanner.next();
+        switch (token) {
+            .array_end => break,
+            .object_begin => {
+                // Parse one object manually.
+                // For brevity, we assume we know the structure.
+                // In reality, we would accumulate fields.
+                _ = try scanner.next(); // e.g., "key"
+                _ = try scanner.next(); // e.g., :
+                const value_token = try scanner.next(); // e.g., number
+                if (value_token == .number) {
+                    // do something with value_token.number.slice
+                }
+                // consume remaining fields until object_end
+                while (true) {
+                    const t = try scanner.next();
+                    if (t == .object_end) break;
+                }
+            },
+            else => return error.UnexpectedToken,
+        }
+    }
+}
+```
+
+This pattern is common when ingesting event streams or bulk data into a database.
+
+#### Example 4: Compile‑Time Serialization to a Custom Binary Format
+
+Zig’s comptime capabilities allow us to serialize arbitrary types to a compact binary representation (e.g., a simple key‑value sequence) without any runtime type info. This is a sneak peek at building a non‑JSON format.
+
+```zig
+const std = @import("std");
+
+// Write a value in a simple TLV (type-length-value) format.
+fn tlvSerialize(self: anytype, writer: anytype) !void {
+    const T = @TypeOf(self);
+    switch (@typeInfo(T)) {
+        .Struct => |s| {
+            inline for (s.fields) |field| {
+                const val = @field(self, field.name);
+                // Write field name length and name
+                try writer.writeIntLittle(u8, @intCast(field.name.len));
+                _ = try writer.write(field.name);
+                // Recursively serialize field value
+                try tlvSerialize(val, writer);
+            }
+        },
+        .Int => |i| {
+            try writer.writeIntLittle(u8, 1); // tag: int
+            try writer.writeIntLittle(i.bits / 8, @intCast(i.bits / 8));
+            try writer.writeIntLittle(i.signedness == .signed, @bitCast(@as(i64, self)));
+        },
+        .Array => {
+            // omitted for brevity
+        },
+        else => @compileError("unsupported type " ++ @typeName(T)),
+    }
+}
+
+test "tlv serialize a struct" {
+    const S = struct {
+        id: u32,
+        active: bool,
+    };
+    const val = S{ .id = 42, .active = true };
+    var buf: [128]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buf);
+    try tlvSerialize(val, stream.writer());
+    // Now buf contains the binary representation.
+}
+```
+
+This illustrates the principle: comptime `@typeInfo` combined with `inline for` gives us a macro‑free serialization framework that is both type‑safe and fast.
+
+---
+
+### 9. Summary & Exercises
+
+**Summary**
+
+- `std.json` provides a layered toolkit: a zero‑allocation **Scanner** for token streams, a **DOM parser** that builds an owned `Value` tree, and **stringify** functions that emit JSON from any type.
+- Custom types participate in serialization by implementing `jsonParse` and `jsonStringify`, discovered at comptime.
+- The design upholds explicit memory management, error handling, and control flow – no hidden allocations, no exceptions, no runtime reflection.
+- Performance is competitive for a pure‑Zig implementation; use streaming for large data, and leverage comptime to generate specialized serializers.
+- Beyond JSON, the same comptime reflection patterns can drive serialization to Protobuf, CBOR, MessagePack, or custom binary protocols.
+
+**Exercises**
+
+1. **Arena‑Backed JSON Server**
+   Write a function that accepts a `std.net.Server.Connection` and parses a stream of JSON‑RPC requests. Each request is a single line of JSON. Reuse the same arena for each request, resetting it between messages. Measure the memory footprint and compare it to allocating a new `Parsed` per message.
+
+2. **Stream‑to‑Stream JSON Filter**
+   Create a program that reads an enormous JSON array from `stdin` and writes to `stdout` a new JSON array containing only elements that match a predicate (e.g., a field > threshold). You must not load the entire input into memory. Use `json.Scanner` and `json.WriteStream` to pipe tokens with minimal buffering. Ensure valid JSON output even for gigabyte‑sized inputs.
+
+3. **Binary Protocol Generator**
+   Build a comptime function `protobufSchema(comptime T: type)` that returns a `[]const u8` string describing the Protobuf message definition for that Zig struct. Use `@typeInfo` to map field types to Protobuf wire types, and produce the `.proto` text at compile time. Then implement a runtime writer that serializes an instance of `T` to the Protobuf binary format using only the generated schema – no runtime descriptors. Verify the output against an off‑the‑shelf Protobuf library in another language. This exercise cements the idea that comptime + explicit I/O can replace entire code‑generation toolchains.

@@ -1,0 +1,401 @@
+# Chapter 9
+## Organizing Code with Modules
+
+In systems programming, how you split code across files is not merely an organizational nicety—it defines compile-time dependencies, influences build parallelism, and either enables or inhibits whole-program optimization. Zig’s module system is designed around one guiding principle: **the source file is the module**. There are no header files, no separate interface declarations, and no implicit namespaces that span directory hierarchies. This chapter unpacks the mechanics of `@import`, shows how to structure projects with packages, and explains why the absence of headers is not a missing feature but a deliberate engineering choice that eliminates entire categories of bugs.
+
+---
+
+### 1. Basic Usage
+
+Every Zig source file is a module. Declarations marked `pub` become accessible to any code that imports that file with `@import`. The import returns a struct type whose fields are the public declarations.
+
+Start with a file `math.zig`:
+
+```zig
+// math.zig
+pub fn add(a: i32, b: i32) i32 {
+    return a + b;
+}
+
+pub fn multiply(a: i32, b: i32) i32 {
+    return a * b;
+}
+```
+
+Another file, `main.zig`, imports it:
+
+```zig
+// main.zig
+const std = @import("std");
+const math = @import("math.zig");
+
+pub fn main() !void {
+    const result = math.add(3, 4);
+    std.debug.print("{d}\n", .{result});
+}
+```
+
+The string argument to `@import` is a file path **relative to the file that contains the `@import`**, not relative to the project root. So if `main.zig` and `math.zig` sit in the same directory, `"math.zig"` works. If `main.zig` is in `src/` and `math.zig` is in `src/lib/`, you’d write `@import("lib/math.zig")`.
+
+You can also import and immediately pick a specific declaration:
+
+```zig
+const add = @import("math.zig").add;
+```
+
+This does not create a partial import; the entire file is still parsed and all its public symbols are available to the compiler for code generation, but only the name `add` is bound locally. The module struct itself is cached.
+
+To build this program, a minimal `build.zig` looks like:
+
+```zig
+const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    const exe = b.addExecutable(.{
+        .name = "myapp",
+        .root_source_file = b.path("main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    b.installArtifact(exe);
+}
+```
+
+Because `main.zig` imports `math.zig`, Zig automatically includes it in the compilation; you do not list source files in the build script unless you are creating a separate library.
+
+---
+
+### 2. Under the Hood
+
+When the compiler encounters `@import("math.zig")`, it performs the following steps:
+
+1. **Resolve the path:** If the string is a simple relative path, it resolves it relative to the directory of the source file currently being processed. If the string matches a known *package name* (registered via `build.zig` or the special `"std"`), it uses the root source file associated with that package.
+2. **Check the cache:** The compiler maintains a global cache of parsed modules indexed by absolute path. If `math.zig` has already been parsed, the cached module struct is returned immediately.
+3. **Parse and analyze:** On the first encounter, Zig reads the file, runs lexing, parsing, and semantic analysis (including comptime evaluation of any top-level comptime blocks or declarations). The result is a compile-time struct that mirrors the public declarations.
+4. **Incremental re‑compilation:** The build system tracks file dependencies. If `math.zig` changes, only files that (transitively) import it are re‑analyzed. The compiler is able to reuse cached results for unchanged modules, giving fast edit‑build cycles.
+
+Because every import is resolved to a single file, and there are no preprocessor includes or conditional compilation paths (beyond comptime branches), the dependency graph is an explicit directed acyclic graph. Circular imports are detected and reported as compile errors before code generation.
+
+Underneath, Zig still produces object files per compilation unit (each root source file). The linker, usually LLD when targeting ELF/Mach‑O/PE, stitches everything together. Crucially, the **absence of header files means the compiler always sees the exact same definition that every other translation unit sees**. There is no risk of an outdated header mismatching the implementation—Zig completely sidesteps the ODR (One Definition Rule) and header‑drift problems.
+
+At the LLVM level, Zig emits a single LLVM module per compilation unit, but functions from other modules are visible as declarations; the optimizer can inline across module boundaries because it has access to the full definitions. This is only possible because Zig’s compilation model is whole‑program by default (unless you explicitly build a shared library that dynamically links). For static linking, the toolchain effectively gives you LTO (Link‑Time Optimization) with zero extra flags.
+
+Comptime metaprogramming can also introspect modules. For example, you can use `@typeInfo(@import("math.zig"))` to obtain a slice of the module’s declarations at compile time, allowing automatic generation of bindings or tests.
+
+---
+
+### 3. Why This Design?
+
+The Zig module system is the logical conclusion of two core principles: **no hidden control flow** and **explicit is better than implicit**.
+
+- **No headers, no duplication.** In C and C++, the declaration of a function exists in a header, the definition in a source file. Keeping them synchronised is a manual, error‑prone process. Zig forces you to write the signature only once. If you change it, the compiler immediately sees the mismatch everywhere.
+- **No include path magic.** `@import` uses a plain string; there is no `-I` flag, no search path ordering confusion. This makes builds deterministic and understandable without external tooling.
+- **`pub` is the only visibility modifier.** There is no `protected`, `internal`, or `friend`. A declaration is either part of the module’s public API or it is not. This simplicity prevents accidental leakage of implementation details.
+- **Modules are structs.** Because `@import` returns a struct, you can assign it to any local name, pass it to functions (though rarely needed), and use `@typeInfo` on it. There is no special “module” type in the language—it is just an ordinary comptime struct, making the module system feel like a natural extension of the language rather than a separate abstraction layer.
+- **No implicit package hierarchies.** In Go, directory layout determines package name; in Java, the directory path mirrors the package path. Zig imposes no such tie. You can organise files however you like, and create a public‑facing package root that re‑exports a curated API. This decoupling is especially important when interfacing with existing C code or when targeting environments with restricted file systems.
+
+The result is a system that is trivially understandable, easy to tool, and impossible to misuse in the way that leads to the classic “header not found” or “declaration mismatch” errors of C.
+
+---
+
+### 4. Competing Approaches
+
+**C: `#include` textual inclusion.**
+C’s preprocessor literally copies the content of the included file. This leads to include‑order dependencies, macro pollution, and slow builds (the same headers are re‑parsed thousands of times). Zig’s semantic import is order‑independent and caches the result, eliminating these problems.
+
+**C++20 Modules.**
+C++ modules attempt to solve the same issues with a new language feature: `import` and `export`. They still require explicit interface units and implementation units, and the toolchain integration is non‑trivial. Zig’s file‑as‑module requires zero extra syntax beyond `pub`—it is the same language you already know.
+
+**Rust.**
+Rust’s module system uses `mod` declarations and `use` paths, with a tree rooted at `main.rs` or `lib.rs`. Submodules can be in‑line, in `mod.rs`, or in a file named after the module. This is more structured but also more rigid; moving a file requires updating `mod` statements. Zig’s approach is simpler: a file path string is the only link, and it is always relative to the importing file (or a package root). Rust’s `crate`‑level visibility and path resolution can be subtle; Zig’s flat `pub`/no‑pub is deliberately unsophisticated.
+
+**Go.**
+Go maps directories to packages; all `.go` files in a directory share the same package name. Import paths are relative to the module root. Zig does not enforce any mapping between directories and module names. While this may seem less organised, it avoids the “one package per directory” constraint and allows you to freely split large modules into multiple files by re‑exporting from a single root—or not.
+
+**Python/Java.**
+These have hierarchical, dotted import paths that rely on a search path (`sys.path`/`classpath`). Zig has none of that; the import string is always a file path or a registered package name, with no ambient search order.
+
+In every case, Zig prioritises explicitness and minimalism over convenience features like namespace aliases or automatic module discovery.
+
+---
+
+### 5. Common Mistakes
+
+**1. Forgetting `pub` on declarations.**
+Coming from languages where top‑level definitions are exported by default (Go, Python), you may omit `pub`. A declaration without `pub` is private to the file and will not be visible to the importer. The compiler will error with something like “no member named `add` in module `math`”.
+
+**2. Misunderstanding import path resolution.**
+`@import("foo.zig")` is always relative to the directory of the file doing the importing. This often trips up developers who expect it to be relative to the “project root” or the build file. If `src/main.zig` imports `"lib/math.zig"`, that looks for `src/lib/math.zig`. If `src/lib/math.zig` itself wants to import another file in `src/lib/`, it must use `@import("other.zig")`, not `@import("lib/other.zig")`. This can become fragile when files move. The recommended fix is to use **packages** (see Best Practices).
+
+**3. Circular imports.**
+Zig detects import cycles at compile time. For example, if `a.zig` imports `b.zig` and `b.zig` imports `a.zig`, you will get an error: `error: import cycle detected`. The solution is to refactor shared declarations into a third module that both files import, or to use function pointers and lazy initialization (rarely needed). Because modules are purely compile‑time structures, there is no runtime mechanism for breaking cycles, which is a good thing: cycles are a design smell.
+
+**4. Relying on re‑exporting everything.**
+It is tempting to put `pub const everything = @import("everything.zig");` in a root module to bring all symbols into one namespace. While convenient, this can lead to unnecessarily large compile‑time work if `everything.zig` contains comptime‑heavy code that isn’t always needed. Use selective re‑exports for public APIs.
+
+**5. Ignoring package hashes in `build.zig.zon`.**
+When adding a dependency via URL, forgetting to include the expected hash (or using an incorrect hash) causes the build to fail with a hash mismatch error. Zig uses the hash to ensure the download is exactly what you tested against; never bypass this by using an empty hash except during initial development.
+
+---
+
+### 6. Performance Considerations
+
+**Compile‑time performance:**
+Zig’s module system is designed for fast builds. Each file is a separate caching unit; if you change a file, only its importers (and their transitive importers) need to be re‑analysed. This is coarser than some incremental compilation models, but because Zig does whole‑program analysis, it can often inline and optimise aggressively without extra LTO steps. The absence of header files avoids the classic C/C++ problem of re‑parsing the same declarations thousands of times.
+
+For very large projects with many modules, the initial cold build may be slower than expected because all comptime‑evaluable code runs in a single pass. Strategies to mitigate this include:
+
+- Keep comptime‑heavy logic in separate modules that are imported only where needed.
+- Use `@import` lazily inside comptime blocks if the import is only conditionally required, though standard practice is to import at the top level.
+- Use `std.Build.Step.Compile` caching: the build system skips re‑analysis when no inputs change.
+
+**Runtime performance:**
+The module system has absolutely zero runtime overhead. `@import` is a compile‑time directive; it generates no indirections, no vtables, no lazy loading. A call to `math.add` from another module compiles to the same machine code as if the function were defined in the same file. Whole‑program optimisation ensures that functions are inlined across module boundaries when beneficial. There is no dynamic symbol resolution inside a static executable.
+
+**Binary size:**
+Since Zig does not export symbols unless explicitly requested (e.g., via `export`), dead‑code elimination trivially removes unused functions from other modules. The linker can aggressively strip unused sections, so importing a large library and using only a few functions does not bloat the binary.
+
+---
+
+### 7. Best Practices
+
+**1. Use packages to create stable import roots.**
+Instead of relying on relative paths that break when files move, define a package in `build.zig` that points to a directory or a specific root file. Then import using that package name from anywhere in the project.
+
+Example for a library `mylib` with root `src/lib.zig`:
+
+```zig
+// build.zig
+const lib_module = b.addModule("mylib", .{
+    .root_source_file = b.path("src/lib.zig"),
+    .target = target,
+    .optimize = optimize,
+});
+exe.root_module.addImport("mylib", lib_module);
+```
+
+Now `main.zig` and any submodule of `mylib` can use `@import("mylib")` to get the same root. The root file `lib.zig` re‑exports internal modules:
+
+```zig
+// src/lib.zig
+pub const math = @import("math.zig");
+pub const vector = @import("geometry/vector.zig");
+```
+
+This gives a clean public API: users access `mylib.math.add`, and internal files can still use relative imports for private collaboration.
+
+**2. Keep modules focused.**
+A module should do one thing well. A 2000‑line module is a smell—consider splitting it into several files that are re‑exported from a single package root. Zig’s compilation model encourages small, reusable pieces.
+
+**3. Use `const` aliases consistently.**
+The community idiom is:
+
+```zig
+const std = @import("std");
+const math = @import("math.zig");
+```
+
+Avoid renaming to arbitrary short names that obscure meaning. The import name becomes part of the reader’s mental model: `math.add` is clear; `m.add` saves nothing and loses context.
+
+**4. Test at module boundaries.**
+Write `test` blocks inside each module to exercise its public API. Use `std.testing.refAllDecls(@This())` in the root file to recursively test all public declarations of submodules:
+
+```zig
+// src/lib.zig
+test {
+    _ = @import("math.zig");
+    _ = @import("geometry/vector.zig");
+}
+```
+
+This ensures that `zig build test` compiles and runs all tests. (Note: `refAllDecls` is often used inside a test block to force analysis, but manually listing submodule imports for testing is perfectly valid and common.)
+
+**5. Avoid deep nesting of imports.**
+Flat module structures are easier to navigate than deep directory trees with many re‑export layers. A package root with a few submodules is usually sufficient. If you need more organisation, consider a separate package for a major subsystem.
+
+**6. Dependencies belong in `build.zig.zon`.**
+Never vendor third‑party code unless absolutely necessary. Use Zig’s package manager by declaring dependencies with a URL and a hash. This ensures reproducible builds and easy updates. The build system fetches and caches dependencies automatically.
+
+---
+
+### 8. Examples
+
+Let’s build a small but realistic project that demonstrates all the concepts.
+
+**Project structure:**
+
+```
+myproj/
+├── build.zig
+├── build.zig.zon
+├── src/
+│   ├── main.zig
+│   ├── lib.zig
+│   ├── math.zig
+│   └── geometry/
+│       └── vector.zig
+```
+
+**`math.zig`** – a basic math module:
+
+```zig
+// src/math.zig
+pub fn add(a: f64, b: f64) f64 {
+    return a + b;
+}
+
+pub fn multiply(a: f64, b: f64) f64 {
+    return a * b;
+}
+
+test "add" {
+    try std.testing.expectEqual(5.0, add(2, 3));
+}
+
+const std = @import("std");
+```
+
+**`geometry/vector.zig`** – uses `math.zig` via a relative import:
+
+```zig
+// src/geometry/vector.zig
+const math = @import("../math.zig");
+
+pub const Vec3 = struct {
+    x: f64,
+    y: f64,
+    z: f64,
+
+    pub fn scale(self: Vec3, s: f64) Vec3 {
+        return .{
+            .x = math.multiply(self.x, s),
+            .y = math.multiply(self.y, s),
+            .z = math.multiply(self.z, s),
+        };
+    }
+};
+
+test "scale" {
+    const v = Vec3{ .x = 1, .y = 2, .z = 3 };
+    const scaled = v.scale(2);
+    try std.testing.expectEqual(Vec3{ .x = 2, .y = 4, .z = 6 }, scaled);
+}
+
+const std = @import("std");
+```
+
+**`lib.zig`** – the package root that exposes a unified public API:
+
+```zig
+// src/lib.zig
+pub const math = @import("math.zig");
+pub const vec = @import("geometry/vector.zig");
+
+test {
+    _ = math;
+    _ = vec;
+}
+```
+
+**`main.zig`** – the executable, using the `mylib` package:
+
+```zig
+const std = @import("std");
+const mylib = @import("mylib");
+
+pub fn main() !void {
+    const v = mylib.vec.Vec3{ .x = 1, .y = 2, .z = 3 };
+    const scaled = v.scale(2);
+    std.debug.print("({d}, {d}, {d})\n", .{ scaled.x, scaled.y, scaled.z });
+}
+```
+
+**`build.zig`** – registers the package and links it:
+
+```zig
+const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    const lib_module = b.addModule("mylib", .{
+        .root_source_file = b.path("src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const exe = b.addExecutable(.{
+        .name = "myproj",
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    exe.root_module.addImport("mylib", lib_module);
+    b.installArtifact(exe);
+
+    const lib_tests = b.addTest(.{
+        .root_module = lib_module,
+    });
+    const run_lib_tests = b.addRunArtifact(lib_tests);
+    const test_step = b.step("test", "Run library tests");
+    test_step.dependOn(&run_lib_tests.step);
+}
+```
+
+With this setup, `zig build` compiles the executable, and `zig build test` runs all tests in `math.zig` and `vector.zig` (because the root’s test block references them). The import `@import("mylib")` works from any file that has the package added to its module—here only `main.zig`, but you could also add it to internal modules if needed.
+
+**Adding a third‑party dependency** is just as straightforward. Suppose we want to use a community library `zap` (a HTTP framework). Add to `build.zig.zon`:
+
+```zig
+.{
+    .name = "myproj",
+    .version = "0.1.0",
+    .dependencies = .{
+        .zap = .{
+            .url = "https://github.com/zigzap/zap/archive/v0.1.0.tar.gz",
+            .hash = "1220...",
+        },
+    },
+    .paths = .{ "src", "build.zig", "build.zig.zon" },
+}
+```
+
+Then in `build.zig`:
+
+```zig
+const zap_dep = b.dependency("zap", .{
+    .target = target,
+    .optimize = optimize,
+});
+exe.root_module.addImport("zap", zap_dep.module("zap"));
+```
+
+Now `@import("zap")` is available in `main.zig`. The Zig build system will download and verify the hash, cache it, and make the dependency’s modules available.
+
+---
+
+### 9. Summary & Exercises
+
+**Summary:**
+- A Zig module is a single file. `@import` returns a struct of its `pub` declarations.
+- Import paths are relative to the importing file unless a package name is used.
+- Circular imports are compile‑time errors; the dependency graph must be a DAG.
+- Packages, defined in `build.zig`, create stable, location‑independent import roots.
+- `build.zig.zon` manages external dependencies with URL + hash for reproducibility.
+- The module system introduces zero runtime overhead; it is purely a compile‑time organisational tool.
+- The absence of header files eliminates declaration duplication and guarantees consistent views across all translation units.
+
+**Exercises:**
+
+1. **Build a library with internal structure.**
+   Create a project `mymathlib` that provides two modules: `basic` (add, sub) and `advanced` (trig approximations using comptime lookup tables). Expose them through a single package root. Write an executable that uses both. Include tests that cover all public functions. Measure the compile time with `zig build` and ensure `zig build test` runs everything.
+
+2. **Dependency management drill.**
+   Add a dependency on a real Zig library from the ecosystem (e.g., `zig-clap` for argument parsing) via `build.zig.zon`. Use it in your executable to parse command‑line arguments. Verify the hash in `build.zig.zon` by building once with an empty hash, then copying the hash from the error message into the file. Explain why the hash is essential for supply‑chain security.
+
+3. **Design a module layout for a real system.**
+   Imagine you are building a networked game server: it needs a TCP acceptor, a game world simulator, a player session manager, and a serialisation module for binary protocol data. The game world depends on the session manager, but the session manager also needs to notify the world about player actions—leading to a potential cycle. Sketch a module structure that breaks this cycle using interfaces or shared types, then implement a skeleton in Zig that compiles without circular imports. Justify your choices.
