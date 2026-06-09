@@ -1,497 +1,184 @@
-# Chapter 3: Your First Go Program
+## 3. Your First Go Program
 
-Every Go program follows a predictable, almost ritualistic structure. This consistency is intentional: when you’ve seen one Go codebase, you’ve seen the skeleton of them all. Today, we’ll build your first executable, dissect the compilation model, and uncover why Go’s apparent “verbosity” is actually a form of enforced clarity.
+Go treats the developer experience as a first-class concern, and nothing exemplifies this better than the path from a single source file to a running, statically linked binary. This chapter unpacks the simplest possible Go program—not to teach you what a `print` statement is, but to reveal the toolchain, compilation model, and philosophy baked into every executable you’ll ever write.
 
 ---
 
-## 1. Basic Usage
+### Basic Usage
 
-Let’s start with the canonical “Hello, World” – but stripped of magic and annotated for seasoned eyes.
+A Go executable lives in a file declared `package main` and must contain a function `func main()`. The canonical “Hello, World” looks like this:
 
 ```go
-// main.go
 package main
 
 import "fmt"
 
 func main() {
-    fmt.Println("Hello, World")
+	fmt.Println("Hello, World!")
 }
 ```
 
-To build and run:
+To run it without producing a persistent binary:
 
-```bash
-$ go run main.go          # compile+execute directly (useful for development)
-Hello, World
-
-$ go build -o hello main.go   # produce a static binary
-$ ./hello
-Hello, World
+```
+go run main.go
 ```
 
-### Executables vs. Libraries
+To compile and keep the artifact:
 
-The `package main` declaration is special. When the Go compiler sees `package main` with a `func main()`, it produces an **executable** rather than a shared object or static library. Any other package name (e.g., `package math`, `package http`) yields a **library archive** (`.a` file) that can be imported.
-
-**Key nuance:** A package named `main` without a `main()` function compiles but is useless – you can’t link it into anything. The build will succeed, but `go install` will place nothing in `$GOPATH/bin`.
-
-### Multi-file executables
-
-Real programs split across files within the same package:
-
-```go
-// greet.go (part of package main)
-package main
-
-func greet(name string) string {
-    return "Hello, " + name
-}
+```
+go build -o hello main.go
+./hello
 ```
 
-```go
-// main.go
-package main
+`go build` produces a statically linked native binary by default. You can drop that binary on any machine with the same OS/architecture and it will run—no interpreter, no virtual machine, no shared libraries (unless you explicitly link against C libraries via CGO). The `go` command is the single entry point to the entire workflow: formatting, testing, building, and dependency management all live under the same CLI.
 
-import "fmt"
-
-func main() {
-    fmt.Println(greet("World"))
-}
-```
-
-Build with `go build .` – the compiler automatically picks up all `.go` files in the current directory (excluding `_test.go` and platform-specific `_windows.go` etc.) that declare `package main`.
+The file name is arbitrary; `go build` looks at the package declaration, not the file name. Conventions like `main.go` are just conventions. You can spread the `main` package across multiple `.go` files inside the same directory if you wish, as long as exactly one file provides `func main()` (and none of the files violate the “one package per directory” rule).
 
 ---
 
-## 2. Under the Hood
+### Under the Hood
 
-### The Build Process in Detail
+When you invoke `go build`, several stages fire in sequence:
 
-Go’s compilation pipeline is refreshingly linear compared to C/C++:
+1. **Source parsing & type checking:** The compiler reads every `.go` file in the package, resolves imports, and builds an abstract syntax tree. Type checking happens early—unused imports or variables cause a compilation *error*, not a warning.
 
-```
-Source (.go) → Tokenization → AST → Type Checking → SSA IR → Machine Code → Static Binary
-```
+2. **Compilation to object code:** Each package compiles to an archive (`.a` file) containing the package’s compiled code and export data. The standard library is already pre-compiled in the Go installation cache, so `fmt` doesn’t need to be rebuilt.
 
-**Step 1: Package Resolution**
-`go build` reads `go.mod` to determine dependencies, then locates all imported packages (standard library + modules). Unlike C, there’s no separate header step – the compiler parses source files directly, extracting exported symbols from the AST.
+3. **Linking:** The linker pulls together the `main` package, all transitive dependencies, and the Go runtime. The runtime includes the garbage collector, goroutine scheduler, and bootstrap code. The final binary is statically linked by default on Linux and macOS; even on platforms that default to dynamic linking, Go prefers static linking to simplify deployment.
 
-**Step 2: Concurrent Compilation**
-Go compiles packages **independently** and in parallel, respecting dependency DAG. Each package produces a `.a` (archive) file containing:
-- Exported symbols (`//export` directives, public functions/types)
-- Debug information (if `-gcflags="-N -l"` disables optimizations)
-- Metadata for the linker (relocation records, import list)
+At program startup the execution sequence is:
 
-**Step 3: Static Linking**
-The final link step combines all archives into a single binary. **No dynamic linking by default** (except for `//go:cgo_import_dynamic` or `-buildmode=c-shared`). This includes the Go runtime (scheduler, GC, stack management), the entire standard library used, and even `fmt.Printf`’s parsing tables.
+- The kernel loads the binary and jumps to `_rt0_<arch>_<os>` (the platform-specific entry point written in assembly).
+- The runtime initializes: sets up thread-local storage, spawns the initial OS thread, initializes the garbage collector, creates the scheduler, and sets up signal handling.
+- `runtime.main` is called on the main goroutine. It runs `main.init()` functions (package-level initialization) and finally invokes `main.main()`.
 
-**Result:** A standalone binary with zero runtime dependencies – copy it to a `scratch` Docker container or an ancient Linux server, and it runs unchanged.
-
-### The `go run` Illusion
-
-`go run` doesn’t interpret the source. It:
-1. Compiles the program to a temporary directory (e.g., `/tmp/go-build123/b001/exe/main`)
-2. Executes it
-3. Removes the binary on exit (unless `-work` flag is passed)
-
-This makes `go run` unsuitable for production – you lose the binary. Use it only for development scripts or quick experiments.
-
-### Why No Build Scripts (Make/CMake)?
-
-Go’s toolchain infers everything from the source. The compiler determines dependencies by parsing `import` statements – no header files, no `-I` paths, no `-l` linker flags for standard libraries. The only common flag is `-ldflags "-X main.version=1.0"` to inject values at link time.
-
-**Aha moment:** Go treats your entire workspace as a database of packages. The toolchain is the query engine.
+This explains why a simple “Hello, World” binary is roughly 1.2 MB (Go 1.21, linux/amd64, stripped): the runtime is always included. There is no way to compile a “runtime-less” Go executable. The trade-off is that every Go binary carries a rich set of concurrent primitives, a precise GC, and a scheduler, even if you only print a single line.
 
 ---
 
-## 3. Why This Design?
+### Why This Design?
 
-### Why `package main` and not a `main` function in any package?
+Newcomers often ask: “Why do I have to write `package main` and `func main()`? Why not just a top-level script like Python?” The answer is **explicitness**, which is a central Go value.
 
-Most languages (C, C++, Java, C#) use a naming convention – `main` or `Main` – in a global scope. Go requires an explicit **package main** for two reasons:
+- **Unambiguous entry point:** There is no `if __name__ == "__main__"` magic. The compiler enforces that exactly one `main` function exists across all files in package `main`. This eliminates edge cases where a file can accidentally behave differently when executed directly versus imported.
+- **Packages as the universal unit of code:** Every Go file belongs to a package. Even a one-liner script is a package. This consistency means the same tooling (testing, vetting, documentation) applies uniformly—no separate “script mode.”
+- **Import paths are strings:** `import "fmt"` looks like a file path, but it’s a logical package import path resolved by the compiler and the module system. There are no classpath tricks, no alias-by-default, and no wildcard imports. You always see exactly where symbols come from.
+- **All Go programs look the same:** `gofmt` enforces a single canonical style. Combined with mandatory package clauses and import grouping, Go codebases—whether from Google, a startup, or an open-source project—share a visual rhythm. This reduces the time needed to become productive in an unfamiliar codebase.
 
-1. **Explicit build target:** When you see `package main`, you immediately know this directory produces an executable, not a library. This is a compile-time contract.
-2. **No link-time surprises:** In C, you can compile multiple `main()` functions into separate object files, then link one. Go prevents this – the `main` package can appear only once in a build graph.
-
-### Why no dynamic linking by default?
-
-Simplicity over flexibility. Dynamic linking introduces:
-- Dependency version hell (DLL hell)
-- Platform-specific loading mechanics (`LD_LIBRARY_PATH`, `PATH`, `rpath`)
-- Performance penalties (PLT indirections, lazy binding)
-
-Go’s answer: **build everything once, ship a fat binary**. This mirrors how Google deploys services – containers with static binaries, not shared libraries. The trade-off is binary size (~2–3 MB for a minimal HTTP server, ~10–15 MB for typical CLI tools) and duplication of the runtime across processes (though kernel-level page sharing mitigates this for identical binaries).
-
-### Why does every Go program look similar?
-
-Go enforces a **canonical file structure**:
-- No `#define` or macros – use constants and functions
-- No header files – `export` is implicit via capital letters
-- No multiple inheritance or constructor hierarchies – just `init()` functions (one per file, executed in dependency order)
-
-This consistency means you can navigate any Go project immediately. The `go fmt` tool eliminates stylistic debates – the community agreed to one formatting rule.
+This design philosophy stems from Google’s need to maintain massive, multi-decade codebases where engineers frequently switch teams. A language that mandates uniformity at the syntactic level directly addresses the organizational scaling problem.
 
 ---
 
-## 4. Competing Approaches
+### Competing Approaches
 
-| Language | Build Model | Entry Point | Dependency Management |
-|----------|-------------|-------------|----------------------|
-| **Go** | Static binary, single-step (`go build`) | `func main()` in `package main` | `go.mod` (MVS) |
-| **C/C++** | Separate compile+link, headers | `int main(int argc, char** argv)` | Make/CMake + system libs |
-| **Rust** | Static by default, but supports `cdylib` | `fn main()` | `Cargo.toml` |
-| **Java** | JARs / classpath, JIT-compiled | `public static void main(String[] args)` | Maven/Gradle (transitive) |
-| **Python** | Interpreted, no explicit entry | `if __name__ == "__main__":` | `pip` + virtualenvs |
+| Language | Minimal “Hello, World” | Notable differences |
+|----------|------------------------|----------------------|
+| **Go**   | `package main; import "fmt"; func main() { fmt.Println("Hello") }` | Statically linked binary, no runtime dependency. Compiler enforces style. |
+| **Python** | `print("Hello")` | Terse, but requires an interpreter and often a virtual environment. Execution semantics change if the file is imported. |
+| **Java**  | `public class Main { public static void main(String[] args) { System.out.println("Hello"); } }` | Requires a class and `String[] args`, JVM, compilation to bytecode, and classpath management. |
+| **C**     | `#include <stdio.h>; int main(void) { printf("Hello\n"); return 0; }` | Tiny binary (~16 KB), but must manage headers, linking, and platform differences manually. |
+| **Rust**  | `fn main() { println!("Hello"); }` | Similar minimal syntax, but `println!` is a macro; builds via Cargo; binaries carry no GC but have larger debug info. |
+| **Node.js** | `console.log("Hello");` | Requires a JavaScript runtime (V8). No compilation step, but startup time and memory footprint are higher. |
 
-### Java vs. Go: The JAR vs. Binary
-
-Java’s model prioritizes **bytecode portability** (run anywhere with a JVM). Go prioritizes **deployment simplicity** – no JVM to patch, no classpath debugging, no `NoClassDefFoundError`. However, Go binaries are OS- and architecture-specific: `GOOS=linux GOARCH=amd64 go build` yields a binary that won’t run on ARM or Windows.
-
-### C vs. Go: Header Files
-
-C separates declaration (`.h`) from implementation (`.c`). Go avoids this duplication – the compiler extracts exported symbols directly from source. This eliminates:
-- Include guard errors
-- Mismatched declarations
-- Forward declarations for circular dependencies (Go handles circular imports with a compile-time error, forcing better design)
-
-**Trade-off:** Go’s approach requires parsing all source files even for small changes, but incremental compilation (Go 1.10+) caches package archives, making rebuilds fast.
-
-### Python vs. Go: Entry Point Clarity
-
-Python’s `if __name__ == "__main__":` pattern is flexible – the same file can be a module or a script. Go’s separation is rigid: `package main` is **never** importable by other packages. This prevents accidental misuse but requires a separate `cmd/` directory if you want both a library and an executable from the same codebase.
+Go deliberately rejects the “script” model: there is no interpreter that skips compilation. Even `go run` compiles to a temporary binary and executes it. The single binary output, with zero external dependencies, makes Go especially suited for containers, CLI tools, and microservices where shipping a whole runtime (like the JVM or Python’s `site-packages`) is undesirable.
 
 ---
 
-## 5. Common Mistakes
+### Common Mistakes
 
-### Mistake 1: Multiple `main()` functions in a package
-
-```go
-// main.go
-package main
-func main() { println("first") }
-
-// other.go
-package main
-func main() { println("second") }
-```
-
-**Error:** `main redeclared in this block`. Go requires exactly one `main()` per package.
-
-### Mistake 2: Using `init()` when a simple constructor would do
-
-```go
-var db *sql.DB
-
-func init() {
-    db, _ = sql.Open("sqlite3", "file:db.sqlite") // error ignored!
-}
-```
-
-`init()` runs before `main()`, but:
-- Order across files is **deterministic but not portable** (lexical file name order)
-- Error handling is awkward – you can’t return errors
-- Initialization happens even if your binary has subcommands that don’t need the DB
-
-**Better:** Use a constructor function called explicitly from `main()`.
-
-### Mistake 3: Not understanding `go run`’s temporary nature
-
-Newcomers often write scripts with `go run` and assume the binary persists. Then in CI/CD, they compile repeatedly, wasting time. **Rule:** Use `go run` only for local development; in Dockerfiles or build pipelines, always `go build`.
-
-### Mistake 4: Assuming `package main` can be imported
-
-```go
-// mylib.go (in package main)
-package main
-
-func Helper() {} // Exported (capital H)
-```
-
-```go
-// otherpackage.go
-import "github.com/user/myproject" // imports package main?
-```
-
-**Result:** Compilation fails with `import "..." is a program, not an importable package`. The `main` package is a leaf in the dependency graph – nothing can depend on it.
+- **Forgetting `package main` or misnaming it:** If the package declaration is `package myapp`, `go build` will produce no error (it’s a valid library), but running `go run` will complain: `package is not a main package`. Seasoned engineers switching from languages without package-level entry points often trip here.
+- **Omitting `func main`:** The compiler error `missing function main` is clear, but the fix may not be obvious if `main` is defined in another file that isn’t compiled (e.g., a file with a build tag that doesn’t match).
+- **Unused imports and variables:** Go refuses to compile code with unused imports or variables. After commenting out a `fmt.Println` call, you must also remove `"fmt"` from the import block. The `goimports` tool automates this, but the strictness surprises engineers from permissive ecosystems.
+- **Shadowing the package name:** Declaring a variable named `fmt` (e.g., `fmt := "text"`) will shadow the import and cause `fmt.Println` to fail. The compiler error will say `fmt.Println undefined (type string has no field or method Println)`, which can be cryptic at first glance.
+- **Attempting to run a library:** Running `go run` on a file with `package mylib` produces `package is not a main package`. This reinforces that executables and libraries are fundamentally distinct.
+- **Filename issues:** Files ending in `_test.go` are excluded from regular builds. Files with platform suffixes like `_linux.go` or `_windows.go` are conditionally compiled based on `GOOS`. Putting `main` in a file that doesn’t match the target platform will cause a “missing function main” error.
 
 ---
 
-## 6. Performance Considerations
+### Performance Considerations
 
-### Compilation Speed
+**Compilation time:** Go’s compiler is designed for speed. Incremental builds are near-instant for small projects because the compiler caches package outputs aggressively. Even a full build of a Hello World from clean cache takes roughly 100 ms on modern hardware.
 
-Go’s compiler is famously fast. Let’s measure:
+**Binary size:** A stripped Hello World binary on linux/amd64 is about 1.2 MB. This includes the runtime, GC, scheduler, and all types used by `fmt`. While larger than a C equivalent, it is dwarfed by the disk and memory footprint of a JVM or Node.js runtime. For CLI tools where size matters, you can reduce it further with `-ldflags="-s -w"` (strip debug information) and by using `print`/`println` built-ins instead of `fmt` (though that sacrifices functionality). UPX compression can bring the binary under 500 KB, but at a startup latency cost.
 
-```bash
-$ time go build -o /dev/null ./hello
-real    0m0.123s
-```
+**Startup time:** The runtime initialization is highly optimized and typically completes in tens to hundreds of microseconds. The dominant cost for a trivial program is dynamic linker time (on platforms that use it) and page faults when loading the binary. In containerized environments, Go’s static linking often eliminates the dynamic linker step entirely. For performance-sensitive CLI tools (e.g., `kubectl`, `docker`), Go’s startup is fast enough that it rarely becomes a bottleneck—unlike JVM-based CLIs, which routinely incur hundreds of milliseconds of warm-up.
 
-Compare with Rust (debug build):
-```bash
-$ time cargo build
-real    0m1.892s   # cold, with dependencies
-```
-
-Why is Go faster?
-- **No header parsing:** Source files are the only input.
-- **Simplified grammar:** Fewer language features reduce AST complexity.
-- **Parallel compilation:** Each package builds independently.
-- **SSA backend:** Fast lowering to machine code without heavy optimization passes (unless `-O2` is requested, which Go defaults to – but optimization is still cheaper than C++’s templates).
-
-### Binary Size
-
-Minimal “Hello World” sizes:
-
-| Language | Stripped Binary Size (Linux x86_64) |
-|----------|--------------------------------------|
-| C (`gcc -Os`) | ~16 KB |
-| Rust (`--release`) | ~400 KB |
-| **Go** (`-ldflags="-s -w"`) | ~1.2 MB |
-| C++ (`g++ -static`) | ~800 KB |
-
-Go’s larger size includes:
-- Runtime scheduler (~200 KB)
-- GC infrastructure (~150 KB)
-- Stack management and panic handling
-- `fmt` package’s reflection tables (despite only using `Println`)
-
-**Mitigation:** Use `-ldflags="-s -w"` to strip debug symbols and DWARF tables. For extreme cases, `tinygo` (LLVM-based) produces sub-100 KB binaries but lacks full standard library support.
-
-### Start-up Latency
-
-Go binaries start almost instantly because:
-- No dynamic linker overhead
-- No JIT warmup (Java’s C2 compiler)
-- Initial heap is tiny (configurable via `GOGC`)
-
-Benchmark:
-
-```bash
-$ time ./hello
-real    0m0.002s (2 ms)
-```
-
-Python’s interpreter startup alone is ~50 ms; a Spring Boot app takes 1–3 seconds.
+**Memory footprint:** The “Hello, World” process consumes roughly 0.5–1 MB of resident memory at steady state. The runtime pre-allocates a small heap and a handful of goroutine stacks. This overhead is constant and amortized over the lifetime of long-running services.
 
 ---
 
-## 7. Best Practices
+### Best Practices
 
-### 1. Use `package main` only once per executable project
-
-Organize larger CLIs with subcommands:
-
-```
-cmd/
-  myapp/
-    main.go          # package main
-  myappctl/
-    main.go          # separate executable
-internal/
-  shared/
-    lib.go           # package shared (not main)
-```
-
-### 2. Keep `main()` minimal
-
-`main()` should parse flags, initialize logging, and call into a `run()` function that returns an error:
-
-```go
-func main() {
-    if err := run(); err != nil {
-        slog.Error("fatal", "error", err)
-        os.Exit(1)
-    }
-}
-
-func run() error {
-    // business logic starts here
-    return nil
-}
-```
-
-This enables testing `run()` from a `_test.go` file – you cannot directly call `main()` in tests.
-
-### 3. Use `go mod init` before writing code
-
-Even for a “Hello World”:
-
-```bash
-$ go mod init hello
-```
-
-This enables module-aware builds and pins your dependencies. Without it, `go build` still works but uses legacy `GOPATH` mode (deprecated in Go 1.16+). For Go 1.21+, modules are mandatory.
-
-### 4. Leverage `//go:embed` for static assets (Go 1.16+)
-
-```go
-package main
-
-import _ "embed"
-
-//go:embed greeting.txt
-var greeting string
-
-func main() {
-    print(greeting)
-}
-```
-
-This embeds files into the binary – no external asset deployment.
-
-### 5. Always commit `go.sum`
-
-`go.sum` contains cryptographic hashes of each dependency version. It protects against:
-- Man-in-the-middle attacks on module proxies
-- Accidental version changes
-
-Never `rm go.sum` – treat it like a lockfile.
+- **Keep `main` minimal:** The `main` function should parse flags, initialize logging, and call into a library function. Business logic should never live in the `main` package. This makes the core logic testable and reusable.
+- **Use the `cmd` directory convention:** In multi-binary projects, place each executable’s `main` package under `cmd/<binary-name>/main.go`. This keeps the repository root clean and signals which directories produce artifacts.
+- **Leverage `goimports`:** Automatically add and remove imports on save. This eliminates friction from Go’s strict unused-import rule.
+- **Favor `_` for side-effect imports sparingly:** The blank identifier import (e.g., `import _ "net/http/pprof"`) registers handlers or drivers. Use it only when the side effect is necessary and document it explicitly.
+- **Use `flag` or environment variables for configuration:** Avoid hardcoding values. The standard `flag` package is sufficient for most CLIs; for complex applications, consider `os.Getenv` with sensible defaults.
+- **Let the toolchain manage formatting:** Run `gofmt` or `go fmt` before committing. Formatting is not a matter of taste in Go—it’s automated and non-negotiable. This consistency is a feature.
 
 ---
 
-## 8. Examples
+### Examples
 
-### Example 1: Command-line argument parsing
+A more realistic first program that reads a name from a flag or environment variable, timestamps the output, and handles basic errors:
 
 ```go
 package main
 
 import (
-    "flag"
-    "fmt"
-    "log"
-    "os"
+	"flag"
+	"fmt"
+	"os"
+	"time"
 )
 
 func main() {
-    // Define flags
-    name := flag.String("name", "World", "person to greet")
-    repeat := flag.Int("repeat", 1, "number of times to greet")
-    flag.Parse()
+	// Default to the USER environment variable; override with -name flag.
+	name := flag.String("name", os.Getenv("USER"), "name to greet")
+	flag.Parse()
 
-    // Validate
-    if *repeat < 1 {
-        log.Fatal("repeat must be >= 1")
-    }
+	if *name == "" {
+		fmt.Fprintln(os.Stderr, "name must not be empty")
+		os.Exit(1)
+	}
 
-    for i := 0; i < *repeat; i++ {
-        fmt.Printf("Hello, %s!\n", *name)
-    }
+	fmt.Printf("[%s] Hello, %s!\n", time.Now().Format(time.RFC3339), *name)
 }
 ```
 
-Build and test:
-```bash
-$ go build -o greet
-$ ./greet -name Alice -repeat 3
-Hello, Alice!
-Hello, Alice!
-Hello, Alice!
+Run it:
+
+```
+$ go run greet.go -name=Gopher
+[2026-06-09T14:22:05Z] Hello, Gopher!
 ```
 
-### Example 2: Multi-file package with `init()` (use sparingly)
+This snippet demonstrates:
 
-```go
-// config.go
-package main
+- Multiple imports grouped in a factored import block.
+- The standard `flag` package for flag parsing.
+- Access to environment variables with `os.Getenv`.
+- Writing to stderr and exiting with a non-zero status on failure.
+- Using `time.Now().Format` with the `time.RFC3339` constant.
 
-import "os"
-
-var config struct {
-    host string
-    port string
-}
-
-func init() {
-    config.host = os.Getenv("APP_HOST")
-    if config.host == "" {
-        config.host = "localhost"
-    }
-    config.port = os.Getenv("APP_PORT")
-    if config.port == "" {
-        config.port = "8080"
-    }
-}
-```
-
-```go
-// main.go
-package main
-
-import "fmt"
-
-func main() {
-    fmt.Printf("Running on %s:%s\n", config.host, config.port)
-}
-```
-
-**Critique:** `init()` makes testing harder – the environment is read before `TestMain` can set it. Prefer explicit initialization in `main()`.
-
-### Example 3: Building for multiple platforms
-
-```bash
-# Linux amd64
-GOOS=linux GOARCH=amd64 go build -o myapp-linux
-
-# Windows amd64
-GOOS=windows GOARCH=amd64 go build -o myapp.exe
-
-# macOS ARM (M1/M2)
-GOOS=darwin GOARCH=arm64 go build -o myapp-macos
-```
-
-The same source compiles everywhere – no `#ifdef` needed thanks to Go’s platform abstraction (`os`, `syscall` packages).
+All of this uses only the standard library. The binary produced is completely self-contained and can be distributed without worrying about runtime compatibility.
 
 ---
 
-## 9. Summary & Exercises
+### Summary & Exercises
 
-### Summary
+**Recap:**
 
-- **Every Go executable** is defined by `package main` containing `func main()`.
-- **Static linking** is the default, producing single-binary deployments.
-- **Compilation speed** comes from concurrent package compilation and no header files.
-- **Consistency** across Go programs (`go fmt`, canonical structure) reduces cognitive load.
-- **The entry point** is minimal – real logic lives in a `run()` function returning an error.
+- Every Go executable begins with `package main` and `func main()`. The toolchain (`go run`, `go build`) enforces this contract.
+- The build process produces a statically linked binary that embeds the Go runtime, giving you a single deployable artifact with no external dependencies.
+- Go’s uniformity—enforced by `gofmt`, the package system, and import rules—ensures that every program you encounter feels familiar, lowering the cognitive cost of code navigation.
+- While the binary is larger than a C equivalent, it’s still tiny compared to shipping a full language runtime, and the startup latency is negligible for nearly all use cases.
 
-### Key Takeaways for Seasoned Engineers
+**Exercises:**
 
-- Go’s build model trades binary size for deployment simplicity – a deliberate choice for server-side software.
-- The absence of preprocessor macros and dynamic linking eliminates an entire class of configuration bugs.
-- `go run` is not a REPL or interpreter – it’s a compile-execute wrapper with temporary binaries.
+1. **Environment printer:** Write a program that reads all environment variables via `os.Environ()`, sorts them lexicographically, and prints each on its own line in `KEY=VALUE` format. Time the startup of the resulting binary with `time ./envprint`. How does it compare to `env` from coreutils?
 
-### Exercises
+2. **Mini-CLI with subcommands:** Using only the `os.Args` slice (no external framework), create a program that accepts a subcommand: `time` (prints the current time in RFC3339), `date` (prints the date only), and `greet <name>` (prints a greeting). If no subcommand is given, print a usage message. Consider how you would test the different subcommand paths.
 
-#### Exercise 1: Build a `wc`-like tool
-
-Write a Go program that reads from `os.Stdin` (or a file named on the command line) and prints line, word, and byte counts (like `wc`). Use only the standard library. Requirements:
-- Support `-l` (lines only), `-w` (words only), `-c` (bytes only) flags (default to all three).
-- Use `bufio.Scanner` for lines and `strings.Fields` for words.
-- Implement error handling: if the file doesn’t exist, print the error to `stderr` and exit with code 1.
-
-**Hint:** The `flag` package can define multiple flags; test with `go run main.go -- -l README.md` (the `--` stops flag parsing).
-
-#### Exercise 2: Understand init order
-
-Create three files in the same `package main`:
-- `a.go` with `func init() { println("a") }`
-- `b.go` with `func init() { println("b") }`
-- `main.go` with `main()`
-
-Run `go build` multiple times, rename files, and observe the order of `init()` execution. Then read the spec: “init functions are executed in the order they appear in the source”. What does “appear” mean – lexical file name order, or order passed to the compiler? Verify with `go build -work` and examine the temporary directory’s file list.
-
-#### Exercise 3: Cross-compile and inspect
-
-Build your solution from Exercise 1 for Windows (even on macOS/Linux):
-```bash
-GOOS=windows GOARCH=amd64 go build -o wc.exe
-```
-
-Run `file wc.exe` (on Unix) or examine it with `hexdump -C | head`. Then build a Linux version and compare sizes with `ls -lh`. Why is the Windows binary slightly larger? (Hint: Look up “PE vs. ELF alignment”.)
-
----
-
-**Next Chapter Preview:** *Variables, Constants, and Types* – where we’ll dissect Go’s type inference, zero values, and why `var x int` is not the same as `x := 0` under the hood.
+3. **Compile an HTTP server from scratch:** Write a `main` function that starts an HTTP server on `:8080` and responds with `"Hello, World!"` to every request (use `net/http`). Build the binary, run it, and hit it with `curl`. Then stop and reflect: this binary contains a production-grade HTTP stack, a scheduler, and a GC—all in a few lines of code and one self-contained file. How would you replicate this deployment simplicity in Java? In Python?
